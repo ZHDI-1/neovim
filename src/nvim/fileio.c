@@ -15,6 +15,22 @@
 #include <time.h>
 #include <uv.h>
 
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+# include <immintrin.h>
+# define NVIM_FILEIO_AVX2 1
+# define NVIM_FILEIO_AVX2_TARGET __attribute__((target("avx2")))
+# if defined(__x86_64__)
+#  define NVIM_FILEIO_AVX512BW 1
+#  define NVIM_FILEIO_AVX512BW_TARGET __attribute__((target("avx512f,avx512bw")))
+# endif
+#else
+# define NVIM_FILEIO_AVX2_TARGET
+#endif
+
+#ifndef NVIM_FILEIO_AVX512BW_TARGET
+# define NVIM_FILEIO_AVX512BW_TARGET
+#endif
+
 #include "auto/config.h"
 #include "nvim/ascii_defs.h"
 #include "nvim/autocmd.h"
@@ -93,13 +109,1157 @@
 # define UV_FS_COPYFILE_FICLONE 0
 #endif
 
+typedef enum {
+  kReadfileMmapScanOK = 0,
+  kReadfileMmapScanFallback,
+  kReadfileMmapScanReject,
+} ReadfileMmapScanResult;
+
+typedef struct {
+  uint16_t nl_count;
+  uint16_t prefix_len;
+  uint16_t suffix_len;
+} ReadfileMmapBlockScan;
+
+typedef struct {
+  const char *data;
+  size_t block_start;
+  size_t block_end;
+  size_t file_size;
+  ReadfileMmapBlockScan *blocks;
+  ReadfileMmapScanResult result;
+  bool use_avx512bw;
+} ReadfileMmapScanJob;
+
 #include "fileio.c.generated.h"
+
+#ifdef UNIX
+# include <sys/mman.h>
+#endif
 
 static const char *e_auchangedbuf = N_("E812: Autocommands changed buffer or buffer name");
 
 // Bitmask with 0x80 set in each byte of a uint64_t word, used to detect
 // non-ASCII bytes (high bit set) in multiple bytes at once.
 #define NONASCII_MASK (((uint64_t)(-1) / 0xFF) * 0x80)
+
+static bool readfile_can_use_avx2(void)
+{
+#ifdef NVIM_FILEIO_AVX2
+  static bool checked = false;
+  static bool has_avx2 = false;
+
+  if (!checked) {
+    __builtin_cpu_init();
+    has_avx2 = __builtin_cpu_supports("avx2");
+    checked = true;
+  }
+
+  return has_avx2;
+#else
+  return false;
+#endif
+}
+
+static bool readfile_can_use_avx512bw(void)
+{
+#ifdef NVIM_FILEIO_AVX512BW
+  static bool checked = false;
+  static bool has_avx512bw = false;
+
+  if (!checked) {
+    __builtin_cpu_init();
+    has_avx512bw = __builtin_cpu_supports("avx512f")
+                   && __builtin_cpu_supports("avx512bw");
+    checked = true;
+  }
+
+  return has_avx512bw;
+#else
+  return false;
+#endif
+}
+
+static const char *readfile_find_nonascii_avx2(const char *base, size_t size)
+  FUNC_ATTR_NONNULL_ALL NVIM_FILEIO_AVX2_TARGET;
+
+static const char *readfile_find_nonascii_avx2(const char *base, size_t size)
+{
+#ifdef NVIM_FILEIO_AVX2
+  const char *p = base;
+  const char *const end = base + size;
+
+  while (end - p >= 32) {
+    const __m256i data = _mm256_loadu_si256((const __m256i *)(const void *)p);
+    const int mask = _mm256_movemask_epi8(data);
+    if (mask != 0) {
+      return p + (unsigned)__builtin_ctz((unsigned)mask);
+    }
+    p += 32;
+  }
+
+  while (end - p >= (ptrdiff_t)sizeof(uint64_t)) {
+    uint64_t word;
+    memcpy(&word, p, sizeof(uint64_t));
+    if (word & NONASCII_MASK) {
+      while ((uint8_t)(*p) < 0x80) {
+        p++;
+      }
+      return p;
+    }
+    p += sizeof(uint64_t);
+  }
+
+  while (p < end) {
+    if ((uint8_t)(*p) >= 0x80) {
+      return p;
+    }
+    p++;
+  }
+
+  return NULL;
+#else
+  (void)base;
+  (void)size;
+  return base;
+#endif
+}
+
+enum {
+  READFILE_MMAP_MIN_SIZE = 1024 * 1024,
+  READFILE_MMAP_PARALLEL_MIN_SIZE = 128 * 1024 * 1024,
+  READFILE_MMAP_PARALLEL_BLOCK_SIZE = 4096,
+  READFILE_MMAP_PARALLEL_MAX_THREADS = 32,
+  READFILE_MMAP_MAX_LINES = MAXLNUM - 1,
+};
+
+static bool readfile_mmap_validate_utf8(const char *base, size_t size)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  const uint8_t *p = (const uint8_t *)base;
+  const uint8_t *const end = (const uint8_t *)base + size;
+
+  if (readfile_can_use_avx2()) {
+    const char *nonascii = readfile_find_nonascii_avx2(base, size);
+    if (nonascii == NULL) {
+      return true;
+    }
+    p = (const uint8_t *)nonascii;
+  }
+
+  while (p < end) {
+    while (end - p >= (ptrdiff_t)sizeof(uint64_t)) {
+      uint64_t word;
+      memcpy(&word, p, sizeof(uint64_t));
+      if (word & NONASCII_MASK) {
+        break;
+      }
+      p += sizeof(uint64_t);
+    }
+    while (p < end && *p < 0x80) {
+      p++;
+    }
+    if (p >= end) {
+      break;
+    }
+
+    const int todo = (int)(end - p);
+    const int len = utf_ptr2len_len((const char *)p, todo);
+    if (len == 1 || len > todo) {
+      return false;
+    }
+    p += len;
+  }
+
+  return true;
+}
+
+static bool readfile_mmap_append_offset(size_t **offsets, size_t *count, size_t *capacity,
+                                        size_t value)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  const size_t max_offsets = MIN((size_t)MAXLNUM + 1,
+                                 (size_t)(READFILE_MMAP_MAX_LINES
+                                          / ML_MMAP_INDEX_STRIDE + 2));
+  if (*count >= max_offsets) {
+    return false;
+  }
+  if (*count == *capacity) {
+    if (*capacity >= max_offsets / 2) {
+      return false;
+    }
+    *capacity *= 2;
+    *capacity = MIN(*capacity, max_offsets);
+    *offsets = xrealloc(*offsets, *capacity * sizeof **offsets);
+  }
+  (*offsets)[(*count)++] = value;
+  return true;
+}
+
+static ReadfileMmapScanResult readfile_mmap_scan_ascii_avx2(const char *data, size_t size,
+                                                            size_t **offsetsp,
+                                                            size_t *offset_countp,
+                                                            linenr_T *line_countp,
+                                                            bool *noeolp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT NVIM_FILEIO_AVX2_TARGET;
+
+static ReadfileMmapScanResult readfile_mmap_scan_ascii_avx512bw(const char *data, size_t size,
+                                                                size_t **offsetsp,
+                                                                size_t *offset_countp,
+                                                                linenr_T *line_countp,
+                                                                bool *noeolp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT NVIM_FILEIO_AVX512BW_TARGET;
+
+static ReadfileMmapScanResult readfile_mmap_scan_block_ascii_avx512bw(const char *data,
+                                                                      size_t size,
+                                                                      ReadfileMmapBlockScan *block)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT NVIM_FILEIO_AVX512BW_TARGET;
+
+static ReadfileMmapScanResult readfile_mmap_scan_block_ascii_avx512bw(const char *data,
+                                                                      size_t size,
+                                                                      ReadfileMmapBlockScan *block)
+{
+#ifdef NVIM_FILEIO_AVX512BW
+  const char *p = data;
+  const char *const end = data + size;
+  const __m512i nl_vec = _mm512_set1_epi8(NL);
+  const __m512i nul_vec = _mm512_setzero_si512();
+  const __m512i cr_vec = _mm512_set1_epi8(CAR);
+  uint16_t nl_count = 0;
+  size_t first_nl = SIZE_MAX;
+  size_t last_nl = 0;
+
+  while (end - p >= 64) {
+    const __m512i bytes = _mm512_loadu_si512((const void *)p);
+    if ((uint64_t)_mm512_movepi8_mask(bytes) != 0) {
+      return kReadfileMmapScanFallback;
+    }
+    const uint64_t bad_mask = (uint64_t)_mm512_cmpeq_epi8_mask(bytes, nul_vec)
+                              | (uint64_t)_mm512_cmpeq_epi8_mask(bytes, cr_vec);
+    if (bad_mask != 0) {
+      return kReadfileMmapScanReject;
+    }
+
+    const uint64_t nl_mask = (uint64_t)_mm512_cmpeq_epi8_mask(bytes, nl_vec);
+    if (nl_mask != 0) {
+      nl_count += (uint16_t)__builtin_popcountll(nl_mask);
+      const size_t base = (size_t)(p - data);
+      if (first_nl == SIZE_MAX) {
+        first_nl = base + (unsigned)__builtin_ctzll(nl_mask);
+      }
+      last_nl = base + (size_t)(63 - __builtin_clzll(nl_mask));
+    }
+    p += 64;
+  }
+
+  while (p < end) {
+    const uint8_t c = (uint8_t)(*p);
+    if (c >= 0x80) {
+      return kReadfileMmapScanFallback;
+    }
+    if (c == NUL || c == CAR) {
+      return kReadfileMmapScanReject;
+    }
+    if (c == NL) {
+      const size_t pos = (size_t)(p - data);
+      nl_count++;
+      if (first_nl == SIZE_MAX) {
+        first_nl = pos;
+      }
+      last_nl = pos;
+    }
+    p++;
+  }
+
+  block->nl_count = nl_count;
+  block->prefix_len = (uint16_t)(nl_count == 0 ? size : first_nl);
+  block->suffix_len = (uint16_t)(nl_count == 0 ? size : size - last_nl - 1);
+  return kReadfileMmapScanOK;
+#else
+  (void)data;
+  (void)size;
+  (void)block;
+  return kReadfileMmapScanFallback;
+#endif
+}
+
+static ReadfileMmapScanResult readfile_mmap_scan_block_ascii_avx2(const char *data, size_t size,
+                                                                  ReadfileMmapBlockScan *block)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT NVIM_FILEIO_AVX2_TARGET;
+
+static ReadfileMmapScanResult readfile_mmap_scan_block_ascii_avx2(const char *data, size_t size,
+                                                                  ReadfileMmapBlockScan *block)
+{
+#ifdef NVIM_FILEIO_AVX2
+  const char *p = data;
+  const char *const end = data + size;
+  const __m256i nl_vec = _mm256_set1_epi8(NL);
+  const __m256i nul_vec = _mm256_setzero_si256();
+  const __m256i cr_vec = _mm256_set1_epi8(CAR);
+  uint16_t nl_count = 0;
+  size_t first_nl = SIZE_MAX;
+  size_t last_nl = 0;
+
+  while (end - p >= 32) {
+    const __m256i bytes = _mm256_loadu_si256((const __m256i *)(const void *)p);
+    if (_mm256_movemask_epi8(bytes) != 0) {
+      return kReadfileMmapScanFallback;
+    }
+    const int bad_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, nul_vec))
+                         | _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, cr_vec));
+    if (bad_mask != 0) {
+      return kReadfileMmapScanReject;
+    }
+
+    const unsigned nl_mask =
+      (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, nl_vec));
+    if (nl_mask != 0) {
+      nl_count += (uint16_t)__builtin_popcount(nl_mask);
+      const size_t base = (size_t)(p - data);
+      if (first_nl == SIZE_MAX) {
+        first_nl = base + (unsigned)__builtin_ctz(nl_mask);
+      }
+      last_nl = base + (size_t)(31 - __builtin_clz(nl_mask));
+    }
+    p += 32;
+  }
+
+  while (p < end) {
+    const uint8_t c = (uint8_t)(*p);
+    if (c >= 0x80) {
+      return kReadfileMmapScanFallback;
+    }
+    if (c == NUL || c == CAR) {
+      return kReadfileMmapScanReject;
+    }
+    if (c == NL) {
+      const size_t pos = (size_t)(p - data);
+      nl_count++;
+      if (first_nl == SIZE_MAX) {
+        first_nl = pos;
+      }
+      last_nl = pos;
+    }
+    p++;
+  }
+
+  block->nl_count = nl_count;
+  block->prefix_len = (uint16_t)(nl_count == 0 ? size : first_nl);
+  block->suffix_len = (uint16_t)(nl_count == 0 ? size : size - last_nl - 1);
+  return kReadfileMmapScanOK;
+#else
+  (void)data;
+  (void)size;
+  (void)block;
+  return kReadfileMmapScanFallback;
+#endif
+}
+
+static void readfile_mmap_scan_ascii_worker(void *arg)
+{
+  ReadfileMmapScanJob *job = arg;
+  job->result = kReadfileMmapScanOK;
+
+  for (size_t block_idx = job->block_start; block_idx < job->block_end; block_idx++) {
+    const size_t offset = block_idx * (size_t)READFILE_MMAP_PARALLEL_BLOCK_SIZE;
+    const size_t remaining = job->file_size - offset;
+    const size_t size = MIN(remaining, (size_t)READFILE_MMAP_PARALLEL_BLOCK_SIZE);
+    ReadfileMmapScanResult result;
+    if (job->use_avx512bw) {
+      result = readfile_mmap_scan_block_ascii_avx512bw(job->data + offset, size,
+                                                       &job->blocks[block_idx]);
+    } else {
+      result = readfile_mmap_scan_block_ascii_avx2(job->data + offset, size,
+                                                   &job->blocks[block_idx]);
+    }
+    if (result != kReadfileMmapScanOK) {
+      job->result = result;
+      return;
+    }
+  }
+}
+
+static unsigned readfile_mmap_parallel_thread_count(size_t size, size_t block_count)
+  FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  uv_cpu_info_t *cpu_infos = NULL;
+  int cpu_count = 0;
+  unsigned threads = 2;
+
+  if (uv_cpu_info(&cpu_infos, &cpu_count) == 0) {
+    if (cpu_count > 0) {
+      threads = (unsigned)cpu_count;
+    }
+    uv_free_cpu_info(cpu_infos, cpu_count);
+  }
+
+  threads = MIN(threads, (unsigned)READFILE_MMAP_PARALLEL_MAX_THREADS);
+  threads = MIN(threads, (unsigned)MAX(block_count, (size_t)1));
+  while (threads > 2 && size / threads < 16 * 1024 * 1024) {
+    threads--;
+  }
+  return MAX(threads, 2);
+}
+
+static bool readfile_mmap_find_nth_newline(const char *data, size_t size, uint16_t nth,
+                                           size_t *posp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  const char *p = data;
+  const char *const end = data + size;
+  uint16_t seen = 0;
+
+  while (p < end) {
+    const char *nl = memchr(p, NL, (size_t)(end - p));
+    if (nl == NULL) {
+      return false;
+    }
+    seen++;
+    if (seen == nth) {
+      *posp = (size_t)(nl - data);
+      return true;
+    }
+    p = nl + 1;
+  }
+  return false;
+}
+
+static ReadfileMmapScanResult readfile_mmap_scan_ascii_parallel(const char *data, size_t size,
+                                                                size_t **offsetsp,
+                                                                size_t *offset_countp,
+                                                                linenr_T *line_countp,
+                                                                bool *noeolp,
+                                                                bool use_avx512bw)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  const size_t block_count = (size + READFILE_MMAP_PARALLEL_BLOCK_SIZE - 1)
+                             / READFILE_MMAP_PARALLEL_BLOCK_SIZE;
+  if (block_count < 2) {
+    return kReadfileMmapScanFallback;
+  }
+
+  const unsigned thread_count = readfile_mmap_parallel_thread_count(size, block_count);
+  ReadfileMmapBlockScan *blocks = xcalloc(block_count, sizeof *blocks);
+  uv_thread_t *threads = xmalloc(thread_count * sizeof *threads);
+  ReadfileMmapScanJob *jobs = xcalloc(thread_count, sizeof *jobs);
+  unsigned created = 0;
+
+  for (unsigned i = 0; i < thread_count; i++) {
+    jobs[i].data = data;
+    jobs[i].block_start = (size_t)i * block_count / thread_count;
+    jobs[i].block_end = (size_t)(i + 1) * block_count / thread_count;
+    jobs[i].file_size = size;
+    jobs[i].blocks = blocks;
+    jobs[i].use_avx512bw = use_avx512bw;
+    if (uv_thread_create(&threads[i], readfile_mmap_scan_ascii_worker, &jobs[i]) != 0) {
+      break;
+    }
+    created++;
+  }
+
+  for (unsigned i = 0; i < created; i++) {
+    uv_thread_join(&threads[i]);
+  }
+
+  if (created != thread_count) {
+    xfree(jobs);
+    xfree(threads);
+    xfree(blocks);
+    return kReadfileMmapScanFallback;
+  }
+
+  ReadfileMmapScanResult result = kReadfileMmapScanOK;
+  for (unsigned i = 0; i < thread_count; i++) {
+    if (jobs[i].result == kReadfileMmapScanReject) {
+      result = kReadfileMmapScanReject;
+      break;
+    }
+    if (jobs[i].result == kReadfileMmapScanFallback) {
+      result = kReadfileMmapScanFallback;
+    }
+  }
+  xfree(jobs);
+  xfree(threads);
+  if (result != kReadfileMmapScanOK) {
+    xfree(blocks);
+    return result;
+  }
+
+  uint64_t newline_count = 0;
+  size_t current_line_len = 0;
+  for (size_t i = 0; i < block_count; i++) {
+    const ReadfileMmapBlockScan block = blocks[i];
+    if (block.nl_count == 0) {
+      current_line_len += block.prefix_len;
+      if ((uintmax_t)current_line_len > (uintmax_t)MAXCOL - 1) {
+        xfree(blocks);
+        return kReadfileMmapScanReject;
+      }
+      continue;
+    }
+
+    current_line_len += block.prefix_len;
+    if ((uintmax_t)current_line_len > (uintmax_t)MAXCOL - 1) {
+      xfree(blocks);
+      return kReadfileMmapScanReject;
+    }
+    newline_count += block.nl_count;
+    if (newline_count > READFILE_MMAP_MAX_LINES) {
+      xfree(blocks);
+      return kReadfileMmapScanReject;
+    }
+    current_line_len = block.suffix_len;
+  }
+
+  const bool noeol = data[size - 1] != NL;
+  uint64_t total_lines = newline_count;
+  if (noeol) {
+    if (newline_count >= READFILE_MMAP_MAX_LINES
+        || (uintmax_t)current_line_len > (uintmax_t)MAXCOL - 1) {
+      xfree(blocks);
+      return kReadfileMmapScanReject;
+    }
+    total_lines++;
+  }
+  if (total_lines < 1 || total_lines > READFILE_MMAP_MAX_LINES) {
+    xfree(blocks);
+    return kReadfileMmapScanReject;
+  }
+
+  const size_t offset_capacity = (size_t)((total_lines - 1) / ML_MMAP_INDEX_STRIDE) + 1;
+  size_t *offsets = xmalloc(offset_capacity * sizeof *offsets);
+  size_t offset_count = 0;
+  offsets[offset_count++] = 0;
+
+  uint64_t seen_newlines = 0;
+  size_t block_idx = 0;
+  for (uint64_t target = ML_MMAP_INDEX_STRIDE; target < total_lines;
+       target += ML_MMAP_INDEX_STRIDE) {
+    while (block_idx < block_count
+           && seen_newlines + blocks[block_idx].nl_count < target) {
+      seen_newlines += blocks[block_idx].nl_count;
+      block_idx++;
+    }
+    if (block_idx >= block_count || blocks[block_idx].nl_count == 0) {
+      xfree(offsets);
+      xfree(blocks);
+      return kReadfileMmapScanReject;
+    }
+
+    const uint16_t local_target = (uint16_t)(target - seen_newlines);
+    const size_t block_offset = block_idx * (size_t)READFILE_MMAP_PARALLEL_BLOCK_SIZE;
+    const size_t remaining = size - block_offset;
+    const size_t block_size = MIN(remaining, (size_t)READFILE_MMAP_PARALLEL_BLOCK_SIZE);
+    size_t local_nl_pos = 0;
+    if (!readfile_mmap_find_nth_newline(data + block_offset, block_size, local_target,
+                                        &local_nl_pos)) {
+      xfree(offsets);
+      xfree(blocks);
+      return kReadfileMmapScanReject;
+    }
+    const size_t line_start = block_offset + local_nl_pos + 1;
+    if (line_start >= size) {
+      xfree(offsets);
+      xfree(blocks);
+      return kReadfileMmapScanReject;
+    }
+    offsets[offset_count++] = line_start;
+  }
+
+  xfree(blocks);
+  *offsetsp = offsets;
+  *offset_countp = offset_count;
+  *line_countp = (linenr_T)total_lines;
+  *noeolp = noeol;
+  return kReadfileMmapScanOK;
+}
+
+static ReadfileMmapScanResult readfile_mmap_scan_ascii_avx512bw(const char *data, size_t size,
+                                                                size_t **offsetsp,
+                                                                size_t *offset_countp,
+                                                                linenr_T *line_countp,
+                                                                bool *noeolp)
+{
+#ifdef NVIM_FILEIO_AVX512BW
+  size_t capacity = MAX(size / ((size_t)64 * ML_MMAP_INDEX_STRIDE), (size_t)1024);
+  capacity = MIN(capacity, (size_t)(READFILE_MMAP_MAX_LINES / ML_MMAP_INDEX_STRIDE + 2));
+  size_t *offsets = xmalloc(capacity * sizeof *offsets);
+  size_t offset_count = 0;
+  offsets[offset_count++] = 0;
+  linenr_T line_count = 0;
+
+  const char *line_start = data;
+  const char *scan = data;
+  const char *const end = data + size;
+  const __m512i nl_vec = _mm512_set1_epi8(NL);
+  const __m512i nul_vec = _mm512_setzero_si512();
+  const __m512i cr_vec = _mm512_set1_epi8(CAR);
+
+  while (end - scan >= 64) {
+    const __m512i bytes = _mm512_loadu_si512((const void *)scan);
+    const uint64_t high_mask = (uint64_t)_mm512_movepi8_mask(bytes);
+    if (high_mask != 0) {
+      xfree(offsets);
+      return kReadfileMmapScanFallback;
+    }
+
+    const uint64_t nul_mask = (uint64_t)_mm512_cmpeq_epi8_mask(bytes, nul_vec);
+    const uint64_t cr_mask = (uint64_t)_mm512_cmpeq_epi8_mask(bytes, cr_vec);
+    if ((nul_mask | cr_mask) != 0) {
+      xfree(offsets);
+      return kReadfileMmapScanReject;
+    }
+
+    uint64_t nl_mask = (uint64_t)_mm512_cmpeq_epi8_mask(bytes, nl_vec);
+    while (nl_mask != 0) {
+      const unsigned bit = (unsigned)__builtin_ctzll(nl_mask);
+      const char *nl = scan + bit;
+      if (line_count >= READFILE_MMAP_MAX_LINES
+          || (uintmax_t)(nl - line_start) > (uintmax_t)MAXCOL - 1) {
+        xfree(offsets);
+        return kReadfileMmapScanReject;
+      }
+      line_count++;
+      if (nl + 1 < end && line_count % ML_MMAP_INDEX_STRIDE == 0
+          && !readfile_mmap_append_offset(&offsets, &offset_count, &capacity,
+                                          (size_t)(nl + 1 - data))) {
+        xfree(offsets);
+        return kReadfileMmapScanReject;
+      }
+      line_start = nl + 1;
+      nl_mask &= nl_mask - 1;
+    }
+
+    scan += 64;
+  }
+
+  while (scan < end) {
+    const uint8_t c = (uint8_t)(*scan);
+    if (c >= 0x80) {
+      xfree(offsets);
+      return kReadfileMmapScanFallback;
+    }
+    if (c == NUL || c == CAR) {
+      xfree(offsets);
+      return kReadfileMmapScanReject;
+    }
+    if (c == NL) {
+      if (line_count >= READFILE_MMAP_MAX_LINES
+          || (uintmax_t)(scan - line_start) > (uintmax_t)MAXCOL - 1) {
+        xfree(offsets);
+        return kReadfileMmapScanReject;
+      }
+      line_count++;
+      if (scan + 1 < end && line_count % ML_MMAP_INDEX_STRIDE == 0
+          && !readfile_mmap_append_offset(&offsets, &offset_count, &capacity,
+                                          (size_t)(scan + 1 - data))) {
+        xfree(offsets);
+        return kReadfileMmapScanReject;
+      }
+      line_start = scan + 1;
+    }
+    scan++;
+  }
+
+  const bool noeol = data[size - 1] != NL;
+  if (noeol) {
+    if (line_count >= READFILE_MMAP_MAX_LINES
+        || (uintmax_t)(end - line_start) > (uintmax_t)MAXCOL - 1) {
+      xfree(offsets);
+      return kReadfileMmapScanReject;
+    }
+    line_count++;
+  }
+
+  *offsetsp = offsets;
+  *offset_countp = offset_count;
+  *line_countp = line_count;
+  *noeolp = noeol;
+  return kReadfileMmapScanOK;
+#else
+  (void)data;
+  (void)size;
+  (void)offsetsp;
+  (void)offset_countp;
+  (void)line_countp;
+  (void)noeolp;
+  return kReadfileMmapScanFallback;
+#endif
+}
+
+static ReadfileMmapScanResult readfile_mmap_scan_ascii_avx2(const char *data, size_t size,
+                                                            size_t **offsetsp,
+                                                            size_t *offset_countp,
+                                                            linenr_T *line_countp,
+                                                            bool *noeolp)
+{
+#ifdef NVIM_FILEIO_AVX2
+  size_t capacity = MAX(size / ((size_t)64 * ML_MMAP_INDEX_STRIDE), (size_t)1024);
+  capacity = MIN(capacity, (size_t)(READFILE_MMAP_MAX_LINES / ML_MMAP_INDEX_STRIDE + 2));
+  size_t *offsets = xmalloc(capacity * sizeof *offsets);
+  size_t offset_count = 0;
+  offsets[offset_count++] = 0;
+  linenr_T line_count = 0;
+
+  const char *line_start = data;
+  const char *scan = data;
+  const char *const end = data + size;
+  const __m256i nl_vec = _mm256_set1_epi8(NL);
+  const __m256i nul_vec = _mm256_setzero_si256();
+  const __m256i cr_vec = _mm256_set1_epi8(CAR);
+
+  while (end - scan >= 32) {
+    const __m256i bytes = _mm256_loadu_si256((const __m256i *)(const void *)scan);
+    const int high_mask = _mm256_movemask_epi8(bytes);
+    if (high_mask != 0) {
+      xfree(offsets);
+      return kReadfileMmapScanFallback;
+    }
+
+    const __m256i nul_cmp = _mm256_cmpeq_epi8(bytes, nul_vec);
+    const __m256i cr_cmp = _mm256_cmpeq_epi8(bytes, cr_vec);
+    if ((_mm256_movemask_epi8(nul_cmp) | _mm256_movemask_epi8(cr_cmp)) != 0) {
+      xfree(offsets);
+      return kReadfileMmapScanReject;
+    }
+
+    uint32_t nl_mask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, nl_vec));
+    while (nl_mask != 0) {
+      const unsigned bit = (unsigned)__builtin_ctz(nl_mask);
+      const char *nl = scan + bit;
+      if (line_count >= READFILE_MMAP_MAX_LINES
+          || (uintmax_t)(nl - line_start) > (uintmax_t)MAXCOL - 1) {
+        xfree(offsets);
+        return kReadfileMmapScanReject;
+      }
+      line_count++;
+      if (nl + 1 < end && line_count % ML_MMAP_INDEX_STRIDE == 0
+          && !readfile_mmap_append_offset(&offsets, &offset_count, &capacity,
+                                          (size_t)(nl + 1 - data))) {
+        xfree(offsets);
+        return kReadfileMmapScanReject;
+      }
+      line_start = nl + 1;
+      nl_mask &= nl_mask - 1;
+    }
+
+    scan += 32;
+  }
+
+  while (scan < end) {
+    const uint8_t c = (uint8_t)(*scan);
+    if (c >= 0x80) {
+      xfree(offsets);
+      return kReadfileMmapScanFallback;
+    }
+    if (c == NUL || c == CAR) {
+      xfree(offsets);
+      return kReadfileMmapScanReject;
+    }
+    if (c == NL) {
+      if (line_count >= READFILE_MMAP_MAX_LINES
+          || (uintmax_t)(scan - line_start) > (uintmax_t)MAXCOL - 1) {
+        xfree(offsets);
+        return kReadfileMmapScanReject;
+      }
+      line_count++;
+      if (scan + 1 < end && line_count % ML_MMAP_INDEX_STRIDE == 0
+          && !readfile_mmap_append_offset(&offsets, &offset_count, &capacity,
+                                          (size_t)(scan + 1 - data))) {
+        xfree(offsets);
+        return kReadfileMmapScanReject;
+      }
+      line_start = scan + 1;
+    }
+    scan++;
+  }
+
+  const bool noeol = data[size - 1] != NL;
+  if (noeol) {
+    if (line_count >= READFILE_MMAP_MAX_LINES
+        || (uintmax_t)(end - line_start) > (uintmax_t)MAXCOL - 1) {
+      xfree(offsets);
+      return kReadfileMmapScanReject;
+    }
+    line_count++;
+  }
+
+  *offsetsp = offsets;
+  *offset_countp = offset_count;
+  *line_countp = line_count;
+  *noeolp = noeol;
+  return kReadfileMmapScanOK;
+#else
+  (void)data;
+  (void)size;
+  (void)offsetsp;
+  (void)offset_countp;
+  (void)line_countp;
+  (void)noeolp;
+  return kReadfileMmapScanFallback;
+#endif
+}
+
+static bool readfile_try_mmap_utf8(int fd, off_T file_size, linenr_T *line_countp,
+                                   bool *noeolp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+#ifdef UNIX
+  if (file_size < READFILE_MMAP_MIN_SIZE || file_size <= 0
+      || (uintmax_t)file_size > (uintmax_t)PTRDIFF_MAX
+      || (uintmax_t)file_size > (uintmax_t)SIZE_MAX) {
+    return false;
+  }
+
+  const size_t size = (size_t)file_size;
+  char *data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (data == MAP_FAILED) {
+    return false;
+  }
+# ifdef MADV_SEQUENTIAL
+  (void)madvise(data, size, MADV_SEQUENTIAL);
+# endif
+
+  size_t *offsets = NULL;
+  size_t offset_count = 0;
+  linenr_T line_count = 0;
+  bool noeol = false;
+
+  if (readfile_can_use_avx512bw()) {
+    if (size >= READFILE_MMAP_PARALLEL_MIN_SIZE) {
+      const ReadfileMmapScanResult scan_result =
+        readfile_mmap_scan_ascii_parallel(data, size, &offsets, &offset_count, &line_count,
+                                          &noeol, true);
+      if (scan_result == kReadfileMmapScanReject) {
+        munmap(data, size);
+        return false;
+      }
+      if (scan_result == kReadfileMmapScanOK) {
+        goto install_mmap_lines;
+      }
+    }
+
+    const ReadfileMmapScanResult scan_result =
+      readfile_mmap_scan_ascii_avx512bw(data, size, &offsets, &offset_count, &line_count,
+                                        &noeol);
+    if (scan_result == kReadfileMmapScanReject) {
+      munmap(data, size);
+      return false;
+    }
+    if (scan_result == kReadfileMmapScanOK) {
+      goto install_mmap_lines;
+    }
+  } else if (readfile_can_use_avx2()) {
+    if (size >= READFILE_MMAP_PARALLEL_MIN_SIZE) {
+      const ReadfileMmapScanResult scan_result =
+        readfile_mmap_scan_ascii_parallel(data, size, &offsets, &offset_count, &line_count,
+                                          &noeol, false);
+      if (scan_result == kReadfileMmapScanReject) {
+        munmap(data, size);
+        return false;
+      }
+      if (scan_result == kReadfileMmapScanOK) {
+        goto install_mmap_lines;
+      }
+    }
+
+    const ReadfileMmapScanResult scan_result =
+      readfile_mmap_scan_ascii_avx2(data, size, &offsets, &offset_count, &line_count, &noeol);
+    if (scan_result == kReadfileMmapScanReject) {
+      munmap(data, size);
+      return false;
+    }
+    if (scan_result == kReadfileMmapScanOK) {
+      goto install_mmap_lines;
+    }
+  }
+
+  if ((size >= 3
+       && (uint8_t)data[0] == 0xef
+       && (uint8_t)data[1] == 0xbb
+       && (uint8_t)data[2] == 0xbf)
+      || memchr(data, NUL, size) != NULL
+      || memchr(data, CAR, size) != NULL
+      || !readfile_mmap_validate_utf8(data, size)) {
+    munmap(data, size);
+    return false;
+  }
+
+  size_t capacity = MAX(size / ((size_t)64 * ML_MMAP_INDEX_STRIDE), (size_t)1024);
+  capacity = MIN(capacity, (size_t)(READFILE_MMAP_MAX_LINES / ML_MMAP_INDEX_STRIDE + 2));
+  offsets = xmalloc(capacity * sizeof *offsets);
+  offsets[offset_count++] = 0;
+
+  const char *line_start = data;
+  const char *scan = data;
+  const char *const end = data + size;
+  while (scan < end) {
+    const char *nl = memchr(scan, NL, (size_t)(end - scan));
+    if (nl == NULL) {
+      break;
+    }
+    if (line_count >= READFILE_MMAP_MAX_LINES
+        || (uintmax_t)(nl - line_start) > (uintmax_t)MAXCOL - 1) {
+      munmap(data, size);
+      xfree(offsets);
+      return false;
+    }
+    line_count++;
+    if (nl + 1 < end && line_count % ML_MMAP_INDEX_STRIDE == 0
+        && !readfile_mmap_append_offset(&offsets, &offset_count, &capacity,
+                                        (size_t)(nl + 1 - data))) {
+      munmap(data, size);
+      xfree(offsets);
+      return false;
+    }
+    scan = nl + 1;
+    line_start = scan;
+  }
+
+  noeol = data[size - 1] != NL;
+  if (noeol) {
+    if (line_count >= READFILE_MMAP_MAX_LINES
+        || (uintmax_t)(end - line_start) > (uintmax_t)MAXCOL - 1) {
+      munmap(data, size);
+      xfree(offsets);
+      return false;
+    }
+    line_count++;
+  }
+
+install_mmap_lines:
+  ;
+  if (line_count < 1
+      || ml_set_mmap_lines(curbuf, data, size, offsets, offset_count, line_count, noeol)
+         == FAIL) {
+    munmap(data, size);
+    xfree(offsets);
+    return false;
+  }
+
+  *line_countp = line_count;
+  *noeolp = noeol;
+  return true;
+#else
+  (void)fd;
+  (void)file_size;
+  (void)line_countp;
+  (void)noeolp;
+  return false;
+#endif
+}
+
+static inline int readfile_put_line(linenr_T lnum, char *line, colnr_T len, int append_flags,
+                                    bool *replaced_empty_line)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_ALWAYS_INLINE
+{
+  if ((append_flags & ML_APPEND_FAST_NEWFILE)
+      && !*replaced_empty_line
+      && lnum == 0
+      && curbuf->b_ml.ml_line_count == 1
+      && (curbuf->b_ml.ml_flags & ML_EMPTY)) {
+    if (ml_replace_len(1, line, (size_t)len - 1, true) == FAIL) {
+      return FAIL;
+    }
+    *replaced_empty_line = true;
+    return OK;
+  }
+
+  if (append_flags & ML_APPEND_FAST_NEWFILE) {
+    return ml_append_line_fast_newfile(lnum, line, len);
+  }
+
+  return ml_append_flags(lnum, line, len, append_flags);
+}
+
+enum {
+  READFILE_FAST_LINE_BATCH = 64,
+};
+
+static inline int readfile_flush_line_batch(char **lines, colnr_T *lens, size_t *countp,
+                                            linenr_T *lnump, linenr_T *read_countp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_ALWAYS_INLINE
+{
+  const size_t count = *countp;
+  if (count == 0) {
+    return OK;
+  }
+
+  if (ml_append_lines_scanned_fast_newfile(lnump, lines, lens, count) == FAIL) {
+    return FAIL;
+  }
+
+  *read_countp -= (linenr_T)count;
+  *countp = 0;
+  return OK;
+}
+
+static int readfile_split_unix_avx2(char **ptrp, char **line_startp, char *end, linenr_T *lnump,
+                                    linenr_T *read_countp, int append_flags,
+                                    bool *replaced_empty_line, bool *limit_reached)
+  FUNC_ATTR_NONNULL_ALL NVIM_FILEIO_AVX2_TARGET;
+
+static int readfile_split_unix_avx2(char **ptrp, char **line_startp, char *end, linenr_T *lnump,
+                                    linenr_T *read_countp, int append_flags,
+                                    bool *replaced_empty_line, bool *limit_reached)
+{
+#ifdef NVIM_FILEIO_AVX2
+  char *scan = *ptrp;
+  char *line_start = *line_startp;
+  linenr_T lnum = *lnump;
+  linenr_T read_count = *read_countp;
+  const __m256i nl_vec = _mm256_set1_epi8(NL);
+  const __m256i nul_vec = _mm256_setzero_si256();
+  char *batch_lines[READFILE_FAST_LINE_BATCH];
+  colnr_T batch_lens[READFILE_FAST_LINE_BATCH];
+  size_t batch_count = 0;
+
+  *limit_reached = false;
+
+  while (end - scan >= 32) {
+    const __m256i data = _mm256_loadu_si256((const __m256i *)(const void *)scan);
+    uint32_t nl_mask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(data, nl_vec));
+    uint32_t nul_mask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(data, nul_vec));
+    uint32_t special_mask = nl_mask | nul_mask;
+
+    while (special_mask != 0) {
+      const int idx = __builtin_ctz(special_mask);
+      char *pos = scan + idx;
+      const uint32_t bit = 1u << idx;
+
+      if (nul_mask & bit) {
+        *pos = NL;
+      } else {
+        *pos = NUL;
+        colnr_T len = (colnr_T)(pos - line_start + 1);
+        if (!*replaced_empty_line && lnum == 0) {
+          if (readfile_put_line(lnum, line_start, len, append_flags, replaced_empty_line) == FAIL) {
+            *ptrp = pos;
+            *line_startp = line_start;
+            *lnump = lnum;
+            *read_countp = read_count;
+            return FAIL;
+          }
+          lnum++;
+          if (--read_count == 0) {
+            *ptrp = pos;
+            *line_startp = pos;
+            *lnump = lnum;
+            *read_countp = read_count;
+            *limit_reached = true;
+            return OK;
+          }
+        } else {
+          batch_lines[batch_count] = line_start;
+          batch_lens[batch_count] = len;
+          batch_count++;
+          if (batch_count == READFILE_FAST_LINE_BATCH
+              || (linenr_T)batch_count == read_count) {
+            if (readfile_flush_line_batch(batch_lines, batch_lens, &batch_count,
+                                          &lnum, &read_count) == FAIL) {
+              *ptrp = pos;
+              *line_startp = line_start;
+              *lnump = lnum;
+              *read_countp = read_count;
+              return FAIL;
+            }
+            if (read_count == 0) {
+              *ptrp = pos;
+              *line_startp = pos;
+              *lnump = lnum;
+              *read_countp = read_count;
+              *limit_reached = true;
+              return OK;
+            }
+          }
+        }
+        line_start = pos + 1;
+      }
+
+      special_mask &= special_mask - 1;
+    }
+
+    scan += 32;
+  }
+
+  while (scan < end) {
+    if (*scan == NUL) {
+      *scan = NL;
+    } else if (*scan == NL) {
+      *scan = NUL;
+      colnr_T len = (colnr_T)(scan - line_start + 1);
+      if (!*replaced_empty_line && lnum == 0) {
+        if (readfile_put_line(lnum, line_start, len, append_flags, replaced_empty_line) == FAIL) {
+          *ptrp = scan;
+          *line_startp = line_start;
+          *lnump = lnum;
+          *read_countp = read_count;
+          return FAIL;
+        }
+        lnum++;
+        if (--read_count == 0) {
+          *ptrp = scan;
+          *line_startp = scan;
+          *lnump = lnum;
+          *read_countp = read_count;
+          *limit_reached = true;
+          return OK;
+        }
+      } else {
+        batch_lines[batch_count] = line_start;
+        batch_lens[batch_count] = len;
+        batch_count++;
+        if (batch_count == READFILE_FAST_LINE_BATCH
+            || (linenr_T)batch_count == read_count) {
+          if (readfile_flush_line_batch(batch_lines, batch_lens, &batch_count,
+                                        &lnum, &read_count) == FAIL) {
+            *ptrp = scan;
+            *line_startp = line_start;
+            *lnump = lnum;
+            *read_countp = read_count;
+            return FAIL;
+          }
+          if (read_count == 0) {
+            *ptrp = scan;
+            *line_startp = scan;
+            *lnump = lnum;
+            *read_countp = read_count;
+            *limit_reached = true;
+            return OK;
+          }
+        }
+      }
+      line_start = scan + 1;
+    }
+    scan++;
+  }
+
+  if (readfile_flush_line_batch(batch_lines, batch_lens, &batch_count,
+                                &lnum, &read_count) == FAIL) {
+    *ptrp = line_start;
+    *line_startp = line_start;
+    *lnump = lnum;
+    *read_countp = read_count;
+    return FAIL;
+  }
+
+  *ptrp = end;
+  *line_startp = line_start;
+  *lnump = lnum;
+  *read_countp = read_count;
+  return OK;
+#else
+  (void)ptrp;
+  (void)line_startp;
+  (void)end;
+  (void)lnump;
+  (void)read_countp;
+  (void)append_flags;
+  (void)replaced_empty_line;
+  *limit_reached = false;
+  return FAIL;
+#endif
+}
 
 void filemess(buf_T *buf, char *name, char *s)
 {
@@ -180,6 +1340,7 @@ int readfile(char *fname, char *sfname, linenr_T from, linenr_T lines_to_skip,
   bool read_buffer = (flags & READ_BUFFER);
   bool read_fifo = (flags & READ_FIFO);
   bool set_options = newfile || read_buffer || (eap != NULL && eap->read_edit);
+  int read_append_flags = newfile ? ML_APPEND_NEW : 0;
   linenr_T read_buf_lnum = 1;           // next line to read from curbuf
   colnr_T read_buf_col = 0;             // next char to read from this line
   char c;
@@ -189,6 +1350,7 @@ int readfile(char *fname, char *sfname, linenr_T from, linenr_T lines_to_skip,
   char *new_buffer = NULL;       // init to shut up gcc
   char *line_start = NULL;       // init to shut up gcc
   int wasempty;                         // buffer was empty before reading
+  bool read_replaced_empty_line = false;
   colnr_T len;
   ptrdiff_t size = 0;
   uint8_t *p = NULL;
@@ -665,6 +1827,10 @@ int readfile(char *fname, char *sfname, linenr_T from, linenr_T lines_to_skip,
 
   // Autocommands may add lines to the file, need to check if it is empty
   wasempty = (curbuf->b_ml.ml_flags & ML_EMPTY);
+  if (newfile && wasempty && from == 0 && !filtering
+      && !read_stdin && !read_buffer && !read_fifo) {
+    read_append_flags |= ML_APPEND_FAST_NEWFILE;
+  }
 
   if (!recoverymode && !filtering && !(flags & READ_DUMMY) && !silent) {
     if (!read_stdin && !read_buffer) {
@@ -745,6 +1911,7 @@ retry:
     while (lnum > from) {
       ml_delete(lnum--);
     }
+    read_replaced_empty_line = false;
     file_rewind = false;
     if (set_options) {
       curbuf->b_p_bomb = false;
@@ -888,6 +2055,59 @@ retry:
     }
   }
 
+#ifdef UNIX
+  const bool mmap_base_allowed = !skip_read
+                                 && (read_append_flags & ML_APPEND_FAST_NEWFILE)
+                                 && lines_to_skip == 0
+                                 && lines_to_read == MAXLNUM
+                                 && !curbuf->b_p_bin
+                                 && !read_undo_file
+                                 && !(flags & READ_DUMMY)
+                                 && (fileformat == EOL_UNKNOWN || fileformat == EOL_UNIX)
+                                 && curbuf->b_ml.ml_mfp != NULL;
+  if (mmap_base_allowed && fio_flags == FIO_UCSBOM) {
+    char bom[4];
+    ssize_t bom_len = read_eintr(fd, bom, sizeof bom);
+    bool rewind_ok = (vim_lseek(fd, 0, SEEK_SET) == 0);
+    if (rewind_ok && bom_len >= 0) {
+      int blen = 0;
+      char *ccname = bom_len < 2 ? NULL : check_for_bom(bom, (int)bom_len, &blen, FIO_ALL);
+      if (ccname == NULL) {
+        advance_fenc = true;
+        goto retry;
+      }
+    }
+  }
+
+  if (mmap_base_allowed
+      && !converted
+      && fio_flags == 0
+      && iconv_fd == (iconv_t)-1
+      && (*fenc == NUL || strcmp(fenc, "utf-8") == 0)) {
+    FileInfo mmap_info;
+    linenr_T mmap_line_count = 0;
+    bool mmap_noeol = false;
+
+    if (os_fileinfo_fd(fd, &mmap_info)
+        && S_ISREG(mmap_info.stat.st_mode)
+        && readfile_try_mmap_utf8(fd, (off_T)mmap_info.stat.st_size,
+                                  &mmap_line_count, &mmap_noeol)) {
+      fileformat = EOL_UNIX;
+      if (set_options) {
+        set_fileformat(EOL_UNIX, OPT_LOCAL);
+        if (mmap_noeol) {
+          curbuf->b_p_eol = false;
+        }
+      }
+      filesize = (off_T)mmap_info.stat.st_size;
+      read_no_eol_lnum = mmap_noeol ? mmap_line_count : 0;
+      read_replaced_empty_line = true;
+      lnum = from + mmap_line_count;
+      goto failed;
+    }
+  }
+#endif
+
   while (!error && !got_int) {
     // We allocate as much space for the file as we can get, plus
     // space for the old line plus room for one terminating NUL.
@@ -897,8 +2117,8 @@ retry:
       if (!skip_read) {
         // Use buffer >= 64K.  Add linerest to double the size if the
         // line gets very long, to avoid a lot of copying. But don't
-        // read more than 1 Mbyte at a time, so we can be interrupted.
-        size = MIN(0x10000 + linerest, 0x100000);
+        // read more than 16 Mbyte at a time, so we can be interrupted.
+        size = MIN(0x10000 + linerest, 0x1000000);
       }
 
       // Protect against the argument of lalloc() going negative.
@@ -1341,83 +2561,99 @@ retry:
         ptr = dest;
       } else if (!curbuf->b_p_bin) {
         bool incomplete_tail = false;
+        const bool avx2_ascii_scan = (read_append_flags & ML_APPEND_FAST_NEWFILE)
+                                     && readfile_can_use_avx2();
+        uint8_t *validate_start = (uint8_t *)ptr;
+        bool need_validate = true;
 
-        // Reading UTF-8: Check if the bytes are valid UTF-8.
-        for (p = (uint8_t *)ptr;;) {
-          // Skip ASCII bytes quickly using word-at-a-time check.
-          {
-            uint8_t *ascii_end = (uint8_t *)ptr + size;
-            while (ascii_end - p >= (ptrdiff_t)sizeof(uint64_t)) {
-              uint64_t word;
-              memcpy(&word, p, sizeof(uint64_t));
-              if (word & NONASCII_MASK) {
-                break;
-              }
-              p += sizeof(uint64_t);
-            }
-            while (p < ascii_end && *p < 0x80) {
-              p++;
-            }
+        if (avx2_ascii_scan) {
+          const char *nonascii = readfile_find_nonascii_avx2(ptr, (size_t)size);
+          if (nonascii == NULL) {
+            p = (uint8_t *)ptr + size;
+            need_validate = false;
+          } else {
+            validate_start = (uint8_t *)nonascii;
           }
+        }
 
-          int todo = (int)(((uint8_t *)ptr + size) - p);
-          if (todo <= 0) {
-            break;
-          }
-          if (*p >= 0x80) {
-            // A length of 1 means it's an illegal byte.  Accept
-            // an incomplete character at the end though, the next
-            // read() will get the next bytes, we'll check it
-            // then.
-            int l = utf_ptr2len_len((char *)p, todo);
-            if (l > todo && !incomplete_tail) {
-              // Avoid retrying with a different encoding when
-              // a truncated file is more likely, or attempting
-              // to read the rest of an incomplete sequence when
-              // we have already done so.
-              if (p > (uint8_t *)ptr || filesize > 0) {
-                incomplete_tail = true;
-              }
-              // Incomplete byte sequence, move it to conv_rest[]
-              // and try to read the rest of it, unless we've
-              // already done so.
-              if (p > (uint8_t *)ptr) {
-                conv_restlen = todo;
-                memmove(conv_rest, p, (size_t)conv_restlen);
-                size -= conv_restlen;
-                break;
-              }
-            }
-            if (l == 1 || l > todo) {
-              // Illegal byte.  If we can try another encoding
-              // do that, unless at EOF where a truncated
-              // file is more likely than a conversion error.
-              if (can_retry && !incomplete_tail) {
-                break;
-              }
-
-              // When we did a conversion report an error.
-              if (iconv_fd != (iconv_t)-1 && conv_error == 0) {
-                conv_error = readfile_linenr(linecnt, ptr, (char *)p);
-              }
-
-              // Remember the first linenr with an illegal byte
-              if (conv_error == 0 && illegal_byte == 0) {
-                illegal_byte = readfile_linenr(linecnt, ptr, (char *)p);
-              }
-
-              // Drop, keep or replace the bad byte.
-              if (bad_char_behavior == BAD_DROP) {
-                memmove(p, p + 1, (size_t)(todo - 1));
-                size--;
-              } else {
-                if (bad_char_behavior != BAD_KEEP) {
-                  *p = (uint8_t)bad_char_behavior;
+        if (need_validate) {
+          // Reading UTF-8: Check if the bytes are valid UTF-8.
+          for (p = validate_start;;) {
+            // Skip ASCII bytes quickly using word-at-a-time check.
+            {
+              uint8_t *ascii_end = (uint8_t *)ptr + size;
+              while (ascii_end - p >= (ptrdiff_t)sizeof(uint64_t)) {
+                uint64_t word;
+                memcpy(&word, p, sizeof(uint64_t));
+                if (word & NONASCII_MASK) {
+                  break;
                 }
+                p += sizeof(uint64_t);
+              }
+              while (p < ascii_end && *p < 0x80) {
                 p++;
               }
-            } else {
-              p += l;
+            }
+
+            int todo = (int)(((uint8_t *)ptr + size) - p);
+            if (todo <= 0) {
+              break;
+            }
+            if (*p >= 0x80) {
+              // A length of 1 means it's an illegal byte.  Accept
+              // an incomplete character at the end though, the next
+              // read() will get the next bytes, we'll check it
+              // then.
+              int l = utf_ptr2len_len((char *)p, todo);
+              if (l > todo && !incomplete_tail) {
+                // Avoid retrying with a different encoding when
+                // a truncated file is more likely, or attempting
+                // to read the rest of an incomplete sequence when
+                // we have already done so.
+                if (p > (uint8_t *)ptr || filesize > 0) {
+                  incomplete_tail = true;
+                }
+                // Incomplete byte sequence, move it to conv_rest[]
+                // and try to read the rest of it, unless we've
+                // already done so.
+                if (p > (uint8_t *)ptr) {
+                  conv_restlen = todo;
+                  memmove(conv_rest, p, (size_t)conv_restlen);
+                  size -= conv_restlen;
+                  break;
+                }
+              }
+              if (l == 1 || l > todo) {
+                // Illegal byte.  If we can try another encoding
+                // do that, unless at EOF where a truncated
+                // file is more likely than a conversion error.
+                if (can_retry && !incomplete_tail) {
+                  break;
+                }
+
+                // When we did a conversion report an error.
+                if (iconv_fd != (iconv_t)-1 && conv_error == 0) {
+                  conv_error = readfile_linenr(linecnt, ptr, (char *)p);
+                }
+
+                // Remember the first linenr with an illegal byte
+                if (conv_error == 0 && illegal_byte == 0) {
+                  illegal_byte = readfile_linenr(linecnt, ptr, (char *)p);
+                }
+
+                // Drop, keep or replace the bad byte.
+                if (bad_char_behavior == BAD_DROP) {
+                  memmove(p, p + 1, (size_t)(todo - 1));
+                  size--;
+                } else {
+                  if (bad_char_behavior != BAD_KEEP) {
+                    *p = (uint8_t)bad_char_behavior;
+                  }
+                  p++;
+                }
+              } else {
+                p += l;
+              }
             }
           }
         }
@@ -1522,7 +2758,8 @@ rewind_retry:
           if (skip_count == 0) {
             *ptr = NUL;                     // end of line
             len = (colnr_T)(ptr - line_start + 1);
-            if (ml_append(lnum, line_start, len, newfile) == FAIL) {
+            if (readfile_put_line(lnum, line_start, len, read_append_flags,
+                                  &read_replaced_empty_line) == FAIL) {
               error = true;
               break;
             }
@@ -1545,78 +2782,101 @@ rewind_retry:
       // Use memchr() for SIMD-optimized newline scanning instead
       // of scanning each byte individually.
       char *end = ptr + size;
+      const bool use_avx2_split = (read_append_flags & ML_APPEND_FAST_NEWFILE)
+                                  && fileformat == EOL_UNIX
+                                  && skip_count == 0
+                                  && read_count > 0
+                                  && !read_undo_file
+                                  && readfile_can_use_avx2();
 
-      while (ptr < end) {
-        char *nl = memchr(ptr, NL, (size_t)(end - ptr));
-        char *nul_scan;
-
-        if (nl == NULL) {
-          // No more newlines in buffer.
-          // Replace any NUL bytes with NL in remaining data.
-          while ((nul_scan = memchr(ptr, NUL, (size_t)(end - ptr))) != NULL) {
-            *nul_scan = NL;
-            ptr = nul_scan + 1;
-          }
-          ptr = end;
-          break;
+      if (use_avx2_split) {
+        bool limit_reached = false;
+        if (readfile_split_unix_avx2(&ptr, &line_start, end, &lnum, &read_count,
+                                     read_append_flags, &read_replaced_empty_line,
+                                     &limit_reached) == FAIL) {
+          error = true;
+        } else if (limit_reached) {
+          error = true;
         }
+      } else {
+        const bool has_nul = memchr(ptr, NUL, (size_t)(end - ptr)) != NULL;
 
-        // Replace NUL bytes with NL before the newline.
-        {
-          char *scan = ptr;
-          while ((nul_scan = memchr(scan, NUL, (size_t)(nl - scan))) != NULL) {
-            *nul_scan = NL;
-            scan = nul_scan + 1;
-          }
-        }
+        while (ptr < end) {
+          char *nl = memchr(ptr, NL, (size_t)(end - ptr));
+          char *nul_scan;
 
-        // Process the newline.
-        ptr = nl;
-        if (skip_count == 0) {
-          *ptr = NUL;                         // end of line
-          len = (colnr_T)(ptr - line_start + 1);
-          if (fileformat == EOL_DOS) {
-            if (ptr > line_start && ptr[-1] == CAR) {
-              // remove CR before NL
-              ptr[-1] = NUL;
-              len--;
-            } else if (ff_error != EOL_DOS) {
-              // Reading in Dos format, but no CR-LF found!
-              // When 'fileformats' includes "unix", delete all
-              // the lines read so far and start all over again.
-              // Otherwise give an error message later.
-              if (try_unix
-                  && !read_stdin
-                  && (read_buffer || vim_lseek(fd, 0, SEEK_SET) == 0)) {
-                fileformat = EOL_UNIX;
-                if (set_options) {
-                  set_fileformat(EOL_UNIX, OPT_LOCAL);
-                }
-                file_rewind = true;
-                keep_fileformat = true;
-                goto retry;
+          if (nl == NULL) {
+            // No more newlines in buffer.
+            // Replace any NUL bytes with NL in remaining data.
+            if (has_nul) {
+              while ((nul_scan = memchr(ptr, NUL, (size_t)(end - ptr))) != NULL) {
+                *nul_scan = NL;
+                ptr = nul_scan + 1;
               }
-              ff_error = EOL_DOS;
+            }
+            ptr = end;
+            break;
+          }
+
+          // Replace NUL bytes with NL before the newline.
+          if (has_nul) {
+            char *scan = ptr;
+            while ((nul_scan = memchr(scan, NUL, (size_t)(nl - scan))) != NULL) {
+              *nul_scan = NL;
+              scan = nul_scan + 1;
             }
           }
-          if (ml_append(lnum, line_start, len, newfile) == FAIL) {
-            error = true;
-            break;
+
+          ptr = nl;
+
+          // Process the newline.
+          if (skip_count == 0) {
+            *ptr = NUL;                         // end of line
+            len = (colnr_T)(ptr - line_start + 1);
+            if (fileformat == EOL_DOS) {
+              if (ptr > line_start && ptr[-1] == CAR) {
+                // remove CR before NL
+                ptr[-1] = NUL;
+                len--;
+              } else if (ff_error != EOL_DOS) {
+                // Reading in Dos format, but no CR-LF found!
+                // When 'fileformats' includes "unix", delete all
+                // the lines read so far and start all over again.
+                // Otherwise give an error message later.
+                if (try_unix
+                    && !read_stdin
+                    && (read_buffer || vim_lseek(fd, 0, SEEK_SET) == 0)) {
+                  fileformat = EOL_UNIX;
+                  if (set_options) {
+                    set_fileformat(EOL_UNIX, OPT_LOCAL);
+                  }
+                  file_rewind = true;
+                  keep_fileformat = true;
+                  goto retry;
+                }
+                ff_error = EOL_DOS;
+              }
+            }
+            if (readfile_put_line(lnum, line_start, len, read_append_flags,
+                                  &read_replaced_empty_line) == FAIL) {
+              error = true;
+              break;
+            }
+            if (read_undo_file) {
+              sha256_update(&sha_ctx, (uint8_t *)line_start, (size_t)len);
+            }
+            lnum++;
+            if (--read_count == 0) {
+              error = true;                         // break loop
+              line_start = ptr;                 // nothing left to write
+              break;
+            }
+          } else {
+            skip_count--;
           }
-          if (read_undo_file) {
-            sha256_update(&sha_ctx, (uint8_t *)line_start, (size_t)len);
-          }
-          lnum++;
-          if (--read_count == 0) {
-            error = true;                         // break loop
-            line_start = ptr;                 // nothing left to write
-            break;
-          }
-        } else {
-          skip_count--;
+          line_start = ptr + 1;
+          ptr++;
         }
-        line_start = ptr + 1;
-        ptr++;
       }
       size = -1;
     }
@@ -1658,7 +2918,8 @@ failed:
     }
     *ptr = NUL;
     len = (colnr_T)(ptr - line_start + 1);
-    if (ml_append(lnum, line_start, len, newfile) == FAIL) {
+    if (readfile_put_line(lnum, line_start, len, read_append_flags,
+                          &read_replaced_empty_line) == FAIL) {
       error = true;
     } else {
       if (read_undo_file) {
@@ -1714,7 +2975,8 @@ failed:
   // In recovery mode everything but autocommands is skipped.
   if (!recoverymode) {
     // need to delete the last line, which comes from the empty buffer
-    if (newfile && wasempty && !(curbuf->b_ml.ml_flags & ML_EMPTY)) {
+    if (newfile && wasempty && !read_replaced_empty_line
+        && !(curbuf->b_ml.ml_flags & ML_EMPTY)) {
       ml_delete(curbuf->b_ml.ml_line_count);
       linecnt--;
     }
@@ -1723,6 +2985,9 @@ failed:
     curbuf->deleted_codepoints = 0;
     curbuf->deleted_codeunits = 0;
     linecnt = curbuf->b_ml.ml_line_count - linecnt;
+    if (read_replaced_empty_line) {
+      linecnt++;
+    }
     if (filesize == 0) {
       linecnt = 0;
     }

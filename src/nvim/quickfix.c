@@ -1924,10 +1924,10 @@ void check_quickfix_busy(void)
 /// @param  valid    valid entry
 ///
 /// @return  QF_OK on success or QF_FAIL on failure.
-static int qf_add_entry(qf_list_T *qfl, char *dir, char *fname, char *module, int bufnum,
-                        char *mesg, linenr_T lnum, linenr_T end_lnum, int col, int end_col,
-                        char vis_col, char *pattern, int nr, char type, typval_T *user_data,
-                        char valid)
+static int qf_add_entry_impl(qf_list_T *qfl, char *dir, char *fname, char *module, int bufnum,
+                             char *mesg, bool take_mesg, linenr_T lnum, linenr_T end_lnum,
+                             int col, int end_col, char vis_col, char *pattern, int nr,
+                             char type, typval_T *user_data, char valid)
 {
   buf_T *buf;
   qfline_T *qfp = xmalloc(sizeof(qfline_T));
@@ -1958,7 +1958,7 @@ static int qf_add_entry(qf_list_T *qfl, char *dir, char *fname, char *module, in
     }
   }
   xfree(fullname);
-  qfp->qf_text = xstrdup(mesg);
+  qfp->qf_text = take_mesg ? mesg : xstrdup(mesg);
   qfp->qf_lnum = lnum;
   qfp->qf_end_lnum = end_lnum;
   qfp->qf_col = col;
@@ -2010,6 +2010,15 @@ static int qf_add_entry(qf_list_T *qfl, char *dir, char *fname, char *module, in
   }
 
   return QF_OK;
+}
+
+static int qf_add_entry(qf_list_T *qfl, char *dir, char *fname, char *module, int bufnum,
+                        char *mesg, linenr_T lnum, linenr_T end_lnum, int col, int end_col,
+                        char vis_col, char *pattern, int nr, char type, typval_T *user_data,
+                        char valid)
+{
+  return qf_add_entry_impl(qfl, dir, fname, module, bufnum, mesg, false, lnum, end_lnum,
+                           col, end_col, vis_col, pattern, nr, type, user_data, valid);
 }
 
 /// Resize quickfix stack to be able to hold n amount of lists.
@@ -5529,6 +5538,73 @@ static bool vgr_qflist_valid(win_T *wp, qf_info_T *qi, unsigned qfid, char *titl
   return true;
 }
 
+static bool vgr_is_literal_utf8(const char *pat, size_t *pat_len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  size_t len = 0;
+
+  while (pat[len] != NUL) {
+    const uint8_t c = (uint8_t)pat[len];
+
+    if (c < 0x20 || c == '\\' || c == '.' || c == '[' || c == '~'
+        || c == '^' || c == '$' || c == '*') {
+      return false;
+    }
+    len++;
+  }
+
+  *pat_len = len;
+  return len > 0 && utf_valid_string(pat, pat + len);
+}
+
+static char *vgr_find_literal(char *str, colnr_T col, size_t line_len, const char *pat,
+                              size_t pat_len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if ((size_t)col >= line_len) {
+    return NULL;
+  }
+
+  char *p = str + col;
+  size_t remaining = line_len - (size_t)col;
+
+  if (pat_len == 1) {
+    return memchr(p, (uint8_t)pat[0], remaining);
+  }
+  if (pat_len == 2) {
+    const uint8_t c0 = (uint8_t)pat[0];
+    const uint8_t c1 = (uint8_t)pat[1];
+    char *end = p + remaining;
+
+    while ((p = memchr(p, c0, (size_t)(end - p))) != NULL) {
+      if ((size_t)(end - p) < 2) {
+        return NULL;
+      }
+      if ((uint8_t)p[1] == c1) {
+        return p;
+      }
+      p++;
+    }
+    return NULL;
+  }
+
+#ifdef __GLIBC__
+  return memmem(p, remaining, pat, pat_len);
+#else
+  char *end = p + remaining;
+  while ((p = memchr(p, (uint8_t)pat[0], (size_t)(end - p))) != NULL) {
+    if ((size_t)(end - p) < pat_len) {
+      return NULL;
+    }
+    if (memcmp(p, pat, pat_len) == 0) {
+      return p;
+    }
+    p++;
+  }
+  return NULL;
+#endif
+}
+
 /// Search for a pattern in all the lines in a buffer and add the matching lines
 /// to a quickfix list.
 static bool vgr_match_buflines(qf_list_T *qfl, char *fname, buf_T *buf, char *spat,
@@ -5536,12 +5612,158 @@ static bool vgr_match_buflines(qf_list_T *qfl, char *fname, buf_T *buf, char *sp
   FUNC_ATTR_NONNULL_ARG(1, 3, 4, 5, 6)
 {
   bool found_match = false;
-  size_t pat_len = strlen(spat);
-  pat_len = MIN(pat_len, FUZZY_MATCH_MAX_LEN);
+  size_t pat_len = 0;
+  const bool literal_utf8 = !(flags & VGR_FUZZY)
+                            && !regmatch->rmm_ic
+                            && vgr_is_literal_utf8(spat, &pat_len);
+  const size_t fuzzy_pat_len = MIN(strlen(spat), FUZZY_MATCH_MAX_LEN);
+  linenr_T literal_block_high = 0;
+  bool literal_block_contains = true;
+
+  if (literal_utf8 && ml_buf_has_mmap_lines(buf)) {
+    mmap_literal_match_T *matches = NULL;
+    size_t match_count = 0;
+    if (ml_get_buf_mmap_literal_matches(buf, spat, pat_len, (flags & VGR_GLOBAL) != 0,
+                                        *tomatch > 0 ? (size_t)*tomatch : 0,
+                                        &matches, &match_count)) {
+      for (size_t i = 0; i < match_count && *tomatch > 0 && !got_int; i++) {
+        const mmap_literal_match_T match = matches[i];
+        char *str = xmemdupz(buf->b_ml.ml_mmap_base + match.line_start, match.line_len);
+        const colnr_T end_col = match.col + (colnr_T)pat_len;
+        if (qf_add_entry_impl(qfl,
+                              NULL,   // dir
+                              fname,
+                              NULL,
+                              duplicate_name ? 0 : buf->b_fnum,
+                              str,
+                              true,   // take_mesg
+                              match.lnum,
+                              match.lnum,
+                              match.col + 1,
+                              end_col + 1,
+                              false,  // vis_col
+                              NULL,   // search pattern
+                              0,      // nr
+                              0,      // type
+                              NULL,   // user_data
+                              true)   // valid
+            == QF_FAIL) {
+          got_int = true;
+          break;
+        }
+
+        found_match = true;
+        (*tomatch)--;
+      }
+      xfree(matches);
+      return found_match;
+    }
+
+    linenr_T lnum = 1;
+    size_t search_offset = 0;
+    size_t line_start = 0;
+    while (lnum <= buf->b_ml.ml_line_count && *tomatch > 0 && !got_int) {
+      char *str = NULL;
+      size_t line_len = 0;
+      colnr_T match_col = 0;
+
+      if (!ml_get_buf_mmap_literal_match_at(buf, &search_offset, &lnum, &line_start,
+                                            spat, pat_len, &str, &line_len, &match_col)) {
+        break;
+      }
+
+      const colnr_T end_col = match_col + (colnr_T)pat_len;
+      const size_t line_end = line_start + line_len;
+      if (qf_add_entry_impl(qfl,
+                            NULL,   // dir
+                            fname,
+                            NULL,
+                            duplicate_name ? 0 : buf->b_fnum,
+                            str,
+                            true,   // take_mesg
+                            lnum,
+                            lnum,
+                            match_col + 1,
+                            end_col + 1,
+                            false,  // vis_col
+                            NULL,   // search pattern
+                            0,      // nr
+                            0,      // type
+                            NULL,   // user_data
+                            true)   // valid
+          == QF_FAIL) {
+        got_int = true;
+        break;
+      }
+
+      found_match = true;
+      if (--*tomatch == 0) {
+        break;
+      }
+      if ((flags & VGR_GLOBAL) == 0) {
+        search_offset = line_end;
+      } else {
+        search_offset += pat_len;
+        search_offset = MIN(search_offset, line_end);
+      }
+    }
+    return found_match;
+  }
 
   for (linenr_T lnum = 1; lnum <= buf->b_ml.ml_line_count && *tomatch > 0; lnum++) {
     colnr_T col = 0;
-    if (!(flags & VGR_FUZZY)) {
+    if (literal_utf8) {
+      if (lnum > literal_block_high) {
+        literal_block_high = ml_get_buf_literal_block_end(buf, lnum, spat, pat_len,
+                                                          &literal_block_contains);
+      }
+      if (!literal_block_contains) {
+        lnum = literal_block_high;
+        continue;
+      }
+
+      char *const str = ml_get_buf(buf, lnum);
+      const size_t line_len = (size_t)ml_get_buf_len(buf, lnum);
+
+      while (true) {
+        char *match = vgr_find_literal(str, col, line_len, spat, pat_len);
+        if (match == NULL) {
+          break;
+        }
+
+        const colnr_T start_col = (colnr_T)(match - str);
+        const colnr_T end_col = start_col + (colnr_T)pat_len;
+
+        if (qf_add_entry(qfl,
+                         NULL,   // dir
+                         fname,
+                         NULL,
+                         duplicate_name ? 0 : buf->b_fnum,
+                         str,
+                         lnum,
+                         lnum,
+                         start_col + 1,
+                         end_col + 1,
+                         false,  // vis_col
+                         NULL,   // search pattern
+                         0,      // nr
+                         0,      // type
+                         NULL,   // user_data
+                         true)   // valid
+            == QF_FAIL) {
+          got_int = true;
+          break;
+        }
+        found_match = true;
+        if (--*tomatch == 0 || (flags & VGR_GLOBAL) == 0) {
+          break;
+        }
+        col = end_col;
+        if ((size_t)col > line_len) {
+          break;
+        }
+      }
+    } else if (!(flags & VGR_FUZZY)) {
       // Regular expression match
       while (vim_regexec_multi(regmatch, curwin, buf, lnum, col, NULL, NULL) > 0) {
         // Pass the buffer number so that it gets used even for a
@@ -5619,7 +5841,7 @@ static bool vgr_match_buflines(qf_list_T *qfl, char *fname, buf_T *buf, char *sp
         if ((flags & VGR_GLOBAL) == 0) {
           break;
         }
-        col = (colnr_T)matches[pat_len - 1] + col + 1;
+        col = (colnr_T)matches[fuzzy_pat_len - 1] + col + 1;
         if (col > linelen) {
           break;
         }

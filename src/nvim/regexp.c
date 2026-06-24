@@ -132,6 +132,8 @@ typedef struct {
   int reganch;          ///< pattern starts with ^
   int regstart;         ///< char at start of pattern
   uint8_t *match_text;  ///< plain text to match with
+  uint8_t *match_text_full;  ///< full plain text to match with
+  size_t match_text_full_len;  ///< byte length of match_text_full
 
   int has_zend;         ///< pattern contains \ze
   int has_backref;      ///< pattern contains \1 .. \9
@@ -8730,11 +8732,12 @@ static int nfa_get_regstart(nfa_state_T *start, int depth)
 // Figure out if the NFA state list contains just literal text and nothing
 // else.  If so return a string in allocated memory with what must match after
 // regstart.  Otherwise return NULL.
-static uint8_t *nfa_get_match_text(nfa_state_T *start)
+static uint8_t *nfa_get_match_text(nfa_state_T *start, uint8_t **fullp, size_t *full_lenp)
 {
   nfa_state_T *p = start;
   int len = 0;
   uint8_t *ret;
+  uint8_t *full;
   uint8_t *s;
 
   if (p->c != NFA_MOPEN) {
@@ -8748,6 +8751,17 @@ static uint8_t *nfa_get_match_text(nfa_state_T *start)
   if (p->c != NFA_MCLOSE || p->out->c != NFA_MATCH) {
     return NULL;
   }
+
+  full = xmalloc((size_t)len + 1);
+  p = start->out;
+  s = full;
+  while (p->c > 0) {
+    s += utf_char2bytes(p->c, (char *)s);
+    p = p->out;
+  }
+  *s = NUL;
+  *fullp = full;
+  *full_lenp = (size_t)(s - full);
 
   ret = xmalloc((size_t)len);
   p = start->out->out;     // skip first char, it goes into regstart
@@ -14046,36 +14060,50 @@ static int skip_to_start(int c, colnr_T *colp)
 }
 
 // Check for a match with match_text.
-// Called after skip_to_start() has found regstart.
+// For case-sensitive literal search this may start before regstart; the full
+// literal text is used to find the next candidate directly.
 // Returns zero for no match, 1 for a match.
-static int find_match_text(colnr_T *startcol, int regstart, uint8_t *match_text)
+static int find_match_text(colnr_T *startcol, int regstart, uint8_t *match_text,
+                           uint8_t *match_text_full, size_t match_text_full_len)
 {
   colnr_T col = *startcol;
   const int regstart_len = utf_char2len(regstart);
 
   while (true) {
     bool match = true;
-    uint8_t *s1 = match_text;
-    // skip regstart
-    int regstart_len2 = regstart_len;
-    if (regstart_len2 > 1 && utf_ptr2len((char *)rex.line + col) != regstart_len2) {
-      // because of case-folding of the previously matched text, we may need
-      // to skip fewer bytes than utf_char2len(regstart)
-      regstart_len2 = utf_char2len(utf_fold(regstart));
-    }
-    uint8_t *s2 = rex.line + col + regstart_len2;
-    while (*s1) {
-      int c1_len = utf_ptr2len((char *)s1);
-      int c1 = utf_ptr2char((char *)s1);
-      int c2_len = utf_ptr2len((char *)s2);
-      int c2 = utf_ptr2char((char *)s2);
-      if (c1 != c2 && (!rex.reg_ic || utf_fold(c1) != utf_fold(c2))) {
-        match = false;
+    uint8_t *s2;
+
+    if (!rex.reg_ic) {
+      const char *s = strstr((char *)rex.line + col, (char *)match_text_full);
+      if (s == NULL) {
         break;
       }
-      s1 += c1_len;
-      s2 += c2_len;
+      col = (colnr_T)(s - (char *)rex.line);
+      s2 = rex.line + col + match_text_full_len;
+    } else {
+      // skip regstart
+      int regstart_len2 = regstart_len;
+      if (regstart_len2 > 1 && utf_ptr2len((char *)rex.line + col) != regstart_len2) {
+        // because of case-folding of the previously matched text, we may need
+        // to skip fewer bytes than utf_char2len(regstart)
+        regstart_len2 = utf_char2len(utf_fold(regstart));
+      }
+      s2 = rex.line + col + regstart_len2;
+      uint8_t *s1 = match_text;
+      while (*s1) {
+        int c1_len = utf_ptr2len((char *)s1);
+        int c1 = utf_ptr2char((char *)s1);
+        int c2_len = utf_ptr2len((char *)s2);
+        int c2 = utf_ptr2char((char *)s2);
+        if (c1 != c2 && utf_fold(c1) != utf_fold(c2)) {
+          match = false;
+          break;
+        }
+        s1 += c1_len;
+        s2 += c2_len;
+      }
     }
+
     if (match
         // check that no composing char follows
         && !utf_iscomposing_legacy(utf_ptr2char((char *)s2))) {
@@ -15746,22 +15774,28 @@ static int nfa_regexec_both(uint8_t *line, colnr_T startcol, proftime_T *tm, int
   }
 
   if (prog->regstart != NUL) {
-    // Skip ahead until a character we know the match must start with.
-    // When there is none there is no match.
-    if (skip_to_start(prog->regstart, &col) == FAIL) {
-      return 0L;
-    }
-
     // If match_text is set it contains the full text that must match.
     // Nothing else to try. Doesn't handle combining chars well.
     if (prog->match_text != NULL && *prog->match_text != NUL && !rex.reg_icombine) {
-      retval = find_match_text(&col, prog->regstart, prog->match_text);
+      // Case-sensitive literal search uses match_text_full below, so a separate
+      // first-character scan would only duplicate work.
+      if (rex.reg_ic && skip_to_start(prog->regstart, &col) == FAIL) {
+        return 0L;
+      }
+      retval = find_match_text(&col, prog->regstart, prog->match_text, prog->match_text_full,
+                               prog->match_text_full_len);
       if (REG_MULTI) {
         rex.reg_mmatch->rmm_matchcol = col;
       } else {
         rex.reg_match->rm_matchcol = col;
       }
       return retval;
+    }
+
+    // Skip ahead until a character we know the match must start with.
+    // When there is none there is no match.
+    if (skip_to_start(prog->regstart, &col) == FAIL) {
+      return 0L;
     }
   }
 
@@ -15864,6 +15898,9 @@ static regprog_T *nfa_regcomp(uint8_t *expr, int re_flags)
   prog = xmalloc(prog_size);
   state_ptr = prog->state;
   prog->re_in_use = false;
+  prog->match_text = NULL;
+  prog->match_text_full = NULL;
+  prog->match_text_full_len = 0;
   prog->listbuf[0] = NULL;
   prog->listbuf[1] = NULL;
 
@@ -15884,7 +15921,8 @@ static regprog_T *nfa_regcomp(uint8_t *expr, int re_flags)
 
   prog->reganch = nfa_get_reganch(prog->start, 0);
   prog->regstart = nfa_get_regstart(prog->start, 0);
-  prog->match_text = nfa_get_match_text(prog->start);
+  prog->match_text = nfa_get_match_text(prog->start, &prog->match_text_full,
+                                        &prog->match_text_full_len);
 
 #ifdef REGEXP_DEBUG
   nfa_postfix_dump(expr, OK);
@@ -15920,6 +15958,7 @@ static void nfa_regfree(regprog_T *prog)
   }
 
   xfree(((nfa_regprog_T *)prog)->match_text);
+  xfree(((nfa_regprog_T *)prog)->match_text_full);
   xfree(((nfa_regprog_T *)prog)->pattern);
   xfree(((nfa_regprog_T *)prog)->listbuf[0]);
   xfree(((nfa_regprog_T *)prog)->listbuf[1]);

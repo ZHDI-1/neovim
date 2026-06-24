@@ -21,5 +21,9 @@ enum {
 enum {
   ML_APPEND_NEW = 1,   // starting to edit a new file
   ML_APPEND_MARK = 2,  // mark the new line
-  // ML_APPEND_UNDO = 4,  // called from undo
+  ML_APPEND_FAST_NEWFILE = 4,  // readfile() can use new-file append fast paths
+};
+
+enum {
+  ML_MMAP_INDEX_STRIDE = 4096,  // mmap index stores one byte offset per this many lines
 };

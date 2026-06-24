@@ -215,6 +215,41 @@ describe('quickfix', function()
   end)
 end)
 
+it(':vimgrep keeps literal fast path separate from regex patterns', function()
+  local file = file_base .. '_vimgrep_literal'
+  write_file(file,
+    'panic: path/to status=500\npanic path status 500\nf.o\nfao\nfoo\naa中🙂bb\nstatus Z: done\n')
+  finally(function()
+    os.remove(file)
+  end)
+
+  command('set noignorecase nosmartcase regexpengine=2')
+  command('vimgrep /panic:/gj ' .. file)
+  local list = fn.getqflist()
+  eq(1, #list)
+  eq({ 1, 1, 7 }, { list[1].lnum, list[1].col, list[1].end_col })
+
+  command('vimgrep /path\\/to/gj ' .. file)
+  list = fn.getqflist()
+  eq(1, #list)
+  eq({ 1, 8, 15 }, { list[1].lnum, list[1].col, list[1].end_col })
+
+  command('vimgrep /f.o/gj ' .. file)
+  list = fn.getqflist()
+  eq(3, #list)
+  eq({ 3, 4, 5 }, { list[1].lnum, list[2].lnum, list[3].lnum })
+
+  command('vimgrep /中🙂/gj ' .. file)
+  list = fn.getqflist()
+  eq(1, #list)
+  eq({ 6, 3, 10 }, { list[1].lnum, list[1].col, list[1].end_col })
+
+  command('vimgrep /Z:/gj ' .. file)
+  list = fn.getqflist()
+  eq(1, #list)
+  eq({ 7, 8, 10 }, { list[1].lnum, list[1].col, list[1].end_col })
+end)
+
 it(':vimgrep can specify Unicode pattern without delimiters', function()
   eq(
     'Vim(vimgrep):E480: No match: →',

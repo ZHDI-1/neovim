@@ -46,7 +46,26 @@
 #include <time.h>
 #include <uv.h>
 
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+# include <immintrin.h>
+# define NVIM_MEMLINE_AVX2 1
+# define NVIM_MEMLINE_AVX2_TARGET __attribute__((target("avx2")))
+# if defined(__x86_64__)
+#  define NVIM_MEMLINE_AVX512BW 1
+#  define NVIM_MEMLINE_AVX512BW_TARGET __attribute__((target("avx512f,avx512bw")))
+# endif
+#else
+# define NVIM_MEMLINE_AVX2_TARGET
+#endif
+
+#ifndef NVIM_MEMLINE_AVX512BW_TARGET
+# define NVIM_MEMLINE_AVX512BW_TARGET
+#endif
+
 #include "auto/config.h"
+#ifdef UNIX
+# include <sys/mman.h>
+#endif
 #include "klib/kvec.h"
 #include "nvim/ascii_defs.h"
 #include "nvim/autocmd.h"
@@ -160,6 +179,23 @@ typedef struct {
 #define HEADER_SIZE (offsetof(DataBlock, db_index))  // size of data block header
 
 enum {
+  // Sequential new-file reads append millions of short lines.  Using larger
+  // data blocks there reduces memline tree/hash churn without changing the
+  // block format or general edit-time allocation policy.
+  ML_NEWFILE_DATA_PAGES = 16,
+};
+
+enum {
+  MLCS_MAXL = 800,  // max no of lines in chunk
+  MLCS_MINL = 400,  // should be half of MLCS_MAXL
+};
+
+static buf_T *ml_upd_lastbuf = NULL;
+static linenr_T ml_upd_lastline;
+static linenr_T ml_upd_lastcurline;
+static int ml_upd_lastcurix;
+
+enum {
   B0_FNAME_SIZE_ORG = 900,      // what it was in older versions
   B0_FNAME_SIZE_NOCRYPT = 898,  // 2 bytes used for other things
   B0_FNAME_SIZE_CRYPT = 890,    // 10 bytes used for other things
@@ -256,6 +292,34 @@ typedef enum {
   SEA_CHOICE_ABORT = 6,
 } sea_choice_T;
 
+enum {
+  ML_MMAP_PARALLEL_MATCH_MIN_SIZE = 128 * 1024 * 1024,
+  ML_MMAP_PARALLEL_MATCH_MAX_THREADS = 32,
+  ML_MMAP_PARALLEL_MATCH_LIMIT = 1024 * 1024,
+};
+
+typedef enum {
+  kMlMmapNlScanScalar = 0,
+  kMlMmapNlScanAvx2,
+  kMlMmapNlScanAvx512bw,
+} ml_mmap_nl_scan_T;
+
+typedef struct {
+  const char *base;
+  size_t start_offset;
+  size_t end_offset;
+  linenr_T start_lnum;
+  const char *pat;
+  size_t pat_len;
+  bool global;
+  ml_mmap_nl_scan_T nl_scan;
+  mmap_literal_match_T *matches;
+  size_t match_count;
+  size_t match_capacity;
+  size_t match_limit;
+  bool overflow;
+} ml_mmap_literal_match_job_T;
+
 #include "memline.c.generated.h"
 
 static const char e_ml_get_invalid_lnum_nr[]
@@ -281,6 +345,790 @@ static const char e_warning_pointer_block_corrupted[]
 # define ML_GET_ALLOC_LINES
 #endif
 
+static inline bool ml_mmap_is_active(const buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_ALWAYS_INLINE
+{
+  return buf->b_ml.ml_mmap_base != NULL;
+}
+
+static void ml_mmap_clear_cache(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (buf->b_ml.ml_line_lnum != 0
+      && (buf->b_ml.ml_flags & (ML_LINE_DIRTY | ML_ALLOCATED))) {
+    xfree(buf->b_ml.ml_line_ptr);
+  }
+  buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
+  buf->b_ml.ml_line_lnum = 0;
+  buf->b_ml.ml_line_offset = 0;
+}
+
+static void ml_mmap_close(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (buf->b_ml.ml_mmap_base != NULL) {
+#ifdef UNIX
+    munmap(buf->b_ml.ml_mmap_base, buf->b_ml.ml_mmap_size);
+#endif
+    buf->b_ml.ml_mmap_base = NULL;
+    buf->b_ml.ml_mmap_size = 0;
+  }
+  XFREE_CLEAR(buf->b_ml.ml_mmap_line_starts);
+  buf->b_ml.ml_mmap_index_count = 0;
+  buf->b_ml.ml_mmap_noeol = false;
+  ml_mmap_clear_cache(buf);
+}
+
+static inline size_t ml_mmap_index_for_lnum(linenr_T lnum)
+  FUNC_ATTR_CONST FUNC_ATTR_ALWAYS_INLINE
+{
+  return (size_t)((lnum - 1) / ML_MMAP_INDEX_STRIDE);
+}
+
+static size_t ml_mmap_line_start_offset(const buf_T *buf, linenr_T lnum)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  const size_t index = ml_mmap_index_for_lnum(lnum);
+  linenr_T cur_lnum = (linenr_T)(index * ML_MMAP_INDEX_STRIDE) + 1;
+  size_t offset = buf->b_ml.ml_mmap_line_starts[index];
+
+  while (cur_lnum < lnum) {
+    const char *nl = memchr(buf->b_ml.ml_mmap_base + offset, NL,
+                            buf->b_ml.ml_mmap_size - offset);
+    if (nl == NULL) {
+      return buf->b_ml.ml_mmap_size;
+    }
+    offset = (size_t)(nl + 1 - buf->b_ml.ml_mmap_base);
+    cur_lnum++;
+  }
+  return offset;
+}
+
+static void ml_mmap_line_bounds(const buf_T *buf, linenr_T lnum, size_t *startp, size_t *endp)
+  FUNC_ATTR_NONNULL_ALL
+{
+  const size_t start = ml_mmap_line_start_offset(buf, lnum);
+  const char *nl = memchr(buf->b_ml.ml_mmap_base + start, NL, buf->b_ml.ml_mmap_size - start);
+
+  *startp = start;
+  *endp = nl == NULL ? buf->b_ml.ml_mmap_size : (size_t)(nl - buf->b_ml.ml_mmap_base);
+}
+
+static linenr_T ml_mmap_lnum_for_offset(const buf_T *buf, size_t offset, size_t *startp,
+                                        size_t *endp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (offset >= buf->b_ml.ml_mmap_size || buf->b_ml.ml_mmap_index_count == 0) {
+    return 0;
+  }
+
+  size_t low = 0;
+  size_t high = buf->b_ml.ml_mmap_index_count - 1;
+  while (low < high) {
+    const size_t mid = low + (high - low + 1) / 2;
+    if (buf->b_ml.ml_mmap_line_starts[mid] <= offset) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  linenr_T lnum = (linenr_T)(low * ML_MMAP_INDEX_STRIDE) + 1;
+  size_t line_start = buf->b_ml.ml_mmap_line_starts[low];
+  while (lnum <= buf->b_ml.ml_line_count) {
+    const char *nl = memchr(buf->b_ml.ml_mmap_base + line_start, NL,
+                            buf->b_ml.ml_mmap_size - line_start);
+    const size_t line_end = nl == NULL ? buf->b_ml.ml_mmap_size
+                                       : (size_t)(nl - buf->b_ml.ml_mmap_base);
+    if (offset <= line_end) {
+      *startp = line_start;
+      *endp = line_end;
+      return lnum;
+    }
+    if (nl == NULL) {
+      return 0;
+    }
+    line_start = line_end + 1;
+    lnum++;
+  }
+
+  return 0;
+}
+
+static int ml_mmap_materialize(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (!ml_mmap_is_active(buf)) {
+    return OK;
+  }
+
+  char *base = buf->b_ml.ml_mmap_base;
+  const size_t size = buf->b_ml.ml_mmap_size;
+  size_t *starts = buf->b_ml.ml_mmap_line_starts;
+  const linenr_T line_count = buf->b_ml.ml_line_count;
+
+  ml_mmap_clear_cache(buf);
+  buf->b_ml.ml_mmap_base = NULL;
+  buf->b_ml.ml_mmap_size = 0;
+  buf->b_ml.ml_mmap_line_starts = NULL;
+  buf->b_ml.ml_mmap_index_count = 0;
+  buf->b_ml.ml_mmap_noeol = false;
+
+  XFREE_CLEAR(buf->b_ml.ml_chunksize);
+  buf->b_ml.ml_numchunks = 0;
+  buf->b_ml.ml_usedchunks = 0;
+  ml_upd_lastbuf = NULL;
+
+  // The normal memline tree still contains the empty line created by ml_open().
+  buf->b_ml.ml_line_count = 1;
+  buf->b_ml.ml_flags |= ML_EMPTY;
+
+  int ret = OK;
+  char *line_start = base;
+  char *const file_end = base + size;
+  for (linenr_T lnum = 1; lnum <= line_count; lnum++) {
+    char *line_end = memchr(line_start, NL, (size_t)(file_end - line_start));
+    if (line_end == NULL) {
+      line_end = file_end;
+    }
+    const size_t len = (size_t)(line_end - line_start);
+    char *line = xmemdupz(line_start, len);
+
+    if (lnum == 1) {
+      ret = ml_replace_buf_len(buf, 1, line, len, false, false);
+    } else {
+      ret = ml_append_buf(buf, lnum - 1, line, (colnr_T)(len + 1), true);
+      xfree(line);
+    }
+    if (ret == FAIL) {
+      break;
+    }
+    line_start = line_end < file_end ? line_end + 1 : line_end;
+  }
+  ml_flush_line(buf, false);
+
+#ifdef UNIX
+  munmap(base, size);
+#endif
+  xfree(starts);
+  return ret;
+}
+
+/// Install an mmap-backed read-only memline representation.
+///
+/// Ownership of "base" and "line_starts" transfers to memline on success.
+/// Callers must keep the normal memline tree in its initial empty-buffer state.
+/// A swapfile may already be open; it then represents an unchanged buffer until
+/// the mmap lines are materialized on the first mutation.
+int ml_set_mmap_lines(buf_T *buf, char *base, size_t size, size_t *line_starts,
+                      size_t index_count, linenr_T line_count, bool noeol)
+  FUNC_ATTR_NONNULL_ALL
+{
+  const size_t expected_index_count = ml_mmap_index_for_lnum(line_count) + 1;
+
+  if (buf->b_ml.ml_mfp == NULL
+      || buf->b_ml.ml_line_count != 1
+      || !(buf->b_ml.ml_flags & ML_EMPTY)
+      || index_count != expected_index_count
+      || line_count < 1
+      || ml_mmap_is_active(buf)) {
+    return FAIL;
+  }
+
+  ml_flush_line(buf, false);
+  buf->b_ml.ml_mmap_base = base;
+  buf->b_ml.ml_mmap_size = size;
+  buf->b_ml.ml_mmap_line_starts = line_starts;
+  buf->b_ml.ml_mmap_index_count = index_count;
+  buf->b_ml.ml_mmap_noeol = noeol;
+  buf->b_ml.ml_line_count = line_count;
+  buf->b_ml.ml_flags &= ~ML_EMPTY;
+  ml_upd_lastbuf = NULL;
+  return OK;
+}
+
+bool ml_buf_has_mmap_lines(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf);
+}
+
+static const char *ml_mmap_find_literal_avx512bw(const char *text, size_t text_len,
+                                                 const char *pat, size_t pat_len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT NVIM_MEMLINE_AVX512BW_TARGET;
+
+static const char *ml_mmap_find_literal_avx512bw(const char *text, size_t text_len,
+                                                 const char *pat, size_t pat_len)
+{
+#ifdef NVIM_MEMLINE_AVX512BW
+  if (text_len < pat_len) {
+    return NULL;
+  }
+
+  const char *p = text;
+  const char *const end = text + text_len;
+  const char *const safe_end = end - pat_len + 1;
+  const __m512i first = _mm512_set1_epi8(pat[0]);
+
+  while (safe_end - p >= 64) {
+    const __m512i data = _mm512_loadu_si512((const void *)p);
+    uint64_t mask = (uint64_t)_mm512_cmpeq_epi8_mask(data, first);
+    while (mask != 0) {
+      const unsigned bit = (unsigned)__builtin_ctzll(mask);
+      const char *candidate = p + bit;
+      if (memcmp(candidate, pat, pat_len) == 0) {
+        return candidate;
+      }
+      mask &= mask - 1;
+    }
+    p += 64;
+  }
+
+  while (p < safe_end) {
+    const char *candidate = memchr(p, (uint8_t)pat[0], (size_t)(safe_end - p));
+    if (candidate == NULL) {
+      return NULL;
+    }
+    if (memcmp(candidate, pat, pat_len) == 0) {
+      return candidate;
+    }
+    p = candidate + 1;
+  }
+  return NULL;
+#else
+  (void)text;
+  (void)text_len;
+  (void)pat;
+  (void)pat_len;
+  return NULL;
+#endif
+}
+
+static const char *ml_mmap_find_literal_avx2(const char *text, size_t text_len,
+                                             const char *pat, size_t pat_len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT NVIM_MEMLINE_AVX2_TARGET;
+
+static const char *ml_mmap_find_literal_avx2(const char *text, size_t text_len,
+                                             const char *pat, size_t pat_len)
+{
+#ifdef NVIM_MEMLINE_AVX2
+  if (text_len < pat_len) {
+    return NULL;
+  }
+
+  const char *p = text;
+  const char *const end = text + text_len;
+  const char *const safe_end = end - pat_len + 1;
+  const __m256i first = _mm256_set1_epi8(pat[0]);
+
+  while (safe_end - p >= 32) {
+    const __m256i data = _mm256_loadu_si256((const __m256i *)(const void *)p);
+    uint32_t mask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(data, first));
+    while (mask != 0) {
+      const unsigned bit = (unsigned)__builtin_ctz(mask);
+      const char *candidate = p + bit;
+      if (memcmp(candidate, pat, pat_len) == 0) {
+        return candidate;
+      }
+      mask &= mask - 1;
+    }
+    p += 32;
+  }
+
+  while (p < safe_end) {
+    const char *candidate = memchr(p, (uint8_t)pat[0], (size_t)(safe_end - p));
+    if (candidate == NULL) {
+      return NULL;
+    }
+    if (memcmp(candidate, pat, pat_len) == 0) {
+      return candidate;
+    }
+    p = candidate + 1;
+  }
+  return NULL;
+#else
+  (void)text;
+  (void)text_len;
+  (void)pat;
+  (void)pat_len;
+  return NULL;
+#endif
+}
+
+static const char *ml_mmap_find_literal(const char *text, size_t text_len, const char *pat,
+                                        size_t pat_len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (pat_len == 1) {
+    return memchr(text, (uint8_t)pat[0], text_len);
+  }
+  if (pat_len == 2) {
+    const uint8_t c0 = (uint8_t)pat[0];
+    const uint8_t c1 = (uint8_t)pat[1];
+    const char *p = text;
+    const char *end = text + text_len;
+
+    while ((p = memchr(p, c0, (size_t)(end - p))) != NULL) {
+      if ((size_t)(end - p) < 2) {
+        return NULL;
+      }
+      if ((uint8_t)p[1] == c1) {
+        return p;
+      }
+      p++;
+    }
+    return NULL;
+  }
+
+  if (ml_mmap_can_use_avx512bw()) {
+    return ml_mmap_find_literal_avx512bw(text, text_len, pat, pat_len);
+  }
+  if (ml_mmap_can_use_avx2()) {
+    return ml_mmap_find_literal_avx2(text, text_len, pat, pat_len);
+  }
+
+#ifdef __GLIBC__
+  return memmem(text, text_len, pat, pat_len);
+#else
+  const char *p = text;
+  const char *end = text + text_len;
+  while ((p = memchr(p, (uint8_t)pat[0], (size_t)(end - p))) != NULL) {
+    if ((size_t)(end - p) < pat_len) {
+      return NULL;
+    }
+    if (memcmp(p, pat, pat_len) == 0) {
+      return p;
+    }
+    p++;
+  }
+  return NULL;
+#endif
+}
+
+static bool ml_mmap_can_use_avx2(void)
+{
+#ifdef NVIM_MEMLINE_AVX2
+  static bool checked = false;
+  static bool has_avx2 = false;
+
+  if (!checked) {
+    __builtin_cpu_init();
+    has_avx2 = __builtin_cpu_supports("avx2");
+    checked = true;
+  }
+
+  return has_avx2;
+#else
+  return false;
+#endif
+}
+
+static bool ml_mmap_can_use_avx512bw(void)
+{
+#ifdef NVIM_MEMLINE_AVX512BW
+  static bool checked = false;
+  static bool has_avx512bw = false;
+
+  if (!checked) {
+    __builtin_cpu_init();
+    has_avx512bw = __builtin_cpu_supports("avx512f")
+                   && __builtin_cpu_supports("avx512bw");
+    checked = true;
+  }
+
+  return has_avx512bw;
+#else
+  return false;
+#endif
+}
+
+static size_t ml_mmap_count_newlines_avx512bw(const char *text, size_t text_len,
+                                              const char **last_nlp)
+  FUNC_ATTR_NONNULL_ALL NVIM_MEMLINE_AVX512BW_TARGET;
+
+static size_t ml_mmap_count_newlines_avx512bw(const char *text, size_t text_len,
+                                              const char **last_nlp)
+{
+#ifdef NVIM_MEMLINE_AVX512BW
+  const char *p = text;
+  const char *const end = text + text_len;
+  const char *last_nl = NULL;
+  size_t count = 0;
+  const __m512i nl = _mm512_set1_epi8(NL);
+
+  while (end - p >= 64) {
+    const __m512i data = _mm512_loadu_si512((const void *)p);
+    const uint64_t mask = _mm512_cmpeq_epi8_mask(data, nl);
+    if (mask != 0) {
+      count += (size_t)__builtin_popcountll(mask);
+      last_nl = p + (63 - __builtin_clzll(mask));
+    }
+    p += 64;
+  }
+
+  while (p < end) {
+    if (*p == NL) {
+      count++;
+      last_nl = p;
+    }
+    p++;
+  }
+
+  *last_nlp = last_nl;
+  return count;
+#else
+  (void)text;
+  (void)text_len;
+  *last_nlp = NULL;
+  return 0;
+#endif
+}
+
+static size_t ml_mmap_count_newlines_avx2(const char *text, size_t text_len,
+                                          const char **last_nlp)
+  FUNC_ATTR_NONNULL_ALL NVIM_MEMLINE_AVX2_TARGET;
+
+static size_t ml_mmap_count_newlines_avx2(const char *text, size_t text_len,
+                                          const char **last_nlp)
+{
+#ifdef NVIM_MEMLINE_AVX2
+  const char *p = text;
+  const char *const end = text + text_len;
+  const char *last_nl = NULL;
+  size_t count = 0;
+  const __m256i nl = _mm256_set1_epi8(NL);
+
+  while (end - p >= 32) {
+    const __m256i data = _mm256_loadu_si256((const __m256i *)(const void *)p);
+    const unsigned mask = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(data, nl));
+    if (mask != 0) {
+      count += (size_t)__builtin_popcount(mask);
+      last_nl = p + (31 - __builtin_clz(mask));
+    }
+    p += 32;
+  }
+
+  while (p < end) {
+    if (*p == NL) {
+      count++;
+      last_nl = p;
+    }
+    p++;
+  }
+
+  *last_nlp = last_nl;
+  return count;
+#else
+  (void)text;
+  (void)text_len;
+  *last_nlp = NULL;
+  return 0;
+#endif
+}
+
+static size_t ml_mmap_count_newlines_scalar(const char *text, size_t text_len,
+                                            const char **last_nlp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  const char *p = text;
+  const char *const end = text + text_len;
+  const char *last_nl = NULL;
+  size_t count = 0;
+
+  while (p < end) {
+    const char *nl = memchr(p, NL, (size_t)(end - p));
+    if (nl == NULL) {
+      break;
+    }
+    count++;
+    last_nl = nl;
+    p = nl + 1;
+  }
+
+  *last_nlp = last_nl;
+  return count;
+}
+
+static size_t ml_mmap_count_newlines(const char *text, size_t text_len, const char **last_nlp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (ml_mmap_can_use_avx512bw()) {
+    return ml_mmap_count_newlines_avx512bw(text, text_len, last_nlp);
+  }
+  if (ml_mmap_can_use_avx2()) {
+    return ml_mmap_count_newlines_avx2(text, text_len, last_nlp);
+  }
+  return ml_mmap_count_newlines_scalar(text, text_len, last_nlp);
+}
+
+static size_t ml_mmap_count_newlines_with_scan(const char *text, size_t text_len,
+                                               const char **last_nlp,
+                                               ml_mmap_nl_scan_T nl_scan)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  switch (nl_scan) {
+  case kMlMmapNlScanAvx512bw:
+    return ml_mmap_count_newlines_avx512bw(text, text_len, last_nlp);
+  case kMlMmapNlScanAvx2:
+    return ml_mmap_count_newlines_avx2(text, text_len, last_nlp);
+  case kMlMmapNlScanScalar:
+    break;
+  }
+  return ml_mmap_count_newlines_scalar(text, text_len, last_nlp);
+}
+
+static bool ml_mmap_literal_match_append(ml_mmap_literal_match_job_T *job,
+                                         mmap_literal_match_T match)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (job->match_count >= job->match_limit) {
+    job->overflow = true;
+    return false;
+  }
+
+  if (job->match_count == job->match_capacity) {
+    size_t new_capacity = job->match_capacity == 0 ? 128 : job->match_capacity * 2;
+    new_capacity = MIN(new_capacity, job->match_limit);
+    job->matches = xrealloc(job->matches, new_capacity * sizeof *job->matches);
+    job->match_capacity = new_capacity;
+  }
+
+  job->matches[job->match_count++] = match;
+  return true;
+}
+
+static void ml_mmap_literal_match_worker(void *arg)
+{
+  ml_mmap_literal_match_job_T *job = arg;
+  const char *const base = job->base;
+  const char *p = base + job->start_offset;
+  const char *const scan_end = base + job->end_offset;
+  linenr_T lnum = job->start_lnum;
+  size_t line_start = job->start_offset;
+
+  while (p < scan_end) {
+    const char *match = ml_mmap_find_literal(p, (size_t)(scan_end - p),
+                                             job->pat, job->pat_len);
+    if (match == NULL) {
+      break;
+    }
+
+    const char *last_nl = NULL;
+    const size_t newline_count =
+      ml_mmap_count_newlines_with_scan(p, (size_t)(match - p), &last_nl, job->nl_scan);
+    lnum += (linenr_T)newline_count;
+    if (last_nl != NULL) {
+      line_start = (size_t)(last_nl + 1 - base);
+    }
+
+    const size_t match_offset = (size_t)(match - base);
+    const char *line = base + line_start;
+    const char *nl = memchr(line, NL, (size_t)(scan_end - line));
+    const size_t line_end = nl == NULL ? job->end_offset : (size_t)(nl - base);
+
+    if (match_offset < line_start || match_offset + job->pat_len > line_end) {
+      p = match + 1;
+      continue;
+    }
+
+    mmap_literal_match_T item = {
+      .lnum = lnum,
+      .col = (colnr_T)(match_offset - line_start),
+      .line_start = line_start,
+      .line_len = line_end - line_start,
+    };
+    if (!ml_mmap_literal_match_append(job, item)) {
+      break;
+    }
+
+    if (!job->global) {
+      if (line_end >= job->end_offset) {
+        break;
+      }
+      p = base + line_end + 1;
+      lnum++;
+      line_start = line_end + 1;
+    } else {
+      p = match + job->pat_len;
+    }
+  }
+}
+
+static unsigned ml_mmap_parallel_match_thread_count(size_t size, size_t line_count)
+  FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  uv_cpu_info_t *cpu_infos = NULL;
+  int cpu_count = 0;
+  unsigned threads = 2;
+
+  if (uv_cpu_info(&cpu_infos, &cpu_count) == 0) {
+    if (cpu_count > 0) {
+      threads = (unsigned)cpu_count;
+    }
+    uv_free_cpu_info(cpu_infos, cpu_count);
+  }
+
+  threads = MIN(threads, (unsigned)ML_MMAP_PARALLEL_MATCH_MAX_THREADS);
+  threads = MIN(threads, (unsigned)line_count);
+  while (threads > 2 && size / threads < 16 * 1024 * 1024) {
+    threads--;
+  }
+  return MAX(threads, 2);
+}
+
+bool ml_get_buf_mmap_literal_matches(buf_T *buf, const char *pat, size_t pat_len, bool global,
+                                     size_t max_matches, mmap_literal_match_T **matchesp,
+                                     size_t *match_countp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  *matchesp = NULL;
+  *match_countp = 0;
+
+  if (!ml_mmap_is_active(buf)
+      || buf->b_ml.ml_mmap_size < ML_MMAP_PARALLEL_MATCH_MIN_SIZE
+      || buf->b_ml.ml_line_count < 2
+      || pat_len < 3
+      || max_matches < 4096) {
+    return false;
+  }
+
+  const size_t line_count = (size_t)buf->b_ml.ml_line_count;
+  const size_t collect_limit = MIN(max_matches, (size_t)ML_MMAP_PARALLEL_MATCH_LIMIT);
+  const unsigned thread_count =
+    ml_mmap_parallel_match_thread_count(buf->b_ml.ml_mmap_size, line_count);
+  if (thread_count < 2) {
+    return false;
+  }
+
+  ml_mmap_nl_scan_T nl_scan = kMlMmapNlScanScalar;
+  if (ml_mmap_can_use_avx512bw()) {
+    nl_scan = kMlMmapNlScanAvx512bw;
+  } else if (ml_mmap_can_use_avx2()) {
+    nl_scan = kMlMmapNlScanAvx2;
+  }
+
+  uv_thread_t *threads = xmalloc(thread_count * sizeof *threads);
+  ml_mmap_literal_match_job_T *jobs = xcalloc(thread_count, sizeof *jobs);
+  const size_t per_job_limit =
+    MIN(collect_limit, MAX((size_t)4096, collect_limit / thread_count + 1024));
+  unsigned created = 0;
+
+  for (unsigned i = 0; i < thread_count; i++) {
+    const linenr_T start_lnum =
+      (linenr_T)(1 + ((uint64_t)i * line_count / thread_count));
+    const linenr_T end_lnum =
+      (linenr_T)(((uint64_t)(i + 1) * line_count / thread_count));
+
+    jobs[i].base = buf->b_ml.ml_mmap_base;
+    jobs[i].start_offset = ml_mmap_line_start_offset(buf, start_lnum);
+    jobs[i].end_offset = end_lnum < buf->b_ml.ml_line_count
+                         ? ml_mmap_line_start_offset(buf, end_lnum + 1)
+                         : buf->b_ml.ml_mmap_size;
+    jobs[i].start_lnum = start_lnum;
+    jobs[i].pat = pat;
+    jobs[i].pat_len = pat_len;
+    jobs[i].global = global;
+    jobs[i].nl_scan = nl_scan;
+    jobs[i].match_limit = per_job_limit;
+
+    if (uv_thread_create(&threads[i], ml_mmap_literal_match_worker, &jobs[i]) != 0) {
+      break;
+    }
+    created++;
+  }
+
+  for (unsigned i = 0; i < created; i++) {
+    uv_thread_join(&threads[i]);
+  }
+
+  bool fallback = created != thread_count;
+  size_t total_matches = 0;
+  for (unsigned i = 0; i < created; i++) {
+    fallback = fallback || jobs[i].overflow;
+    total_matches += jobs[i].match_count;
+  }
+  if (max_matches > collect_limit && total_matches > collect_limit) {
+    fallback = true;
+  }
+
+  mmap_literal_match_T *matches = NULL;
+  size_t match_count = 0;
+  if (!fallback && total_matches > 0) {
+    const size_t wanted = MIN(total_matches, max_matches);
+    matches = xmalloc(wanted * sizeof *matches);
+    for (unsigned i = 0; i < created && match_count < wanted; i++) {
+      const size_t todo = MIN(jobs[i].match_count, wanted - match_count);
+      if (todo > 0) {
+        memcpy(matches + match_count, jobs[i].matches, todo * sizeof *matches);
+        match_count += todo;
+      }
+    }
+  }
+
+  for (unsigned i = 0; i < created; i++) {
+    xfree(jobs[i].matches);
+  }
+  xfree(jobs);
+  xfree(threads);
+
+  if (fallback) {
+    xfree(matches);
+    return false;
+  }
+
+  *matchesp = matches;
+  *match_countp = match_count;
+  return true;
+}
+
+bool ml_get_buf_mmap_literal_match_at(buf_T *buf, size_t *start_offsetp, linenr_T *lnump,
+                                      size_t *line_startp, const char *pat, size_t pat_len,
+                                      char **linep, size_t *line_lenp, colnr_T *colp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  *linep = NULL;
+  *line_lenp = 0;
+  if (!ml_mmap_is_active(buf) || pat_len == 0 || *start_offsetp >= buf->b_ml.ml_mmap_size
+      || *lnump < 1 || *lnump > buf->b_ml.ml_line_count) {
+    return false;
+  }
+
+  const char *base = buf->b_ml.ml_mmap_base;
+  const char *match = ml_mmap_find_literal(base + *start_offsetp,
+                                           buf->b_ml.ml_mmap_size - *start_offsetp,
+                                           pat, pat_len);
+  if (match == NULL) {
+    return false;
+  }
+
+  linenr_T lnum = *lnump;
+  size_t line_start = *line_startp;
+  const char *last_nl = NULL;
+  const size_t newline_count = ml_mmap_count_newlines(base + *start_offsetp,
+                                                      (size_t)(match - base) - *start_offsetp,
+                                                      &last_nl);
+  lnum += (linenr_T)newline_count;
+  if (last_nl != NULL) {
+    line_start = (size_t)(last_nl + 1 - base);
+  }
+
+  const size_t match_offset = (size_t)(match - base);
+  const char *nl = memchr(base + line_start, NL, buf->b_ml.ml_mmap_size - line_start);
+  const size_t line_end = nl == NULL ? buf->b_ml.ml_mmap_size : (size_t)(nl - base);
+  if (match_offset < line_start || match_offset + pat_len > line_end) {
+    return false;
+  }
+
+  const size_t line_len = line_end - line_start;
+  *linep = xmemdupz(base + line_start, line_len);
+  *line_lenp = line_len;
+  *colp = (colnr_T)(match_offset - line_start);
+  *lnump = lnum;
+  *line_startp = line_start;
+  *start_offsetp = match_offset;
+  return true;
+}
+
 /// Open a new memline for "buf".
 ///
 /// @return  FAIL for failure, OK otherwise.
@@ -293,6 +1141,11 @@ int ml_open(buf_T *buf)
   buf->b_ml.ml_locked = NULL;   // no cached block
   buf->b_ml.ml_line_lnum = 0;   // no cached line
   buf->b_ml.ml_line_offset = 0;
+  buf->b_ml.ml_mmap_base = NULL;
+  buf->b_ml.ml_mmap_size = 0;
+  buf->b_ml.ml_mmap_line_starts = NULL;
+  buf->b_ml.ml_mmap_index_count = 0;
+  buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_chunksize = NULL;
   buf->b_ml.ml_usedchunks = 0;
 
@@ -488,6 +1341,9 @@ void ml_open_file(buf_T *buf)
       || buf->terminal) {
     return;  // nothing to do
   }
+  if (ml_mmap_materialize(buf) == FAIL) {
+    return;
+  }
 
   // For a spell buffer use a temp file name.
   if (buf->b_spell) {
@@ -570,6 +1426,7 @@ void ml_close(buf_T *buf, int del_file)
   if (buf->b_ml.ml_mfp == NULL) {               // not open
     return;
   }
+  ml_mmap_close(buf);
   mf_close(buf->b_ml.ml_mfp, del_file);       // close the .swp file
   if (buf->b_ml.ml_line_lnum != 0
       && (buf->b_ml.ml_flags & (ML_LINE_DIRTY | ML_ALLOCATED))) {
@@ -829,6 +1686,11 @@ void ml_recover(bool checkext)
   buf->b_ml.ml_stack_top = 0;           // nothing in the stack
   buf->b_ml.ml_line_lnum = 0;           // no cached line
   buf->b_ml.ml_line_offset = 0;
+  buf->b_ml.ml_mmap_base = NULL;
+  buf->b_ml.ml_mmap_size = 0;
+  buf->b_ml.ml_mmap_line_starts = NULL;
+  buf->b_ml.ml_mmap_index_count = 0;
+  buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_locked = NULL;           // no locked block
   buf->b_ml.ml_flags = 0;
 
@@ -1874,6 +2736,23 @@ int gchar_pos(pos_T *pos)
   return utf_ptr2char(ml_get_pos(pos));
 }
 
+static inline void ml_set_cached_line(buf_T *buf, bhdr_T *hp, linenr_T lnum)
+  FUNC_ATTR_NONNULL_ALL
+{
+  DataBlock *dp = hp->bh_data;
+
+  int idx = lnum - buf->b_ml.ml_locked_low;
+  unsigned start = (dp->db_index[idx] & DB_INDEX_MASK);
+  // The text ends where the previous line starts.  The first line ends
+  // at the end of the block.
+  unsigned end = idx == 0 ? dp->db_txt_end : (dp->db_index[idx - 1] & DB_INDEX_MASK);
+
+  buf->b_ml.ml_line_ptr = (char *)dp + start;
+  buf->b_ml.ml_line_textlen = (colnr_T)(end - start);
+  buf->b_ml.ml_line_lnum = lnum;
+  buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
+}
+
 /// @param will_change  true mark the buffer dirty (chars in the line will be changed)
 ///
 /// @return  a pointer to a line in a specific buffer
@@ -1905,43 +2784,62 @@ errorret:
   }
   lnum = MAX(lnum, 1);  // pretend line 0 is line 1
 
+  if (ml_mmap_is_active(buf)) {
+    if (will_change) {
+      if (ml_mmap_materialize(buf) == FAIL) {
+        goto errorret;
+      }
+      return ml_get_buf_impl(buf, lnum, true);
+    }
+
+    if (buf->b_ml.ml_line_lnum != lnum) {
+      ml_flush_line(buf, false);
+
+      size_t start;
+      size_t end;
+      ml_mmap_line_bounds(buf, lnum, &start, &end);
+      const size_t len = end - start;
+      buf->b_ml.ml_line_ptr = xmemdupz(buf->b_ml.ml_mmap_base + start, len);
+      buf->b_ml.ml_line_textlen = (colnr_T)(len + 1);
+      buf->b_ml.ml_line_lnum = lnum;
+      buf->b_ml.ml_flags = (buf->b_ml.ml_flags & ~ML_LINE_DIRTY) | ML_ALLOCATED;
+    }
+    return buf->b_ml.ml_line_ptr;
+  }
+
   // See if it is the same line as requested last time.
   // Otherwise may need to flush last used line.
   // Don't use the last used line when 'swapfile' is reset, need to load all
   // blocks.
   if (buf->b_ml.ml_line_lnum != lnum) {
-    ml_flush_line(buf, false);
+    if (!will_change
+        && (buf->b_ml.ml_flags & (ML_LINE_DIRTY | ML_ALLOCATED)) == 0
+        && buf->b_ml.ml_locked != NULL
+        && buf->b_ml.ml_locked_low <= lnum
+        && buf->b_ml.ml_locked_high >= lnum) {
+      ml_set_cached_line(buf, buf->b_ml.ml_locked, lnum);
+    } else {
+      ml_flush_line(buf, false);
 
-    // Find the data block containing the line.
-    // This also fills the stack with the blocks from the root to the data
-    // block and releases any locked block.
-    bhdr_T *hp;
-    if ((hp = ml_find_line(buf, lnum, ML_FIND)) == NULL) {
-      if (recursive == 0) {
-        // Avoid giving this message for a recursive call, may happen
-        // when the GUI redraws part of the text.
-        recursive++;
-        get_trans_bufname(buf);
-        shorten_dir(NameBuff);
-        siemsg(_(e_ml_get_cannot_find_line_nr_in_buffer_nr_str),
-               (int64_t)lnum, buf->b_fnum, NameBuff);
-        recursive--;
+      // Find the data block containing the line.
+      // This also fills the stack with the blocks from the root to the data
+      // block and releases any locked block.
+      bhdr_T *hp;
+      if ((hp = ml_find_line(buf, lnum, ML_FIND)) == NULL) {
+        if (recursive == 0) {
+          // Avoid giving this message for a recursive call, may happen
+          // when the GUI redraws part of the text.
+          recursive++;
+          get_trans_bufname(buf);
+          shorten_dir(NameBuff);
+          siemsg(_(e_ml_get_cannot_find_line_nr_in_buffer_nr_str),
+                 (int64_t)lnum, buf->b_fnum, NameBuff);
+          recursive--;
+        }
+        goto errorret;
       }
-      goto errorret;
+      ml_set_cached_line(buf, hp, lnum);
     }
-
-    DataBlock *dp = hp->bh_data;
-
-    int idx = lnum - buf->b_ml.ml_locked_low;
-    unsigned start = (dp->db_index[idx] & DB_INDEX_MASK);
-    // The text ends where the previous line starts.  The first line ends
-    // at the end of the block.
-    unsigned end = idx == 0 ? dp->db_txt_end : (dp->db_index[idx - 1] & DB_INDEX_MASK);
-
-    buf->b_ml.ml_line_ptr = (char *)dp + start;
-    buf->b_ml.ml_line_textlen = (colnr_T)(end - start);
-    buf->b_ml.ml_line_lnum = lnum;
-    buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
   }
   if (will_change) {
     buf->b_ml.ml_flags |= (ML_LOCKED_DIRTY | ML_LOCKED_POS);
@@ -2010,8 +2908,16 @@ static int ml_append_int(buf_T *buf, linenr_T lnum, char *line_arg, colnr_T len_
   // This also releases any locked block.
   int ret = FAIL;
   bhdr_T *hp;
-  if ((hp = ml_find_line(buf, lnum == 0 ? 1 : lnum,
-                         ML_INSERT)) == NULL) {
+  const linenr_T find_lnum = lnum == 0 ? 1 : lnum;
+  if (buf->b_ml.ml_locked != NULL
+      && buf->b_ml.ml_locked_low <= find_lnum
+      && buf->b_ml.ml_locked_high >= find_lnum) {
+    // Same state update as the locked-block fast path in ml_find_line() for
+    // ML_INSERT, but avoid a hot call during sequential new-file appends.
+    buf->b_ml.ml_locked_lineadd++;
+    buf->b_ml.ml_locked_high++;
+    hp = buf->b_ml.ml_locked;
+  } else if ((hp = ml_find_line(buf, find_lnum, ML_INSERT)) == NULL) {
     goto theend;
   }
 
@@ -2146,6 +3052,9 @@ static int ml_append_int(buf_T *buf, linenr_T lnum, char *line_arg, colnr_T len_
     }
 
     int64_t page_count = ((space_needed + (int64_t)HEADER_SIZE) + page_size - 1) / page_size;
+    if ((flags & ML_APPEND_NEW) && lnum >= buf->b_ml.ml_line_count - 2) {
+      page_count = MAX(page_count, ML_NEWFILE_DATA_PAGES);
+    }
     hp_new = ml_new_data(mfp, flags & ML_APPEND_NEW, page_count);
     if (db_idx < 0) {           // left block is new
       hp_left = hp_new;
@@ -2387,11 +3296,219 @@ static int ml_append_int(buf_T *buf, linenr_T lnum, char *line_arg, colnr_T len_
   }
 
   // The line was inserted below 'lnum'
-  ml_updatechunk(buf, lnum + 1, len, ML_CHNK_ADDLINE);
+  if (flags & ML_APPEND_FAST_NEWFILE) {
+    if (lnum + 1 == buf->b_ml.ml_line_count - 1) {
+      ml_updatechunk_newfile(buf, len);
+    } else if (lnum + 1 == buf->b_ml.ml_line_count) {
+      ml_updatechunk_newfile_eof(buf, len);
+    } else {
+      ml_updatechunk(buf, lnum + 1, len, ML_CHNK_ADDLINE);
+    }
+  } else {
+    ml_updatechunk(buf, lnum + 1, len, ML_CHNK_ADDLINE);
+  }
   ret = OK;
 
 theend:
   return ret;
+}
+
+static inline void ml_updatechunk_newfile_eof_fast(buf_T *buf, int len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_ALWAYS_INLINE
+{
+  if (buf->b_ml.ml_usedchunks == -1 || len == 0) {
+    return;
+  }
+  if (buf->b_ml.ml_chunksize == NULL || buf->b_ml.ml_usedchunks <= 0) {
+    ml_updatechunk_newfile_eof(buf, len);
+    return;
+  }
+
+  chunksize_T *curchnk = buf->b_ml.ml_chunksize + buf->b_ml.ml_usedchunks - 1;
+  if (curchnk->mlcs_numlines >= MLCS_MAXL) {
+    ml_updatechunk_newfile_eof(buf, len);
+    return;
+  }
+
+  curchnk->mlcs_numlines++;
+  curchnk->mlcs_totalsize += len;
+
+  ml_upd_lastbuf = buf;
+  ml_upd_lastline = buf->b_ml.ml_line_count;
+  ml_upd_lastcurline = buf->b_ml.ml_line_count - curchnk->mlcs_numlines + 1;
+  ml_upd_lastcurix = buf->b_ml.ml_usedchunks - 1;
+}
+
+static void ml_updatechunk_newfile_eof_fast_batch(buf_T *buf, colnr_T *lens, size_t count)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (buf->b_ml.ml_usedchunks == -1 || count == 0) {
+    return;
+  }
+  if (buf->b_ml.ml_chunksize == NULL || buf->b_ml.ml_usedchunks <= 0) {
+    buf->b_ml.ml_chunksize = xmalloc(sizeof(chunksize_T) * 100);
+    buf->b_ml.ml_numchunks = 100;
+    buf->b_ml.ml_usedchunks = 1;
+    buf->b_ml.ml_chunksize[0].mlcs_numlines = 1;
+    buf->b_ml.ml_chunksize[0].mlcs_totalsize = 1;
+  }
+
+  size_t done = 0;
+  chunksize_T *curchnk = buf->b_ml.ml_chunksize + buf->b_ml.ml_usedchunks - 1;
+  while (done < count) {
+    if (curchnk->mlcs_numlines >= MLCS_MAXL) {
+      if (buf->b_ml.ml_usedchunks + 1 >= buf->b_ml.ml_numchunks) {
+        buf->b_ml.ml_numchunks = buf->b_ml.ml_numchunks * 3 / 2;
+        buf->b_ml.ml_chunksize = xrealloc(buf->b_ml.ml_chunksize,
+                                          sizeof(chunksize_T) * (size_t)buf->b_ml.ml_numchunks);
+        curchnk = buf->b_ml.ml_chunksize + buf->b_ml.ml_usedchunks - 1;
+      }
+
+      curchnk++;
+      buf->b_ml.ml_usedchunks++;
+      curchnk->mlcs_numlines = 0;
+      curchnk->mlcs_totalsize = 0;
+    }
+
+    const size_t todo = MIN(count - done, (size_t)(MLCS_MAXL - curchnk->mlcs_numlines));
+    int chunk_size = 0;
+    for (size_t i = 0; i < todo; i++) {
+      chunk_size += lens[done + i];
+    }
+    curchnk->mlcs_numlines += (int)todo;
+    curchnk->mlcs_totalsize += chunk_size;
+    done += todo;
+  }
+
+  ml_upd_lastbuf = buf;
+  ml_upd_lastline = buf->b_ml.ml_line_count;
+  ml_upd_lastcurline = buf->b_ml.ml_line_count - curchnk->mlcs_numlines + 1;
+  ml_upd_lastcurix = buf->b_ml.ml_usedchunks - 1;
+}
+
+static bool ml_append_fast_newfile_eof(buf_T *buf, linenr_T lnum, char *line, colnr_T len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (lnum != buf->b_ml.ml_line_count
+      || buf->b_ml.ml_mfp == NULL
+      || buf->b_ml.ml_line_lnum != 0) {
+    return false;
+  }
+
+  bhdr_T *hp;
+  if (buf->b_ml.ml_locked != NULL
+      && buf->b_ml.ml_locked_low <= lnum
+      && buf->b_ml.ml_locked_high >= lnum) {
+    hp = buf->b_ml.ml_locked;
+  } else if ((hp = ml_find_line(buf, lnum, ML_FIND)) == NULL) {
+    return false;
+  }
+
+  DataBlock *dp = hp->bh_data;
+  const int line_count = buf->b_ml.ml_locked_high - buf->b_ml.ml_locked_low + 1;
+  const int db_idx = lnum - buf->b_ml.ml_locked_low;
+  const int64_t space_needed = len + (int64_t)INDEX_SIZE;
+
+  if (db_idx != line_count - 1
+      || dp->db_line_count != line_count
+      || (int64_t)dp->db_free < space_needed) {
+    return false;
+  }
+
+  if (lowest_marked && lowest_marked > lnum) {
+    lowest_marked = lnum + 1;
+  }
+  if (buf->b_prev_line_count == 0) {
+    buf->b_prev_line_count = buf->b_ml.ml_line_count;
+  }
+
+  buf->b_ml.ml_flags &= ~ML_EMPTY;
+  buf->b_ml.ml_line_count++;
+  buf->b_ml.ml_locked_lineadd++;
+  buf->b_ml.ml_locked_high++;
+
+  dp->db_txt_start -= (unsigned)len;
+  dp->db_free -= (unsigned)space_needed;
+  dp->db_line_count++;
+  dp->db_index[line_count] = dp->db_txt_start;
+  memcpy((char *)dp + dp->db_txt_start, line, (size_t)len);
+
+  buf->b_ml.ml_flags |= ML_LOCKED_DIRTY;
+  ml_updatechunk_newfile_eof_fast(buf, len);
+  return true;
+}
+
+static size_t ml_append_fast_newfile_eof_batch(buf_T *buf, linenr_T *lnump, char **lines,
+                                               colnr_T *lens, size_t count)
+  FUNC_ATTR_NONNULL_ALL
+{
+  linenr_T lnum = *lnump;
+
+  if (count == 0
+      || lnum != buf->b_ml.ml_line_count
+      || buf->b_ml.ml_mfp == NULL
+      || buf->b_ml.ml_line_lnum != 0) {
+    return 0;
+  }
+
+  bhdr_T *hp;
+  if (buf->b_ml.ml_locked != NULL
+      && buf->b_ml.ml_locked_low <= lnum
+      && buf->b_ml.ml_locked_high >= lnum) {
+    hp = buf->b_ml.ml_locked;
+  } else if ((hp = ml_find_line(buf, lnum, ML_FIND)) == NULL) {
+    return 0;
+  }
+
+  DataBlock *dp = hp->bh_data;
+  int line_count = buf->b_ml.ml_locked_high - buf->b_ml.ml_locked_low + 1;
+  int db_idx = lnum - buf->b_ml.ml_locked_low;
+  if (db_idx != line_count - 1 || dp->db_line_count != line_count) {
+    return 0;
+  }
+
+  if (buf->b_prev_line_count == 0) {
+    buf->b_prev_line_count = buf->b_ml.ml_line_count;
+  }
+  buf->b_ml.ml_flags &= ~ML_EMPTY;
+
+  size_t done = 0;
+  const linenr_T start_lnum = lnum;
+  unsigned txt_start = dp->db_txt_start;
+  unsigned db_free = dp->db_free;
+  while (done < count) {
+    const colnr_T len = lens[done];
+    const int64_t space_needed = len + (int64_t)INDEX_SIZE;
+    if ((int64_t)db_free < space_needed) {
+      break;
+    }
+
+    txt_start -= (unsigned)len;
+    db_free -= (unsigned)space_needed;
+    dp->db_index[line_count] = txt_start;
+    memcpy((char *)dp + txt_start, lines[done], (size_t)len);
+
+    line_count++;
+    done++;
+  }
+
+  if (done > 0) {
+    buf->b_ml.ml_line_count += (linenr_T)done;
+    buf->b_ml.ml_locked_lineadd += (int)done;
+    buf->b_ml.ml_locked_high += (linenr_T)done;
+    dp->db_txt_start = txt_start;
+    dp->db_free = db_free;
+    dp->db_line_count += (int)done;
+    *lnump = start_lnum + (linenr_T)done;
+    if (lowest_marked && lowest_marked > start_lnum) {
+      lowest_marked = start_lnum + 1;
+    }
+    buf->b_ml.ml_flags |= ML_LOCKED_DIRTY;
+    ml_updatechunk_newfile_eof_fast_batch(buf, lens, done);
+  } else {
+    *lnump = lnum;
+  }
+  return done;
 }
 
 /// Flush any pending change and call ml_append_int()
@@ -2415,6 +3532,63 @@ static int ml_append_flush(buf_T *buf, linenr_T lnum, char *line, colnr_T len, i
   }
 
   return ml_append_int(buf, lnum, line, len, flags);
+}
+
+/// Append one line for readfile()'s sequential new-file fast path.
+///
+/// This only special-cases true EOF appends into the currently locked data
+/// block.  All other cases fall back to the normal append implementation.
+int ml_append_line_fast_newfile(linenr_T lnum, char *line, colnr_T len)
+  FUNC_ATTR_NONNULL_ARG(2)
+{
+  if (ml_mmap_materialize(curbuf) == FAIL) {
+    return FAIL;
+  }
+  if (curbuf->b_ml.ml_mfp == NULL && open_buffer(false, NULL, 0) == FAIL) {
+    return FAIL;
+  }
+  if (len == 0) {
+    len = (colnr_T)strlen(line) + 1;
+  }
+
+  const int flags = ML_APPEND_NEW | ML_APPEND_FAST_NEWFILE;
+  if (curbuf->b_ml.ml_line_lnum != 0) {
+    return ml_append_flush(curbuf, lnum, line, len, flags);
+  }
+  if (ml_append_fast_newfile_eof(curbuf, lnum, line, len)) {
+    return OK;
+  }
+  return ml_append_int(curbuf, lnum, line, len, flags);
+}
+
+int ml_append_lines_scanned_fast_newfile(linenr_T *lnump, char **lines, colnr_T *lens,
+                                         size_t count)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (ml_mmap_materialize(curbuf) == FAIL) {
+    return FAIL;
+  }
+  if (curbuf->b_ml.ml_mfp == NULL && open_buffer(false, NULL, 0) == FAIL) {
+    return FAIL;
+  }
+
+  size_t done = 0;
+  while (done < count) {
+    size_t n = ml_append_fast_newfile_eof_batch(curbuf, lnump, lines + done, lens + done,
+                                                count - done);
+    done += n;
+    if (done == count) {
+      break;
+    }
+
+    if (ml_append_line_fast_newfile(*lnump, lines[done], lens[done]) == FAIL) {
+      return FAIL;
+    }
+    (*lnump)++;
+    done++;
+  }
+
+  return OK;
 }
 
 /// Append a line after lnum (may be 0 to insert a line in front of the file).
@@ -2445,12 +3619,138 @@ int ml_append(linenr_T lnum, char *line, colnr_T len, bool newfile)
 /// @return  FAIL for failure, OK otherwise
 int ml_append_flags(linenr_T lnum, char *line, colnr_T len, int flags)
 {
+  if (ml_mmap_materialize(curbuf) == FAIL) {
+    return FAIL;
+  }
+  if ((flags & ML_APPEND_FAST_NEWFILE)
+      && curbuf->b_ml.ml_mfp != NULL
+      && curbuf->b_ml.ml_line_lnum == 0) {
+    return ml_append_int(curbuf, lnum, line, len, flags);
+  }
+
   // When starting up, we might still need to create the memfile
   if (curbuf->b_ml.ml_mfp == NULL && open_buffer(false, NULL, 0) == FAIL) {
     return FAIL;
   }
 
   return ml_append_flush(curbuf, lnum, line, len, flags);
+}
+
+static bool ml_mem_has_literal(const char *text, size_t text_len, const char *pat, size_t pat_len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (pat_len == 1) {
+    return memchr(text, (uint8_t)pat[0], text_len) != NULL;
+  }
+  if (pat_len == 2) {
+    const uint8_t c0 = (uint8_t)pat[0];
+    const uint8_t c1 = (uint8_t)pat[1];
+    const char *p = text;
+    const char *end = text + text_len;
+
+    while ((p = memchr(p, c0, (size_t)(end - p))) != NULL) {
+      if ((size_t)(end - p) < 2) {
+        return false;
+      }
+      if ((uint8_t)p[1] == c1) {
+        return true;
+      }
+      p++;
+    }
+    return false;
+  }
+
+#ifdef __GLIBC__
+  return memmem(text, text_len, pat, pat_len) != NULL;
+#endif
+
+  bool repeated_byte = true;
+  for (size_t i = 1; i < pat_len; i++) {
+    if (pat[i] != pat[0]) {
+      repeated_byte = false;
+      break;
+    }
+  }
+
+  const char *p = text;
+  const char *end = text + text_len;
+  if (repeated_byte) {
+    while ((p = memchr(p, (uint8_t)pat[0], (size_t)(end - p))) != NULL) {
+      if ((size_t)(end - p) < pat_len) {
+        return false;
+      }
+      size_t run_len = 1;
+      while (run_len < pat_len && p[run_len] == pat[0]) {
+        run_len++;
+      }
+      if (run_len == pat_len) {
+        return true;
+      }
+      p += run_len;
+    }
+    return false;
+  }
+
+  const uint8_t last = (uint8_t)pat[pat_len - 1];
+  while ((p = memchr(p, (uint8_t)pat[0], (size_t)(end - p))) != NULL) {
+    if ((size_t)(end - p) < pat_len) {
+      return false;
+    }
+    if ((uint8_t)p[pat_len - 1] == last && memcmp(p, pat, pat_len) == 0) {
+      return true;
+    }
+    p++;
+  }
+  return false;
+}
+
+/// Check whether the data block containing "lnum" has "pat" in its line text.
+///
+/// This is a coarse read-only prefilter for literal searches.  A false result
+/// proves no line in the returned block range can contain the literal; a true
+/// result only means callers should search the lines normally.
+///
+/// @param contains set to true on lookup failure so callers fall back safely.
+/// @return last line number in the containing data block, or "lnum" on failure.
+linenr_T ml_get_buf_literal_block_end(buf_T *buf, linenr_T lnum, const char *pat, size_t pat_len,
+                                      bool *contains)
+  FUNC_ATTR_NONNULL_ALL
+{
+  *contains = true;
+  if (pat_len == 0 || lnum < 1 || lnum > buf->b_ml.ml_line_count || buf->b_ml.ml_mfp == NULL) {
+    return lnum;
+  }
+
+  if (ml_mmap_is_active(buf)) {
+    const size_t block_idx = ml_mmap_index_for_lnum(lnum);
+    const linenr_T block_end = MIN(buf->b_ml.ml_line_count,
+                                   (linenr_T)((block_idx + 1) * ML_MMAP_INDEX_STRIDE));
+    const size_t start = ml_mmap_line_start_offset(buf, lnum);
+    const size_t end = block_idx + 1 < buf->b_ml.ml_mmap_index_count
+                       ? buf->b_ml.ml_mmap_line_starts[block_idx + 1]
+                       : buf->b_ml.ml_mmap_size;
+    *contains = ml_mem_has_literal(buf->b_ml.ml_mmap_base + start, end - start, pat, pat_len);
+    return block_end;
+  }
+
+  if (buf->b_ml.ml_line_lnum != 0) {
+    ml_flush_line(buf, false);
+  }
+
+  bhdr_T *hp;
+  if (buf->b_ml.ml_locked != NULL
+      && buf->b_ml.ml_locked_low <= lnum
+      && buf->b_ml.ml_locked_high >= lnum) {
+    hp = buf->b_ml.ml_locked;
+  } else if ((hp = ml_find_line(buf, lnum, ML_FIND)) == NULL) {
+    return lnum;
+  }
+
+  DataBlock *dp = hp->bh_data;
+  *contains = ml_mem_has_literal((char *)dp + dp->db_txt_start,
+                                 (size_t)(dp->db_txt_end - dp->db_txt_start),
+                                 pat, pat_len);
+  return buf->b_ml.ml_locked_high;
 }
 
 /// Like ml_append() but for an arbitrary buffer.  The buffer must already have
@@ -2463,6 +3763,9 @@ int ml_append_flags(linenr_T lnum, char *line, colnr_T len, int flags)
 int ml_append_buf(buf_T *buf, linenr_T lnum, char *line, colnr_T len, bool newfile)
   FUNC_ATTR_NONNULL_ARG(1)
 {
+  if (ml_mmap_materialize(buf) == FAIL) {
+    return FAIL;
+  }
   if (buf->b_ml.ml_mfp == NULL) {
     return FAIL;
   }
@@ -2541,6 +3844,9 @@ int ml_replace_buf_len(buf_T *buf, linenr_T lnum, char *line_arg, size_t len_arg
   if (buf->b_ml.ml_mfp == NULL && open_buffer(false, NULL, 0) == FAIL) {
     return FAIL;
   }
+  if (ml_mmap_materialize(buf) == FAIL) {
+    return FAIL;
+  }
 
   if (copy) {
     assert(!noalloc);
@@ -2585,6 +3891,9 @@ int ml_replace_buf_len(buf_T *buf, linenr_T lnum, char *line_arg, size_t len_arg
 int ml_delete_buf(buf_T *buf, linenr_T lnum, bool message)
   FUNC_ATTR_NONNULL_ALL
 {
+  if (ml_mmap_materialize(buf) == FAIL) {
+    return FAIL;
+  }
   ml_flush_line(buf, false);
   return ml_delete_int(buf, lnum, message ? ML_DEL_MESSAGE : 0);
 }
@@ -2740,6 +4049,9 @@ int ml_delete(linenr_T lnum)
 /// @return  FAIL for failure, OK otherwise
 int ml_delete_flags(linenr_T lnum, int flags)
 {
+  if (ml_mmap_materialize(curbuf) == FAIL) {
+    return FAIL;
+  }
   ml_flush_line(curbuf, false);
   if (lnum < 1 || lnum > curbuf->b_ml.ml_line_count) {
     return FAIL;
@@ -2751,6 +4063,9 @@ int ml_delete_flags(linenr_T lnum, int flags)
 /// set the DB_MARKED flag for line 'lnum'
 void ml_setmarked(linenr_T lnum)
 {
+  if (ml_mmap_materialize(curbuf) == FAIL) {
+    return;
+  }
   // invalid line number
   if (lnum < 1 || lnum > curbuf->b_ml.ml_line_count
       || curbuf->b_ml.ml_mfp == NULL) {
@@ -2775,6 +4090,9 @@ void ml_setmarked(linenr_T lnum)
 /// find the first line with its DB_MARKED flag set
 linenr_T ml_firstmarked(void)
 {
+  if (ml_mmap_materialize(curbuf) == FAIL) {
+    return 0;
+  }
   if (curbuf->b_ml.ml_mfp == NULL) {
     return 0;
   }
@@ -2808,6 +4126,9 @@ linenr_T ml_firstmarked(void)
 /// clear all DB_MARKED flags
 void ml_clearmarked(void)
 {
+  if (ml_mmap_materialize(curbuf) == FAIL) {
+    return;
+  }
   if (curbuf->b_ml.ml_mfp == NULL) {        // nothing to do
     return;
   }
@@ -2853,6 +4174,20 @@ static void ml_flush_line(buf_T *buf, bool noalloc)
 
   if (buf->b_ml.ml_line_lnum == 0 || buf->b_ml.ml_mfp == NULL) {
     return;             // nothing to do
+  }
+  if (ml_mmap_is_active(buf)) {
+    if (buf->b_ml.ml_flags & ML_LINE_DIRTY) {
+      (void)ml_mmap_materialize(buf);
+      return;
+    }
+    if (buf->b_ml.ml_flags & ML_ALLOCATED) {
+      assert(!noalloc);
+      xfree(buf->b_ml.ml_line_ptr);
+    }
+    buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
+    buf->b_ml.ml_line_lnum = 0;
+    buf->b_ml.ml_line_offset = 0;
+    return;
   }
   if (buf->b_ml.ml_flags & ML_LINE_DIRTY) {
     // This code doesn't work recursively.
@@ -3805,10 +5140,89 @@ void ml_setflags(buf_T *buf)
   }
 }
 
-enum {
-  MLCS_MAXL = 800,  // max no of lines in chunk
-  MLCS_MINL = 400,  // should be half of MLCS_MAXL
-};
+/// Fast byte-offset chunk update for sequential new-file reads.
+///
+/// While a new file is being read, every real line is inserted before the
+/// temporary trailing empty line.  Keep that trailing line in the last chunk and
+/// split it forward when the chunk reaches the normal maximum size.
+static void ml_updatechunk_newfile(buf_T *buf, int len)
+{
+  if (buf->b_ml.ml_usedchunks == -1 || len == 0) {
+    return;
+  }
+  if (buf->b_ml.ml_chunksize == NULL) {
+    buf->b_ml.ml_chunksize = xmalloc(sizeof(chunksize_T) * 100);
+    buf->b_ml.ml_numchunks = 100;
+    buf->b_ml.ml_usedchunks = 1;
+    buf->b_ml.ml_chunksize[0].mlcs_numlines = 1;
+    buf->b_ml.ml_chunksize[0].mlcs_totalsize = 1;
+  }
+
+  chunksize_T *curchnk = buf->b_ml.ml_chunksize + buf->b_ml.ml_usedchunks - 1;
+  if (curchnk->mlcs_numlines >= MLCS_MAXL) {
+    if (buf->b_ml.ml_usedchunks + 1 >= buf->b_ml.ml_numchunks) {
+      buf->b_ml.ml_numchunks = buf->b_ml.ml_numchunks * 3 / 2;
+      buf->b_ml.ml_chunksize = xrealloc(buf->b_ml.ml_chunksize,
+                                        sizeof(chunksize_T) * (size_t)buf->b_ml.ml_numchunks);
+      curchnk = buf->b_ml.ml_chunksize + buf->b_ml.ml_usedchunks - 1;
+    }
+
+    // Move the temporary trailing empty line into a new chunk.
+    curchnk->mlcs_numlines--;
+    curchnk->mlcs_totalsize--;
+    curchnk++;
+    buf->b_ml.ml_usedchunks++;
+    curchnk->mlcs_numlines = 1;
+    curchnk->mlcs_totalsize = 1;
+  }
+
+  curchnk->mlcs_numlines++;
+  curchnk->mlcs_totalsize += len;
+
+  ml_upd_lastbuf = buf;
+  ml_upd_lastline = buf->b_ml.ml_line_count - 1;
+  ml_upd_lastcurline = buf->b_ml.ml_line_count - curchnk->mlcs_numlines + 1;
+  ml_upd_lastcurix = buf->b_ml.ml_usedchunks - 1;
+}
+
+/// Fast byte-offset chunk update for sequential new-file reads that append at
+/// true EOF after reusing the initial empty line for the first file line.
+static void ml_updatechunk_newfile_eof(buf_T *buf, int len)
+{
+  if (buf->b_ml.ml_usedchunks == -1 || len == 0) {
+    return;
+  }
+  if (buf->b_ml.ml_chunksize == NULL) {
+    buf->b_ml.ml_chunksize = xmalloc(sizeof(chunksize_T) * 100);
+    buf->b_ml.ml_numchunks = 100;
+    buf->b_ml.ml_usedchunks = 1;
+    buf->b_ml.ml_chunksize[0].mlcs_numlines = 1;
+    buf->b_ml.ml_chunksize[0].mlcs_totalsize = 1;
+  }
+
+  chunksize_T *curchnk = buf->b_ml.ml_chunksize + buf->b_ml.ml_usedchunks - 1;
+  if (curchnk->mlcs_numlines >= MLCS_MAXL) {
+    if (buf->b_ml.ml_usedchunks + 1 >= buf->b_ml.ml_numchunks) {
+      buf->b_ml.ml_numchunks = buf->b_ml.ml_numchunks * 3 / 2;
+      buf->b_ml.ml_chunksize = xrealloc(buf->b_ml.ml_chunksize,
+                                        sizeof(chunksize_T) * (size_t)buf->b_ml.ml_numchunks);
+      curchnk = buf->b_ml.ml_chunksize + buf->b_ml.ml_usedchunks - 1;
+    }
+
+    curchnk++;
+    buf->b_ml.ml_usedchunks++;
+    curchnk->mlcs_numlines = 0;
+    curchnk->mlcs_totalsize = 0;
+  }
+
+  curchnk->mlcs_numlines++;
+  curchnk->mlcs_totalsize += len;
+
+  ml_upd_lastbuf = buf;
+  ml_upd_lastline = buf->b_ml.ml_line_count;
+  ml_upd_lastcurline = buf->b_ml.ml_line_count - curchnk->mlcs_numlines + 1;
+  ml_upd_lastcurix = buf->b_ml.ml_usedchunks - 1;
+}
 
 /// Keep information for finding byte offset of a line
 ///
@@ -3819,11 +5233,6 @@ enum {
 ///                 ML_CHNK_UPDLINE: Add len to parent chunk, as a signed entity.
 static void ml_updatechunk(buf_T *buf, linenr_T line, int len, int updtype)
 {
-  static buf_T *ml_upd_lastbuf = NULL;
-  static linenr_T ml_upd_lastline;
-  static linenr_T ml_upd_lastcurline;
-  static int ml_upd_lastcurix;
-
   linenr_T curline = ml_upd_lastcurline;
   int curix = ml_upd_lastcurix;
   bhdr_T *hp;
@@ -4027,6 +5436,58 @@ int ml_find_line_or_offset(buf_T *buf, linenr_T lnum, int *offp, bool no_ff)
     ml_flush_line(curbuf, false);
   } else if (can_cache && buf->b_ml.ml_line_offset > 0) {
     return (int)buf->b_ml.ml_line_offset;
+  }
+
+  if (ml_mmap_is_active(buf)) {
+    if (lnum < 0) {
+      return -1;
+    }
+
+    if (lnum != 0) {
+      if (lnum > buf->b_ml.ml_line_count + 1) {
+        return -1;
+      }
+      size_t size = lnum > buf->b_ml.ml_line_count
+                    ? buf->b_ml.ml_mmap_size
+                    : ml_mmap_line_start_offset(buf, lnum);
+      if (ffdos) {
+        linenr_T eol_count = lnum - 1;
+        if (lnum > buf->b_ml.ml_line_count && buf->b_ml.ml_mmap_noeol) {
+          eol_count--;
+        }
+        size += (size_t)eol_count;
+      }
+      if (size > INT_MAX) {
+        return -1;
+      }
+      if (can_cache && size > 0) {
+        buf->b_ml.ml_line_offset = size;
+      }
+      return (int)size;
+    }
+
+    const int mmap_offset = offp == NULL ? 0 : *offp;
+    if (mmap_offset <= 0) {
+      if (offp != NULL) {
+        *offp = 0;
+      }
+      return 1;
+    }
+    size_t pos = (size_t)mmap_offset;
+    if (pos >= buf->b_ml.ml_mmap_size) {
+      return -1;
+    }
+
+    size_t line_start;
+    size_t line_end;
+    const linenr_T found = ml_mmap_lnum_for_offset(buf, pos, &line_start, &line_end);
+    if (found == 0) {
+      return -1;
+    }
+    if (offp != NULL) {
+      *offp = (int)(pos - line_start);
+    }
+    return found;
   }
 
   if (buf->b_ml.ml_usedchunks == -1

@@ -41,6 +41,8 @@ describe('fileio', function()
     os.remove('Xtest_startup_file1~')
     os.remove('Xtest_startup_file2')
     os.remove('Xtest_startup_file2~')
+    os.remove('Xtest_mmap_readfile')
+    os.remove('Xtest_mmap_noeol')
     os.remove('Xtest_тест.md')
     os.remove('Xtest-u8-int-max')
     os.remove('Xtest-overwrite-forced')
@@ -63,6 +65,58 @@ describe('fileio', function()
     })
     return screen
   end
+
+  it('opens large UTF-8 files with mmap and materializes on edit', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for mmap smoke'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+    write_file('Xtest_mmap_noeol', table.concat(lines, '\n'), false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    eq(40000, fn.line('$'))
+    eq(lines[1], fn.getline(1))
+    eq(lines[40000], fn.getline(40000))
+    eq(#lines[1] + 2, fn.line2byte(2))
+    eq(40000, fn.byte2line(fn.line2byte(40000)))
+
+    command("call setline(2, 'changed')")
+    eq('changed', fn.getline(2))
+    eq(40000, fn.line('$'))
+
+    command('edit! Xtest_mmap_noeol')
+    eq(40000, fn.line('$'))
+    eq(0, fn.eval('&endofline'))
+    eq(lines[40000], fn.getline(40000))
+    eq(40000, fn.byte2line(fn.line2byte(40000)))
+  end)
+
+  it('opens large UTF-8 files with mmap while swapfile is enabled', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for mmap swap smoke'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir swapfile' } })
+    command('edit Xtest_mmap_readfile')
+    eq(40000, fn.line('$'))
+    eq(lines[1], fn.getline(1))
+    eq(lines[40000], fn.getline(40000))
+
+    local swapname = fn.swapname('%')
+    neq('', swapname)
+    ok(uv.fs_stat(swapname) ~= nil)
+
+    command("call setline(2, 'changed with swap')")
+    eq('changed with swap', fn.getline(2))
+    eq(lines[40000], fn.getline(40000))
+    eq(40000, fn.line('$'))
+  end)
 
   it("fsync() with 'nofsync' #8304", function()
     clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir' } })

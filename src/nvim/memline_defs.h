@@ -1,5 +1,8 @@
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
+
 #include "nvim/memfile_defs.h"
 #include "nvim/pos_defs.h"
 
@@ -19,6 +22,13 @@ typedef struct {
   int mlcs_numlines;
   int mlcs_totalsize;
 } chunksize_T;
+
+typedef struct {
+  linenr_T lnum;
+  colnr_T col;
+  size_t line_start;
+  size_t line_len;
+} mmap_literal_match_T;
 
 // Flags when calling ml_updatechunk()
 #define ML_CHNK_ADDLINE 1
@@ -62,6 +72,12 @@ typedef struct {
   char *ml_line_ptr;            // pointer to cached line
   size_t ml_line_offset;        // cached byte offset of ml_line_lnum
   int ml_line_offset_ff;        // fileformat of cached line
+
+  char *ml_mmap_base;           // mmap-backed file contents, NULL when inactive
+  size_t ml_mmap_size;          // size of ml_mmap_base
+  size_t *ml_mmap_line_starts;  // byte offsets for sparse line-index blocks
+  size_t ml_mmap_index_count;   // number of sparse line-index blocks
+  bool ml_mmap_noeol;           // last line has no final EOL
 
   bhdr_T *ml_locked;       // block used by last ml_get
   linenr_T ml_locked_low;       // first line in ml_locked
