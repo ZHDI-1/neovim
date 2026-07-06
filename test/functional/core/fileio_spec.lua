@@ -664,6 +664,48 @@ describe('fileio', function()
     eq(literal_count + 1, stats.mmap_substitute_literal_count)
   end)
 
+  it('skips nonmatching mmap lines for sparse literal substitute', function()
+    local lines = {}
+    local payload = string.rep('x', 900)
+    for i = 1, 1600 do
+      lines[i] = ('sparse row %05d %s'):format(i, payload)
+    end
+    lines[10] = 'sparse needle one ' .. payload
+    lines[800] = 'sparse needle two ' .. payload
+    lines[1599] = 'sparse needle three ' .. payload
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    local literal_count = stats.mmap_substitute_literal_count
+    local literal_line_count = stats.mmap_substitute_literal_line_count
+
+    command([[silent! 1,9s/needle/pin/g]])
+    eq('sparse needle one ' .. payload, fn.getline(10))
+    stats = api.nvim__buf_stats(0)
+    eq(literal_count + 1, stats.mmap_substitute_literal_count)
+    eq(literal_line_count, stats.mmap_substitute_literal_line_count)
+
+    command([[%s/needle/pin/g]])
+    eq('sparse pin one ' .. payload, fn.getline(10))
+    eq('sparse pin two ' .. payload, fn.getline(800))
+    eq('sparse pin three ' .. payload, fn.getline(1599))
+    eq(lines[1], fn.getline(1))
+    eq(lines[1600], fn.getline(1600))
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(literal_count + 2, stats.mmap_substitute_literal_count)
+    eq(literal_line_count + 3, stats.mmap_substitute_literal_line_count)
+  end)
+
   it('keeps mmap piece tree active for :global mark execution', function()
     local lines = {}
     for i = 1, 42000 do

@@ -3523,6 +3523,7 @@ static bool sub_mmap_literal_line(linenr_T lnum, const char *pat, size_t pat_len
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
 {
   *match_countp = 0;
+  ml_buf_mmap_substitute_literal_line_record(curbuf);
   char *line = ml_get(lnum);
   const size_t line_len = (size_t)ml_get_len(lnum);
 
@@ -3632,6 +3633,40 @@ static bool sub_mmap_literal_line(linenr_T lnum, const char *pat, size_t pat_len
   return true;
 }
 
+static bool sub_mmap_literal_next_candidate(linenr_T lnum, linenr_T line2, const char *pat,
+                                            size_t pat_len, linenr_T *match_lnump)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (lnum > line2) {
+    return false;
+  }
+
+  size_t offset = 0;
+  if (!ml_get_buf_mmap_line_start(curbuf, lnum, &offset)) {
+    return false;
+  }
+
+  size_t end_offset = SIZE_MAX;
+  if (line2 < curbuf->b_ml.ml_line_count
+      && !ml_get_buf_mmap_line_start(curbuf, line2 + 1, &end_offset)) {
+    return false;
+  }
+
+  linenr_T literal_lnum = lnum;
+  size_t literal_line_start = offset;
+  size_t literal_line_len = 0;
+  colnr_T literal_col = 0;
+  if (!ml_get_buf_mmap_literal_match_in_range_pos(curbuf, &offset, end_offset, &literal_lnum,
+                                                  &literal_line_start, pat, pat_len,
+                                                  &literal_line_len, &literal_col)
+      || literal_lnum > line2) {
+    return false;
+  }
+
+  *match_lnump = literal_lnum;
+  return true;
+}
+
 static bool sub_try_mmap_literal(exarg_T *eap, String pat, const char *sub,
                                  const subflags_T *subflags, bool ignore_case, linenr_T line2,
                                  bool *got_matchp, bool *got_quitp, bool *did_savep,
@@ -3649,9 +3684,14 @@ static bool sub_try_mmap_literal(exarg_T *eap, String pat, const char *sub,
   }
 
   ml_buf_mmap_substitute_literal_record(curbuf);
-  for (linenr_T lnum = eap->line1; lnum <= line2 && !got_int && !aborting(); lnum++) {
+  for (linenr_T lnum = eap->line1; lnum <= line2 && !got_int && !aborting();) {
+    linenr_T match_lnum = 0;
+    if (!sub_mmap_literal_next_candidate(lnum, line2, pat.data, pat.size, &match_lnum)) {
+      break;
+    }
+
     size_t match_count = 0;
-    if (!sub_mmap_literal_line(lnum, pat.data, pat.size, sub, sub_len, subflags->do_all,
+    if (!sub_mmap_literal_line(match_lnum, pat.data, pat.size, sub, sub_len, subflags->do_all,
                                got_matchp, did_savep, &match_count)) {
       *got_quitp = true;
       return true;
@@ -3661,10 +3701,15 @@ static bool sub_try_mmap_literal(exarg_T *eap, String pat, const char *sub,
       sub_nsubs += (int64_t)match_count;
       sub_nlines++;
       if (*first_linep == 0) {
-        *first_linep = lnum;
+        *first_linep = match_lnum;
       }
-      *last_linep = lnum + 1;
+      *last_linep = match_lnum + 1;
     }
+
+    if (match_lnum >= line2) {
+      break;
+    }
+    lnum = match_lnum + 1;
 
     line_breakcheck();
   }

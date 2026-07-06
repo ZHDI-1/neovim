@@ -1635,6 +1635,7 @@ static void ml_mmap_close(buf_T *buf)
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
   buf->b_ml.ml_mmap_substitute_literal_count = 0;
+  buf->b_ml.ml_mmap_substitute_literal_line_count = 0;
   ml_mmap_marked_clear(buf);
   ml_mmap_clear_cache(buf);
 }
@@ -1763,6 +1764,7 @@ static int ml_mmap_materialize(buf_T *buf)
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
   buf->b_ml.ml_mmap_substitute_literal_count = 0;
+  buf->b_ml.ml_mmap_substitute_literal_line_count = 0;
   buf->b_ml.ml_piece_tree = NULL;
 
   XFREE_CLEAR(buf->b_ml.ml_chunksize);
@@ -2112,6 +2114,7 @@ int ml_set_mmap_lines(buf_T *buf, char *base, size_t size, size_t *line_starts,
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
   buf->b_ml.ml_mmap_substitute_literal_count = 0;
+  buf->b_ml.ml_mmap_substitute_literal_line_count = 0;
   ml_mmap_marked_clear(buf);
   buf->b_ml.ml_line_count = line_count;
   buf->b_ml.ml_flags &= ~ML_EMPTY;
@@ -2360,6 +2363,20 @@ uint64_t ml_buf_mmap_substitute_literal_count(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
   return ml_mmap_is_active(buf) ? buf->b_ml.ml_mmap_substitute_literal_count : 0;
+}
+
+void ml_buf_mmap_substitute_literal_line_record(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (ml_mmap_is_active(buf) && buf->b_ml.ml_piece_tree != NULL) {
+    buf->b_ml.ml_mmap_substitute_literal_line_count++;
+  }
+}
+
+uint64_t ml_buf_mmap_substitute_literal_line_count(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) ? buf->b_ml.ml_mmap_substitute_literal_line_count : 0;
 }
 
 bool ml_buf_mmap_piece_journal_active(buf_T *buf)
@@ -3785,9 +3802,11 @@ char *ml_get_buf_mmap_literal_match_line(buf_T *buf, mmap_literal_match_T match)
   return xmemdupz(buf->b_ml.ml_mmap_base + match.line_start, match.line_len);
 }
 
-bool ml_get_buf_mmap_literal_match_at_pos(buf_T *buf, size_t *start_offsetp, linenr_T *lnump,
-                                          size_t *line_startp, const char *pat, size_t pat_len,
-                                          size_t *line_lenp, colnr_T *colp)
+bool ml_get_buf_mmap_literal_match_in_range_pos(buf_T *buf, size_t *start_offsetp,
+                                                size_t end_offset, linenr_T *lnump,
+                                                size_t *line_startp, const char *pat,
+                                                size_t pat_len, size_t *line_lenp,
+                                                colnr_T *colp)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
 {
   *line_lenp = 0;
@@ -3799,12 +3818,13 @@ bool ml_get_buf_mmap_literal_match_at_pos(buf_T *buf, size_t *start_offsetp, lin
   if (!ml_mmap_is_pristine(buf)) {
     PieceTree *tree = buf->b_ml.ml_piece_tree;
     const size_t total = tree == NULL ? 0 : piece_tree_byte_len(tree);
-    if (tree == NULL || *start_offsetp >= total) {
+    const size_t range_end = MIN(end_offset, total);
+    if (tree == NULL || *start_offsetp >= range_end || pat_len > range_end - *start_offsetp) {
       return false;
     }
 
     size_t match_offset = 0;
-    if (!piece_tree_find_literal(tree, *start_offsetp, total - *start_offsetp, pat, pat_len,
+    if (!piece_tree_find_literal(tree, *start_offsetp, range_end - *start_offsetp, pat, pat_len,
                                  &match_offset)) {
       return false;
     }
@@ -3829,13 +3849,14 @@ bool ml_get_buf_mmap_literal_match_at_pos(buf_T *buf, size_t *start_offsetp, lin
     return true;
   }
 
-  if (*start_offsetp >= buf->b_ml.ml_mmap_size) {
+  const size_t range_end = MIN(end_offset, buf->b_ml.ml_mmap_size);
+  if (*start_offsetp >= range_end || pat_len > range_end - *start_offsetp) {
     return false;
   }
 
   const char *base = buf->b_ml.ml_mmap_base;
   const char *match = ml_mmap_find_literal(base + *start_offsetp,
-                                           buf->b_ml.ml_mmap_size - *start_offsetp,
+                                           range_end - *start_offsetp,
                                            pat, pat_len);
   if (match == NULL) {
     return false;
@@ -3866,6 +3887,15 @@ bool ml_get_buf_mmap_literal_match_at_pos(buf_T *buf, size_t *start_offsetp, lin
   *line_startp = line_start;
   *start_offsetp = match_offset;
   return true;
+}
+
+bool ml_get_buf_mmap_literal_match_at_pos(buf_T *buf, size_t *start_offsetp, linenr_T *lnump,
+                                          size_t *line_startp, const char *pat, size_t pat_len,
+                                          size_t *line_lenp, colnr_T *colp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_get_buf_mmap_literal_match_in_range_pos(buf, start_offsetp, SIZE_MAX, lnump,
+                                                    line_startp, pat, pat_len, line_lenp, colp);
 }
 
 bool ml_get_buf_mmap_literal_match_at(buf_T *buf, size_t *start_offsetp, linenr_T *lnump,
@@ -4008,6 +4038,7 @@ int ml_open(buf_T *buf)
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
   buf->b_ml.ml_mmap_substitute_literal_count = 0;
+  buf->b_ml.ml_mmap_substitute_literal_line_count = 0;
   buf->b_ml.ml_mmap_marked_ranges = NULL;
   buf->b_ml.ml_mmap_marked_count = 0;
   buf->b_ml.ml_mmap_marked_cap = 0;
@@ -4585,6 +4616,7 @@ void ml_recover(bool checkext)
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
   buf->b_ml.ml_mmap_substitute_literal_count = 0;
+  buf->b_ml.ml_mmap_substitute_literal_line_count = 0;
   buf->b_ml.ml_mmap_marked_ranges = NULL;
   buf->b_ml.ml_mmap_marked_count = 0;
   buf->b_ml.ml_mmap_marked_cap = 0;
