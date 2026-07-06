@@ -2666,6 +2666,95 @@ int ml_buf_mmap_rebase_file(buf_T *buf, const char *fname)
 #endif
 }
 
+int ml_buf_mmap_rebase_file_after_write(buf_T *buf, const char *fname)
+  FUNC_ATTR_NONNULL_ALL
+{
+#ifdef UNIX
+  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL
+      || buf->b_ml.ml_mmap_storage == NULL) {
+    return FAIL;
+  }
+
+  ml_flush_line(buf, false);
+  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL) {
+    return FAIL;
+  }
+
+  PieceTree *old_tree = buf->b_ml.ml_piece_tree;
+  ml_mmap_storage_T *old_storage = buf->b_ml.ml_mmap_storage;
+  PieceTreeSnapshot snapshot = { 0 };
+  if (!piece_tree_snapshot(old_tree, &snapshot)
+      || snapshot.byte_len == 0
+      || snapshot.line_count == 0
+      || snapshot.line_count > (size_t)MAXLNUM
+      || snapshot.line_count != (size_t)buf->b_ml.ml_line_count) {
+    return FAIL;
+  }
+
+  const size_t expected_index_count = ml_mmap_index_for_lnum((linenr_T)snapshot.line_count) + 1;
+  size_t *line_starts = xcalloc(expected_index_count, sizeof *line_starts);
+  for (size_t i = 1; i < expected_index_count; i++) {
+    const size_t target_lnum = i * (size_t)ML_MMAP_INDEX_STRIDE + 1;
+    if (!piece_tree_line_start_at_revision(old_tree, target_lnum, snapshot.revision,
+                                           &line_starts[i])
+        || line_starts[i] >= snapshot.byte_len) {
+      xfree(line_starts);
+      return FAIL;
+    }
+  }
+
+  char last = NUL;
+  if (!piece_tree_byte_at(old_tree, snapshot.byte_len - 1, &last)) {
+    xfree(line_starts);
+    return FAIL;
+  }
+  const bool noeol = last != NL;
+
+  int fd = os_open(fname, O_RDONLY, 0);
+  if (fd < 0) {
+    xfree(line_starts);
+    return FAIL;
+  }
+
+  FileInfo file_info;
+  if (!os_fileinfo_fd(fd, &file_info) || !S_ISREG(file_info.stat.st_mode)
+      || (uintmax_t)file_info.stat.st_size != (uintmax_t)snapshot.byte_len) {
+    close(fd);
+    xfree(line_starts);
+    return FAIL;
+  }
+
+  char *base = mmap(NULL, snapshot.byte_len, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+  if (base == MAP_FAILED) {
+    xfree(line_starts);
+    return FAIL;
+  }
+
+  ml_mmap_line_index_T *line_index = ml_mmap_line_index_new(line_starts, expected_index_count);
+  ml_mmap_storage_T *new_storage = ml_mmap_storage_new(base, snapshot.byte_len, line_index);
+  PieceTree *new_tree = xmalloc(sizeof *new_tree);
+  piece_tree_init_with_line_index(new_tree, new_storage->base, new_storage->size,
+                                  line_index->starts, line_index->count,
+                                  ML_MMAP_INDEX_STRIDE, snapshot.newline_count);
+
+  ml_mmap_clear_cache(buf);
+  buf->b_ml.ml_piece_tree = new_tree;
+  ml_mmap_set_active_storage(buf, new_storage);
+  buf->b_ml.ml_mmap_noeol = noeol;
+  buf->b_ml.ml_mmap_source_is_buffer_file = true;
+  buf->b_ml.ml_line_count = (linenr_T)snapshot.line_count;
+  buf->b_ml.ml_flags &= ~ML_EMPTY;
+  ml_mmap_retire_piece_storage(old_tree, old_storage);
+  ml_upd_lastbuf = NULL;
+  return OK;
+#else
+  (void)buf;
+  (void)fname;
+  return FAIL;
+#endif
+}
+
 int ml_buf_mmap_rebase_file_after_append(buf_T *buf, const char *fname)
   FUNC_ATTR_NONNULL_ALL
 {
@@ -3186,7 +3275,9 @@ void ml_buf_mmap_piece_journal_reset(buf_T *buf)
   }
 
   ml_mmap_piece_journal_close(buf, true);
-  ml_mmap_piece_journal_open(buf);
+  if (ml_mmap_piece_journal_has_replay_base(buf)) {
+    ml_mmap_piece_journal_open(buf);
+  }
 }
 
 uint64_t ml_buf_mmap_piece_revision(buf_T *buf)

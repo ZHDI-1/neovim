@@ -280,7 +280,12 @@ describe('fileio', function()
 
     local write_stats = expect_mmap_piece(1)
     command('write')
-    local written_stats = expect_mmap_piece(1)
+    local written_stats = api.nvim__buf_stats(0)
+    eq(true, written_stats.mmap_active)
+    eq(true, written_stats.mmap_piece_tree)
+    eq(true, written_stats.mmap_source_is_buffer_file)
+    eq(0, written_stats.mmap_piece_revision)
+    eq(0, written_stats.mmap_piece_add_len)
     eq(write_stats.mmap_piece_write_fast_count + 1,
       written_stats.mmap_piece_write_fast_count)
     matches('^line1 ascii text for mmap smoke\nZhanged\nline3 ascii text for mmap smoke',
@@ -288,7 +293,11 @@ describe('fileio', function()
 
     write_stats = written_stats
     command('write Xtest_mmap_written')
-    written_stats = expect_mmap_piece(1)
+    written_stats = api.nvim__buf_stats(0)
+    eq(true, written_stats.mmap_active)
+    eq(true, written_stats.mmap_piece_tree)
+    eq(0, written_stats.mmap_piece_revision)
+    eq(0, written_stats.mmap_piece_add_len)
     eq(write_stats.mmap_piece_write_fast_count + 1,
       written_stats.mmap_piece_write_fast_count)
     matches('^line1 ascii text for mmap smoke\nZhanged\nline3 ascii text for mmap smoke',
@@ -296,7 +305,11 @@ describe('fileio', function()
 
     write_stats = written_stats
     command('3,5write Xtest_mmap_range_written')
-    written_stats = expect_mmap_piece(1)
+    written_stats = api.nvim__buf_stats(0)
+    eq(true, written_stats.mmap_active)
+    eq(true, written_stats.mmap_piece_tree)
+    eq(0, written_stats.mmap_piece_revision)
+    eq(0, written_stats.mmap_piece_add_len)
     eq(write_stats.mmap_piece_write_fast_count + 1,
       written_stats.mmap_piece_write_fast_count)
     eq(table.concat({ lines[3], lines[4], lines[5] }, '\n') .. '\n',
@@ -307,7 +320,12 @@ describe('fileio', function()
     command('set nowritebackup nobackup backupcopy=yes')
     write_stats = expect_mmap_piece(1)
     command('write')
-    written_stats = expect_mmap_piece(1)
+    written_stats = api.nvim__buf_stats(0)
+    eq(true, written_stats.mmap_active)
+    eq(true, written_stats.mmap_piece_tree)
+    eq(true, written_stats.mmap_source_is_buffer_file)
+    eq(0, written_stats.mmap_piece_revision)
+    eq(0, written_stats.mmap_piece_add_len)
     eq(write_stats.mmap_piece_write_fast_count + 1,
       written_stats.mmap_piece_write_fast_count)
     eq(nil, uv.fs_stat('Xtest_mmap_readfile~'))
@@ -321,7 +339,12 @@ describe('fileio', function()
     lines[4] = 'undofile mmap write'
     write_stats = expect_mmap_piece(1)
     command('write')
-    written_stats = expect_mmap_piece(1)
+    written_stats = api.nvim__buf_stats(0)
+    eq(true, written_stats.mmap_active)
+    eq(true, written_stats.mmap_piece_tree)
+    eq(true, written_stats.mmap_source_is_buffer_file)
+    eq(0, written_stats.mmap_piece_revision)
+    eq(0, written_stats.mmap_piece_add_len)
     eq(write_stats.mmap_piece_write_fast_count + 1,
       written_stats.mmap_piece_write_fast_count)
     matches('^line1 ascii text for mmap smoke\nZhanged\nnowritebackup mmap write\n'
@@ -1152,7 +1175,9 @@ describe('fileio', function()
     local written_stats = api.nvim__buf_stats(0)
     eq(true, written_stats.mmap_active)
     eq(true, written_stats.mmap_piece_tree)
-    eq(false, written_stats.mmap_source_is_buffer_file)
+    eq(true, written_stats.mmap_source_is_buffer_file)
+    eq(0, written_stats.mmap_piece_revision)
+    eq(0, written_stats.mmap_piece_add_len)
     eq(stats.mmap_piece_write_fast_count + 1, written_stats.mmap_piece_write_fast_count)
     local prefix = 'copy-backup mmap line 00001\ncopy-backup mmap write\n'
     eq(prefix, read_file('Xtest_mmap_readfile'):sub(1, #prefix))
@@ -1164,7 +1189,9 @@ describe('fileio', function()
     written_stats = api.nvim__buf_stats(0)
     eq(true, written_stats.mmap_active)
     eq(true, written_stats.mmap_piece_tree)
-    eq(false, written_stats.mmap_source_is_buffer_file)
+    eq(true, written_stats.mmap_source_is_buffer_file)
+    eq(0, written_stats.mmap_piece_revision)
+    eq(0, written_stats.mmap_piece_add_len)
     eq(stats.mmap_piece_write_fast_count + 1, written_stats.mmap_piece_write_fast_count)
     prefix = 'copy-backup mmap line 00001\ncopy-backup mmap write\n'
       .. 'detached-source mmap write\n'
@@ -1536,6 +1563,65 @@ describe('fileio', function()
 
     command('bwipe!')
     eq(nil, uv.fs_stat(journal_path))
+  end)
+
+  it('recovers mmap journals after normal full writes reset the source', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for post-write journal'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir// swapfile' } })
+    command('set nowritebackup nobackup backupcopy=yes backupskip=')
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    local fast_before = stats.mmap_piece_write_fast_count
+
+    lines[2] = 'post-write saved middle edit'
+    command("call setline(2, 'post-write saved middle edit')")
+    command('write')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_source_is_buffer_file)
+    eq(0, stats.mmap_piece_revision)
+    eq(0, stats.mmap_piece_add_len)
+    eq(fast_before + 1, stats.mmap_piece_write_fast_count)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(false, stats.mmap_piece_journal_dirty)
+    eq(0, stats.mmap_piece_journal_record_count)
+
+    lines[3] = 'post-write recovered journal edit'
+    command("call setline(3, 'post-write recovered journal edit')")
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(true, stats.mmap_piece_journal_dirty)
+    eq(1, stats.mmap_piece_journal_record_count)
+    local journal_path = stats.mmap_piece_journal_path
+    eq(true, uv.fs_copyfile(journal_path, 'Xtest_mmap_saved_journal'))
+
+    command('bwipe!')
+    eq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile('Xtest_mmap_saved_journal', journal_path))
+
+    command('enew')
+    command('recover! ' .. fn.fnameescape(journal_path))
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(1, stats.mmap_piece_journal_record_count)
+    eq(lines[2], fn.getline(2))
+    eq(lines[3], fn.getline(3))
+    eq(lines[4], fn.getline(4))
+    eq(1, fn.getbufvar('%', '&modified'))
   end)
 
   it('recovers mmap journals after fast tail writes reset the source', function()

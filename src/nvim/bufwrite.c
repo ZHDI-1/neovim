@@ -1930,6 +1930,7 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
   bool checking_conversion;
   bool mmap_tail_append_did_write = false;
   bool mmap_tail_truncate_did_write = false;
+  bool mmap_piece_raw_did_write = false;
 
   int fd;
 
@@ -2187,6 +2188,7 @@ restore_backup:
                                  write_final_eol, write_undo_file ? &sha_ctx : NULL, &no_eol,
                                  &nchars);
       if (mmap_write_ret == OK) {
+        mmap_piece_raw_did_write = true;
         lnum = end + 1;
         goto write_loop_done;
       } else if (mmap_write_ret == FAIL) {
@@ -2509,6 +2511,15 @@ write_loop_done:
   }
   if (mmap_tail_truncate_did_write
       && ml_buf_mmap_rebase_file_after_truncate(buf, ffname) == FAIL) {
+    ml_buf_mmap_source_detach_buffer_file(buf);
+  }
+  if (mmap_piece_raw_did_write
+      && reset_changed
+      && whole
+      && !append
+      && overwriting
+      && !write_info.bw_conv_error
+      && ml_buf_mmap_rebase_file_after_write(buf, ffname) == FAIL) {
     ml_buf_mmap_source_detach_buffer_file(buf);
   }
   if (reset_changed && whole && !append && overwriting && !write_info.bw_conv_error) {
