@@ -651,6 +651,20 @@ describe('fileio', function()
     eq(prefilter_miss_count + 1, stats.mmap_search_prefilter_miss_count)
 
     prefilter_count = stats.mmap_search_prefilter_count
+    prefilter_miss_count = stats.mmap_search_prefilter_miss_count
+    command('set regexpengine=1')
+    command('normal! G$')
+    eq(0, fn.search([[.*prefilter-target-\d\+]], 'bW', 41001))
+    command('set regexpengine&')
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(prefilter_count, stats.mmap_search_prefilter_count)
+    eq(prefilter_miss_count + 1, stats.mmap_search_prefilter_miss_count)
+
+    prefilter_count = stats.mmap_search_prefilter_count
     command('set regexpengine=1')
     command('normal! G$')
     eq(41000, fn.search([[.*prefilter-target-\d\+]], 'bW'))

@@ -3939,9 +3939,11 @@ bool ml_get_buf_mmap_literal_match_at(buf_T *buf, size_t *start_offsetp, linenr_
   return true;
 }
 
-bool ml_get_buf_mmap_literal_match_before_pos(buf_T *buf, size_t *end_offsetp, linenr_T *lnump,
-                                              size_t *line_startp, const char *pat,
-                                              size_t pat_len, size_t *line_lenp, colnr_T *colp)
+bool ml_get_buf_mmap_literal_match_before_in_range_pos(buf_T *buf, size_t start_offset,
+                                                       size_t *end_offsetp, linenr_T *lnump,
+                                                       size_t *line_startp, const char *pat,
+                                                       size_t pat_len, size_t *line_lenp,
+                                                       colnr_T *colp)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
 {
   *line_lenp = 0;
@@ -3955,25 +3957,29 @@ bool ml_get_buf_mmap_literal_match_before_pos(buf_T *buf, size_t *end_offsetp, l
   if (!ml_mmap_is_pristine(buf)) {
     PieceTree *tree = buf->b_ml.ml_piece_tree;
     const size_t total = tree == NULL ? 0 : piece_tree_byte_len(tree);
+    start_offset = MIN(start_offset, total);
     const size_t end_offset = MIN(*end_offsetp, total);
-    if (tree == NULL || end_offset == 0 || pat_len > end_offset) {
+    if (tree == NULL || start_offset >= end_offset || pat_len > end_offset - start_offset) {
       return false;
     }
 
-    if (!piece_tree_find_literal_before(tree, end_offset, pat, pat_len, &match_offset)) {
+    if (!piece_tree_find_literal_before_in_range(tree, start_offset, end_offset, pat, pat_len,
+                                                 &match_offset)) {
       return false;
     }
     found = true;
   } else {
+    start_offset = MIN(start_offset, buf->b_ml.ml_mmap_size);
     const size_t end_offset = MIN(*end_offsetp, buf->b_ml.ml_mmap_size);
-    if (end_offset == 0 || pat_len > end_offset) {
+    if (start_offset >= end_offset || pat_len > end_offset - start_offset) {
       return false;
     }
 
-    const char *match = ml_mmap_find_literal_before(buf->b_ml.ml_mmap_base, end_offset,
-                                                    pat, pat_len);
+    const char *base = buf->b_ml.ml_mmap_base + start_offset;
+    const char *match = ml_mmap_find_literal_before(base, end_offset - start_offset, pat,
+                                                    pat_len);
     if (match != NULL) {
-      match_offset = (size_t)(match - buf->b_ml.ml_mmap_base);
+      match_offset = start_offset + (size_t)(match - base);
       found = true;
     }
   }
@@ -3998,6 +4004,16 @@ bool ml_get_buf_mmap_literal_match_before_pos(buf_T *buf, size_t *end_offsetp, l
   *line_startp = line_start;
   *end_offsetp = match_offset;
   return true;
+}
+
+bool ml_get_buf_mmap_literal_match_before_pos(buf_T *buf, size_t *end_offsetp, linenr_T *lnump,
+                                              size_t *line_startp, const char *pat,
+                                              size_t pat_len, size_t *line_lenp, colnr_T *colp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_get_buf_mmap_literal_match_before_in_range_pos(buf, 0, end_offsetp, lnump,
+                                                           line_startp, pat, pat_len, line_lenp,
+                                                           colp);
 }
 
 bool ml_get_buf_mmap_literal_match_before(buf_T *buf, size_t *end_offsetp, linenr_T *lnump,

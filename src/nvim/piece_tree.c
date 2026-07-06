@@ -2170,21 +2170,23 @@ static bool pt_find_literal_before_boundary(const PieceTreeSpanVec *vec, size_t 
   return found;
 }
 
-bool piece_tree_find_literal_before(PieceTree *tree, size_t offset, const char *pat,
-                                    size_t pat_len, size_t *match_offsetp)
+bool piece_tree_find_literal_before_in_range(PieceTree *tree, size_t start, size_t end,
+                                             const char *pat, size_t pat_len,
+                                             size_t *match_offsetp)
 {
   if (tree == NULL || pat == NULL || match_offsetp == NULL || pat_len == 0) {
     return false;
   }
 
   const size_t total = piece_tree_byte_len(tree);
-  offset = MIN(offset, total);
-  if (pat_len > offset) {
+  start = MIN(start, total);
+  end = MIN(end, total);
+  if (start >= end || pat_len > end - start) {
     return false;
   }
 
   PieceTreeSpanVec vec = { 0 };
-  if (!piece_tree_collect_span_vec(tree, 0, offset, &vec)) {
+  if (!piece_tree_collect_span_vec(tree, start, end - start, &vec)) {
     return false;
   }
 
@@ -2215,6 +2217,12 @@ bool piece_tree_find_literal_before(PieceTree *tree, size_t offset, const char *
   xfree(boundary_window);
   piece_tree_span_vec_clear(&vec);
   return found;
+}
+
+bool piece_tree_find_literal_before(PieceTree *tree, size_t offset, const char *pat,
+                                    size_t pat_len, size_t *match_offsetp)
+{
+  return piece_tree_find_literal_before_in_range(tree, 0, offset, pat, pat_len, match_offsetp);
 }
 
 bool piece_tree_find_literals(PieceTree *tree, size_t offset, size_t len,
