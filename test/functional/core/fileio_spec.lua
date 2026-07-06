@@ -592,6 +592,20 @@ describe('fileio', function()
     eq(true, stats.mmap_active)
     eq(true, stats.mmap_piece_tree)
     local prefilter_count = stats.mmap_search_prefilter_count
+    local prefilter_miss_count = stats.mmap_search_prefilter_miss_count
+
+    command('set regexpengine=1')
+    command([[silent! 1,100s/.*prefilter-target-\d\+/range miss/]])
+    command('set regexpengine&')
+    eq('regex prefilter-target-12345 suffix', fn.getline(41000))
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(prefilter_count, stats.mmap_search_prefilter_count)
+    eq(prefilter_miss_count + 1, stats.mmap_search_prefilter_miss_count)
+    prefilter_miss_count = stats.mmap_search_prefilter_miss_count
 
     command('set regexpengine=1')
     command('normal! gg0')
@@ -609,6 +623,7 @@ describe('fileio', function()
     })
     stats = api.nvim__buf_stats(0)
     prefilter_count = stats.mmap_search_prefilter_count
+    prefilter_miss_count = stats.mmap_search_prefilter_miss_count
 
     command('set regexpengine=1')
     command([[%s/.*mmap-subregex-\d\+/substitution hit/]])
@@ -620,6 +635,7 @@ describe('fileio', function()
     eq(true, stats.mmap_piece_tree)
     eq(0, stats.virt_blocks)
     ok(stats.mmap_search_prefilter_count > prefilter_count)
+    eq(prefilter_miss_count + 1, stats.mmap_search_prefilter_miss_count)
 
     prefilter_count = stats.mmap_search_prefilter_count
     command('set regexpengine=1')
@@ -734,6 +750,20 @@ describe('fileio', function()
 
     stats = api.nvim__buf_stats(0)
     local prefilter_count = stats.mmap_search_prefilter_count
+    local prefilter_miss_count = stats.mmap_search_prefilter_miss_count
+    command('set regexpengine=1')
+    command([[silent! 1,100g/.*global-regex-\d\+/s/target/outside/]])
+    command('set regexpengine&')
+    eq('global-regex-12345 target', fn.getline(39950))
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(prefilter_count, stats.mmap_search_prefilter_count)
+    eq(prefilter_miss_count + 1, stats.mmap_search_prefilter_miss_count)
+    prefilter_miss_count = stats.mmap_search_prefilter_miss_count
+
     command('set regexpengine=1')
     command([[g/.*global-regex-\d\+/s/target/done/]])
     command('set regexpengine&')
@@ -744,6 +774,7 @@ describe('fileio', function()
     eq(true, stats.mmap_piece_tree)
     eq(0, stats.virt_blocks)
     ok(stats.mmap_search_prefilter_count > prefilter_count)
+    eq(prefilter_miss_count + 1, stats.mmap_search_prefilter_miss_count)
 
     command([[call setreg('a', 'inserted-by-global', 'l')]])
     command('g/global-insert/put a')

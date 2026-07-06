@@ -3633,8 +3633,8 @@ static bool sub_mmap_literal_line(linenr_T lnum, const char *pat, size_t pat_len
   return true;
 }
 
-static bool sub_mmap_literal_next_candidate(linenr_T lnum, linenr_T line2, const char *pat,
-                                            size_t pat_len, linenr_T *match_lnump)
+static bool mmap_literal_next_candidate(linenr_T lnum, linenr_T line2, const char *pat,
+                                        size_t pat_len, linenr_T *match_lnump)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
 {
   if (lnum > line2) {
@@ -3686,7 +3686,7 @@ static bool sub_try_mmap_literal(exarg_T *eap, String pat, const char *sub,
   ml_buf_mmap_substitute_literal_record(curbuf);
   for (linenr_T lnum = eap->line1; lnum <= line2 && !got_int && !aborting();) {
     linenr_T match_lnum = 0;
-    if (!sub_mmap_literal_next_candidate(lnum, line2, pat.data, pat.size, &match_lnum)) {
+    if (!mmap_literal_next_candidate(lnum, line2, pat.data, pat.size, &match_lnum)) {
       break;
     }
 
@@ -4066,24 +4066,14 @@ static int do_sub(exarg_T *eap, const proftime_T timeout, const int cmdpreview_n
            || lnum <= curwin->w_botline);
        lnum++) {
     if (mmap_regex_prefilter) {
-      size_t line_start = 0;
-      if (ml_get_buf_mmap_line_start(curbuf, lnum, &line_start)) {
-        linenr_T literal_lnum = lnum;
-        size_t literal_offset = line_start;
-        size_t literal_line_start = line_start;
-        size_t literal_line_len = 0;
-        colnr_T literal_col = 0;
-        const bool has_literal =
-          ml_get_buf_mmap_literal_match_at_pos(curbuf, &literal_offset, &literal_lnum,
-                                               &literal_line_start, mmap_required_literal,
-                                               mmap_required_literal_len, &literal_line_len,
-                                               &literal_col);
-        if (!has_literal || literal_lnum > line2) {
-          break;
-        }
-        ml_buf_mmap_search_prefilter_record(curbuf);
-        lnum = literal_lnum;
+      linenr_T literal_lnum = 0;
+      if (!mmap_literal_next_candidate(lnum, line2, mmap_required_literal,
+                                       mmap_required_literal_len, &literal_lnum)) {
+        ml_buf_mmap_search_prefilter_miss_record(curbuf);
+        break;
       }
+      ml_buf_mmap_search_prefilter_record(curbuf);
+      lnum = literal_lnum;
     }
     int nmatch = vim_regexec_multi(&regmatch, curwin, curbuf, lnum,
                                    0, NULL, NULL);
@@ -5069,24 +5059,14 @@ void ex_global(exarg_T *eap)
     // pass 1: set marks for each (not) matching line
     for (lnum = eap->line1; lnum <= eap->line2 && !got_int; lnum++) {
       if (mmap_regex_prefilter) {
-        size_t line_start = 0;
-        if (ml_get_buf_mmap_line_start(curbuf, lnum, &line_start)) {
-          linenr_T literal_lnum = lnum;
-          size_t literal_offset = line_start;
-          size_t literal_line_start = line_start;
-          size_t literal_line_len = 0;
-          colnr_T literal_col = 0;
-          const bool has_literal =
-            ml_get_buf_mmap_literal_match_at_pos(curbuf, &literal_offset, &literal_lnum,
-                                                 &literal_line_start, mmap_required_literal,
-                                                 mmap_required_literal_len, &literal_line_len,
-                                                 &literal_col);
-          if (!has_literal || literal_lnum > eap->line2) {
-            break;
-          }
-          ml_buf_mmap_search_prefilter_record(curbuf);
-          lnum = literal_lnum;
+        linenr_T literal_lnum = 0;
+        if (!mmap_literal_next_candidate(lnum, eap->line2, mmap_required_literal,
+                                         mmap_required_literal_len, &literal_lnum)) {
+          ml_buf_mmap_search_prefilter_miss_record(curbuf);
+          break;
         }
+        ml_buf_mmap_search_prefilter_record(curbuf);
+        lnum = literal_lnum;
       }
       // a match on this line?
       int match = vim_regexec_multi(&regmatch, curwin, curbuf, lnum, 0, NULL, NULL);
