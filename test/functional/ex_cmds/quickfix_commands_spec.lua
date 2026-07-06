@@ -317,7 +317,12 @@ it(':vimgrep searches edited mmap buffers through the piece tree', function()
   command("call setline(39950, 'tail mmap-regex-12345 suffix')")
   local stats = api.nvim__buf_stats(0)
   local prefilter_count = stats.mmap_search_prefilter_count
+  local prefilter_miss_count = stats.mmap_search_prefilter_miss_count
   command('set regexpengine=1')
+  eq(
+    [[Vim(vimgrep):E480: No match: .*definitely-missing-mmap-regex-\d\+]],
+    pcall_err(command, [[vimgrep /.*definitely-missing-mmap-regex-\d\+/gj %]])
+  )
   command([[vimgrep /.*mmap-regex-\d\+/gj %]])
   command('set regexpengine&')
   list = fn.getqflist()
@@ -328,6 +333,8 @@ it(':vimgrep searches edited mmap buffers through the piece tree', function()
   eq(true, stats.mmap_active)
   eq(true, stats.mmap_piece_tree)
   eq(0, stats.virt_blocks)
+  -- One miss for the no-match regex, one for finishing the successful scan.
+  eq(prefilter_miss_count + 2, stats.mmap_search_prefilter_miss_count)
   eq(true, stats.mmap_search_prefilter_count > prefilter_count)
 end)
 

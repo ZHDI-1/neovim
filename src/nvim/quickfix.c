@@ -5793,6 +5793,7 @@ static bool vgr_match_buflines(qf_list_T *qfl, char *fname, buf_T *buf, char *sp
                                                  mmap_required_literal_len, &literal_line_len,
                                                  &literal_col);
           if (!has_literal) {
+            ml_buf_mmap_search_prefilter_miss_record(buf);
             break;
           }
           ml_buf_mmap_search_prefilter_record(buf);
