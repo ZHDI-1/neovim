@@ -1244,6 +1244,17 @@ Boolean nvim__buf_compact_mmap_piece_tree(Buffer buf, Error *err)
 }
 
 /// @nodoc
+Boolean nvim__buf_recover_mmap_piece_journal(Buffer buf, Error *err)
+{
+  buf_T *b = find_buffer_by_handle(buf, err);
+  if (!b) {
+    return false;
+  }
+
+  return ml_buf_mmap_piece_journal_recover(b);
+}
+
+/// @nodoc
 Dict nvim__buf_stats(Buffer buf, Arena *arena, Error *err)
 {
   buf_T *b = find_buffer_by_handle(buf, err);

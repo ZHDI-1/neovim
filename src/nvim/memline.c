@@ -1043,7 +1043,12 @@ static void ml_mmap_piece_journal_open(buf_T *buf)
 
   const int fd = os_open(journal_name, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0600);
   if (fd < 0) {
-    xfree(journal_name);
+    if (os_path_exists(journal_name)) {
+      XFREE_CLEAR(buf->b_ml.ml_mmap_piece_journal_fname);
+      buf->b_ml.ml_mmap_piece_journal_fname = journal_name;
+    } else {
+      xfree(journal_name);
+    }
     buf->b_ml.ml_mmap_piece_journal_failed = true;
     return;
   }
@@ -1082,6 +1087,167 @@ static void ml_mmap_piece_journal_open(buf_T *buf)
   buf->b_ml.ml_mmap_piece_journal_record_count = 0;
   buf->b_ml.ml_mmap_piece_journal_bytes = (uint64_t)size;
   buf->b_ml.ml_mmap_piece_journal_failed = false;
+}
+
+static char *ml_mmap_piece_journal_read_file(const char *fname, size_t *lenp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  int fd = os_open(fname, O_RDONLY, 0);
+  if (fd < 0) {
+    return NULL;
+  }
+
+  FileInfo info;
+  if (!os_fileinfo_fd(fd, &info) || !S_ISREG(info.stat.st_mode)
+      || (uintmax_t)info.stat.st_size > (uintmax_t)SIZE_MAX) {
+    close(fd);
+    return NULL;
+  }
+
+  const size_t len = (size_t)info.stat.st_size;
+  char *data = len == 0 ? NULL : xmalloc(len);
+  size_t read_len = 0;
+  while (read_len < len) {
+    const ssize_t n = read_eintr(fd, data + read_len, len - read_len);
+    if (n <= 0) {
+      xfree(data);
+      close(fd);
+      return NULL;
+    }
+    read_len += (size_t)n;
+  }
+  close(fd);
+  *lenp = len;
+  return data;
+}
+
+static bool ml_mmap_piece_journal_header_matches(buf_T *buf, const PieceJournalHeader *header)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  FileInfo info;
+  return os_fileinfo(buf->b_ffname, &info)
+         && header->original_dev == (uint64_t)info.stat.st_dev
+         && header->original_ino == (uint64_t)info.stat.st_ino
+         && header->original_size == os_fileinfo_size(&info)
+         && header->original_mtime_sec == (uint64_t)info.stat.st_mtim.tv_sec
+         && header->original_mtime_nsec == (uint64_t)info.stat.st_mtim.tv_nsec
+         && header->text_size == (uint64_t)ml_mmap_text_size(buf)
+         && header->line_count == (uint64_t)buf->b_ml.ml_line_count
+         && header->flags == ml_mmap_piece_journal_flags(buf);
+}
+
+static bool ml_mmap_piece_journal_apply_record(PieceTree *tree,
+                                               const PieceJournalRecord *record)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (record->offset > SIZE_MAX || record->delete_len > SIZE_MAX
+      || record->insert_len > SIZE_MAX) {
+    return false;
+  }
+
+  const size_t offset = (size_t)record->offset;
+  const size_t delete_len = (size_t)record->delete_len;
+  const size_t insert_len = (size_t)record->insert_len;
+  const char *insert_text = insert_len == 0 ? "" : record->insert_text;
+  bool ok = false;
+  switch (record->op) {
+  case kPieceJournalOpInsert:
+    ok = piece_tree_insert(tree, offset, insert_text, insert_len);
+    break;
+  case kPieceJournalOpDelete:
+    ok = piece_tree_delete(tree, offset, delete_len);
+    break;
+  case kPieceJournalOpReplace:
+    ok = piece_tree_replace(tree, offset, delete_len, insert_text, insert_len);
+    break;
+  }
+  if (!ok) {
+    return false;
+  }
+
+  return tree->revision == record->revision
+         && piece_tree_byte_len(tree) == (size_t)record->text_size_after
+         && piece_tree_line_count(tree) == (size_t)record->line_count_after;
+}
+
+static bool ml_mmap_piece_journal_replay(buf_T *buf, const char *data, size_t len,
+                                         PieceTree **treep, size_t *consumedp,
+                                         uint64_t *record_countp, linenr_T *line_countp,
+                                         bool *noeolp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  PieceJournalHeader header = { 0 };
+  size_t consumed = 0;
+  if (piece_journal_header_decode(data, len, &header, &consumed) != kPieceJournalDecodeOK
+      || !ml_mmap_piece_journal_header_matches(buf, &header)) {
+    return false;
+  }
+
+  PieceTree *tree = xmalloc(sizeof *tree);
+  if (!piece_tree_clone_compact(tree, buf->b_ml.ml_piece_tree)) {
+    xfree(tree);
+    return false;
+  }
+
+  bool ok = true;
+  uint64_t record_count = 0;
+  linenr_T line_count = buf->b_ml.ml_line_count;
+  bool noeol = buf->b_ml.ml_mmap_noeol;
+  while (consumed < len) {
+    PieceJournalRecord record = { 0 };
+    size_t record_len = 0;
+    const PieceJournalDecodeResult result =
+      piece_journal_record_decode(data + consumed, len - consumed, &record, &record_len);
+    if (result == kPieceJournalDecodeIncomplete) {
+      break;
+    }
+    if (result != kPieceJournalDecodeOK || record.line_count_after > (uint64_t)MAXLNUM
+        || !ml_mmap_piece_journal_apply_record(tree, &record)) {
+      ok = false;
+      break;
+    }
+
+    consumed += record_len;
+    record_count++;
+    line_count = (linenr_T)record.line_count_after;
+    noeol = (record.flags_after & PIECE_JOURNAL_FLAG_NOEOL) != 0;
+  }
+
+  if (!ok || record_count == 0) {
+    piece_tree_clear(tree);
+    xfree(tree);
+    return false;
+  }
+
+  *treep = tree;
+  *consumedp = consumed;
+  *record_countp = record_count;
+  *line_countp = line_count;
+  *noeolp = noeol;
+  return true;
+}
+
+static bool ml_mmap_piece_journal_reopen_after_replay(buf_T *buf, size_t consumed,
+                                                      size_t journal_len,
+                                                      uint64_t record_count)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  buf->b_ml.ml_mmap_piece_journal_record_count = record_count;
+  buf->b_ml.ml_mmap_piece_journal_bytes = (uint64_t)consumed;
+  if (consumed != journal_len) {
+    buf->b_ml.ml_mmap_piece_journal_failed = true;
+    return false;
+  }
+
+  const int fd = os_open(buf->b_ml.ml_mmap_piece_journal_fname, O_WRONLY | O_APPEND, 0);
+  if (fd < 0) {
+    buf->b_ml.ml_mmap_piece_journal_failed = true;
+    return false;
+  }
+
+  buf->b_ml.ml_mmap_piece_journal_fd = fd;
+  buf->b_ml.ml_mmap_piece_journal_failed = false;
+  return true;
 }
 
 static void ml_mmap_piece_journal_append(buf_T *buf, PieceJournalOp op, size_t offset,
@@ -1851,6 +2017,70 @@ const char *ml_buf_mmap_piece_journal_path(buf_T *buf)
   return ml_mmap_is_active(buf) && buf->b_ml.ml_mmap_piece_journal_fname != NULL
          ? buf->b_ml.ml_mmap_piece_journal_fname
          : "";
+}
+
+bool ml_buf_mmap_piece_journal_recover(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL || buf->b_ffname == NULL
+      || buf->b_ml.ml_mmap_piece_journal_fd >= 0) {
+    return false;
+  }
+
+  char *journal_name = NULL;
+  if (buf->b_ml.ml_mmap_piece_journal_fname == NULL) {
+    journal_name = ml_mmap_piece_journal_make_name(buf);
+    if (journal_name == NULL || !os_path_exists(journal_name)) {
+      xfree(journal_name);
+      return false;
+    }
+    buf->b_ml.ml_mmap_piece_journal_fname = journal_name;
+    journal_name = NULL;
+  }
+
+  ml_flush_line(buf, false);
+  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL) {
+    return false;
+  }
+
+  size_t journal_len = 0;
+  char *journal = ml_mmap_piece_journal_read_file(buf->b_ml.ml_mmap_piece_journal_fname,
+                                                  &journal_len);
+  if (journal == NULL) {
+    buf->b_ml.ml_mmap_piece_journal_failed = true;
+    return false;
+  }
+
+  PieceTree *tree = NULL;
+  size_t consumed = 0;
+  uint64_t record_count = 0;
+  linenr_T line_count = 0;
+  bool noeol = false;
+  const bool replayed = ml_mmap_piece_journal_replay(buf, journal, journal_len, &tree, &consumed,
+                                                     &record_count, &line_count, &noeol);
+  xfree(journal);
+  if (!replayed) {
+    buf->b_ml.ml_mmap_piece_journal_failed = true;
+    return false;
+  }
+
+  PieceTree *old_tree = buf->b_ml.ml_piece_tree;
+  buf->b_ml.ml_piece_tree = tree;
+  buf->b_ml.ml_line_count = line_count;
+  buf->b_ml.ml_mmap_noeol = noeol;
+  if (piece_tree_byte_len(tree) == 0) {
+    buf->b_ml.ml_flags |= ML_EMPTY;
+  } else {
+    buf->b_ml.ml_flags &= ~ML_EMPTY;
+  }
+  ml_mmap_clear_cache(buf);
+  ml_mmap_retire_piece_storage(old_tree, ml_mmap_storage_ref(buf->b_ml.ml_mmap_storage));
+  ml_mmap_piece_journal_reopen_after_replay(buf, consumed, journal_len, record_count);
+  buf->b_flags |= BF_RECOVERED;
+  changed_internal(buf);
+  buf_inc_changedtick(buf);
+  redraw_curbuf_later(UPD_NOT_VALID);
+  return true;
 }
 
 uint64_t ml_buf_mmap_piece_revision(buf_T *buf)

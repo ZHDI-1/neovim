@@ -45,6 +45,7 @@ describe('fileio', function()
     os.remove('Xtest_startup_file2~')
     os.remove('Xtest_mmap_readfile')
     os.remove('Xtest_mmap_readfile~')
+    os.remove('Xtest_mmap_saved_journal')
     os.remove('Xtest_mmap_noeol')
     os.remove('Xtest_mmap_empty_delete_written')
     os.remove('Xtest_mmap_noeol_written')
@@ -594,6 +595,85 @@ describe('fileio', function()
 
     command('bwipe!')
     eq(nil, uv.fs_stat(journal_path))
+  end)
+
+  it('recovers mmap piece-tree edits from a piece journal', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for mmap recovery smoke'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir// swapfile' } })
+    command('edit Xtest_mmap_readfile')
+    command("call setline(2, 'recovered change')")
+    command("call append(2, 'recovered inserted')")
+    command('5delete')
+
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(3, stats.mmap_piece_journal_record_count)
+    local journal_path = stats.mmap_piece_journal_path
+    neq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile(journal_path, 'Xtest_mmap_saved_journal'))
+
+    command('bwipe!')
+    eq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile('Xtest_mmap_saved_journal', journal_path))
+
+    command('edit Xtest_mmap_readfile')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(false, stats.mmap_piece_journal_active)
+    eq(true, stats.mmap_piece_journal_failed)
+    eq(journal_path, stats.mmap_piece_journal_path)
+
+    eq(true, api.nvim__buf_recover_mmap_piece_journal(0))
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(3, stats.mmap_piece_journal_record_count)
+    eq('recovered change', fn.getline(2))
+    eq('recovered inserted', fn.getline(3))
+    eq(lines[3], fn.getline(4))
+    eq(lines[5], fn.getline(5))
+    eq(1, fn.getbufvar('%', '&modified'))
+  end)
+
+  it('refuses mmap piece-journal recovery when the original file changed', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for mmap recovery refusal'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir// swapfile' } })
+    command('edit Xtest_mmap_readfile')
+    command("call setline(2, 'unsafe recovered change')")
+
+    local stats = api.nvim__buf_stats(0)
+    local journal_path = stats.mmap_piece_journal_path
+    eq(true, uv.fs_copyfile(journal_path, 'Xtest_mmap_saved_journal'))
+    command('bwipe!')
+
+    lines[#lines + 1] = 'original changed outside recovery'
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+    eq(true, uv.fs_copyfile('Xtest_mmap_saved_journal', journal_path))
+
+    command('edit Xtest_mmap_readfile')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(false, stats.mmap_piece_journal_active)
+    eq(true, stats.mmap_piece_journal_failed)
+    eq(false, api.nvim__buf_recover_mmap_piece_journal(0))
+    eq(lines[2], fn.getline(2))
+    eq(0, fn.getbufvar('%', '&modified'))
   end)
 
   it('defers stale legacy swap checks for mmap piece tree reads', function()
