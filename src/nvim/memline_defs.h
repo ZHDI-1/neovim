@@ -10,6 +10,7 @@
 # define NVIM_PIECE_TREE_TYPEDEF
 typedef struct piece_tree PieceTree;
 #endif
+typedef struct ml_mmap_storage ml_mmap_storage_T;
 
 ///
 /// When searching for a specific line, we remember what blocks in the tree
@@ -82,6 +83,7 @@ typedef struct {
   size_t ml_mmap_size;          // size of ml_mmap_base
   size_t *ml_mmap_line_starts;  // byte offsets for sparse line-index blocks
   size_t ml_mmap_index_count;   // number of sparse line-index blocks
+  ml_mmap_storage_T *ml_mmap_storage;  // shared owner for mmap/index storage
   bool ml_mmap_noeol;           // last line has no final EOL
   bool ml_mmap_source_is_buffer_file;  // mmap source still aliases buffer file
   PieceTree *ml_piece_tree;     // tree index/composition for mmap-backed text

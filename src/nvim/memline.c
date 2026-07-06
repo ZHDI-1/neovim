@@ -348,6 +348,7 @@ typedef struct {
   bool ok;
 } ml_mmap_piece_literal_match_job_T;
 
+typedef struct ml_mmap_line_index ml_mmap_line_index_T;
 typedef struct ml_mmap_retired_piece_storage ml_mmap_retired_piece_storage_T;
 
 #include "memline.c.generated.h"
@@ -409,12 +410,23 @@ enum {
   ML_MMAP_PIECE_RECLAIM_EVENT_BUDGET = 256,
 };
 
+struct ml_mmap_line_index {
+  size_t ref_count;
+  size_t *starts;
+  size_t count;
+};
+
+struct ml_mmap_storage {
+  size_t ref_count;
+  char *base;
+  size_t size;
+  ml_mmap_line_index_T *line_index;
+};
+
 struct ml_mmap_retired_piece_storage {
   struct ml_mmap_retired_piece_storage *next;
   PieceTree *tree;
-  char *mmap_base;
-  size_t mmap_size;
-  size_t *line_starts;
+  ml_mmap_storage_T *mmap_storage;
 };
 
 static bool ml_mmap_piece_reclaim_scheduled = false;
@@ -422,16 +434,128 @@ static ml_mmap_retired_piece_storage_T *ml_mmap_retired_piece_storage = NULL;
 
 static void ml_mmap_piece_reclaim_schedule(void);
 
+static inline size_t ml_mmap_ref_count_load(const size_t *countp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_ALWAYS_INLINE
+{
+  return __atomic_load_n(countp, __ATOMIC_ACQUIRE);
+}
+
+static void ml_mmap_ref_count_increment(size_t *countp)
+  FUNC_ATTR_NONNULL_ALL
+{
+  size_t old = ml_mmap_ref_count_load(countp);
+  for (;;) {
+    assert(old > 0);
+    assert(old < SIZE_MAX);
+    const size_t new_count = old + 1;
+    if (__atomic_compare_exchange_n(countp, &old, new_count, false,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+      return;
+    }
+  }
+}
+
+static bool ml_mmap_ref_count_decrement(size_t *countp)
+  FUNC_ATTR_NONNULL_ALL
+{
+  const size_t old = ml_mmap_ref_count_load(countp);
+  assert(old > 0);
+  if (old == 0) {
+    return false;
+  }
+
+  const size_t remaining = __atomic_sub_fetch(countp, 1, __ATOMIC_RELEASE);
+  if (remaining == 0) {
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return true;
+  }
+  return false;
+}
+
+static ml_mmap_line_index_T *ml_mmap_line_index_new(size_t *starts, size_t count)
+  FUNC_ATTR_NONNULL_RET
+{
+  ml_mmap_line_index_T *index = xmalloc(sizeof *index);
+  *index = (ml_mmap_line_index_T){
+    .ref_count = 1,
+    .starts = starts,
+    .count = count,
+  };
+  return index;
+}
+
+static ml_mmap_line_index_T *ml_mmap_line_index_ref(ml_mmap_line_index_T *index)
+{
+  if (index != NULL) {
+    ml_mmap_ref_count_increment(&index->ref_count);
+  }
+  return index;
+}
+
+static void ml_mmap_line_index_unref(ml_mmap_line_index_T *index)
+{
+  if (index == NULL || !ml_mmap_ref_count_decrement(&index->ref_count)) {
+    return;
+  }
+
+  xfree(index->starts);
+  xfree(index);
+}
+
+static ml_mmap_storage_T *ml_mmap_storage_new(char *base, size_t size,
+                                              ml_mmap_line_index_T *line_index)
+  FUNC_ATTR_NONNULL_RET
+{
+  ml_mmap_storage_T *storage = xmalloc(sizeof *storage);
+  *storage = (ml_mmap_storage_T){
+    .ref_count = 1,
+    .base = base,
+    .size = size,
+    .line_index = line_index,
+  };
+  return storage;
+}
+
+static ml_mmap_storage_T *ml_mmap_storage_ref(ml_mmap_storage_T *storage)
+{
+  if (storage != NULL) {
+    ml_mmap_ref_count_increment(&storage->ref_count);
+  }
+  return storage;
+}
+
+static void ml_mmap_storage_unref(ml_mmap_storage_T *storage)
+{
+  if (storage == NULL || !ml_mmap_ref_count_decrement(&storage->ref_count)) {
+    return;
+  }
+
+#ifdef UNIX
+  if (storage->base != NULL && storage->size > 0) {
+    munmap(storage->base, storage->size);
+  }
+#endif
+  ml_mmap_line_index_unref(storage->line_index);
+  xfree(storage);
+}
+
+static void ml_mmap_set_active_storage(buf_T *buf, ml_mmap_storage_T *storage)
+  FUNC_ATTR_NONNULL_ARG(1)
+{
+  buf->b_ml.ml_mmap_storage = storage;
+  buf->b_ml.ml_mmap_base = storage == NULL ? NULL : storage->base;
+  buf->b_ml.ml_mmap_size = storage == NULL ? 0 : storage->size;
+  buf->b_ml.ml_mmap_line_starts = storage == NULL || storage->line_index == NULL
+                                  ? NULL : storage->line_index->starts;
+  buf->b_ml.ml_mmap_index_count = storage == NULL || storage->line_index == NULL
+                                  ? 0 : storage->line_index->count;
+}
+
 static void ml_mmap_retired_piece_storage_free(ml_mmap_retired_piece_storage_T *storage)
   FUNC_ATTR_NONNULL_ALL
 {
   xfree(storage->tree);
-#ifdef UNIX
-  if (storage->mmap_base != NULL && storage->mmap_size > 0) {
-    munmap(storage->mmap_base, storage->mmap_size);
-  }
-#endif
-  xfree(storage->line_starts);
+  ml_mmap_storage_unref(storage->mmap_storage);
   xfree(storage);
 }
 
@@ -448,19 +572,16 @@ static bool ml_mmap_retired_piece_storage_try_dispose(ml_mmap_retired_piece_stor
   return true;
 }
 
-static void ml_mmap_retire_piece_storage(PieceTree *tree, char *mmap_base, size_t mmap_size,
-                                         size_t *line_starts)
+static void ml_mmap_retire_piece_storage(PieceTree *tree, ml_mmap_storage_T *mmap_storage)
 {
-  if (tree == NULL && mmap_base == NULL && line_starts == NULL) {
+  if (tree == NULL && mmap_storage == NULL) {
     return;
   }
 
   ml_mmap_retired_piece_storage_T *storage = xmalloc(sizeof *storage);
   *storage = (ml_mmap_retired_piece_storage_T){
     .tree = tree,
-    .mmap_base = mmap_base,
-    .mmap_size = mmap_size,
-    .line_starts = line_starts,
+    .mmap_storage = mmap_storage,
   };
 
   if (main_loop.events == NULL || main_loop.closing) {
@@ -585,18 +706,13 @@ static void ml_mmap_clear_cache(buf_T *buf)
 static void ml_mmap_clear_piece_tree(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
-  if (buf->b_ml.ml_piece_tree == NULL && buf->b_ml.ml_mmap_base == NULL
-      && buf->b_ml.ml_mmap_line_starts == NULL) {
+  if (buf->b_ml.ml_piece_tree == NULL && buf->b_ml.ml_mmap_storage == NULL) {
     return;
   }
 
-  ml_mmap_retire_piece_storage(buf->b_ml.ml_piece_tree, buf->b_ml.ml_mmap_base,
-                               buf->b_ml.ml_mmap_size, buf->b_ml.ml_mmap_line_starts);
+  ml_mmap_retire_piece_storage(buf->b_ml.ml_piece_tree, buf->b_ml.ml_mmap_storage);
   buf->b_ml.ml_piece_tree = NULL;
-  buf->b_ml.ml_mmap_base = NULL;
-  buf->b_ml.ml_mmap_size = 0;
-  buf->b_ml.ml_mmap_line_starts = NULL;
-  buf->b_ml.ml_mmap_index_count = 0;
+  ml_mmap_set_active_storage(buf, NULL);
 }
 
 static void ml_mmap_close(buf_T *buf)
@@ -715,17 +831,14 @@ static int ml_mmap_materialize(buf_T *buf)
     return OK;
   }
 
+  ml_mmap_storage_T *mmap_storage = buf->b_ml.ml_mmap_storage;
   char *base = buf->b_ml.ml_mmap_base;
   const size_t size = buf->b_ml.ml_mmap_size;
-  size_t *starts = buf->b_ml.ml_mmap_line_starts;
   PieceTree *piece_tree = buf->b_ml.ml_piece_tree;
   const linenr_T line_count = buf->b_ml.ml_line_count;
 
   ml_mmap_clear_cache(buf);
-  buf->b_ml.ml_mmap_base = NULL;
-  buf->b_ml.ml_mmap_size = 0;
-  buf->b_ml.ml_mmap_line_starts = NULL;
-  buf->b_ml.ml_mmap_index_count = 0;
+  ml_mmap_set_active_storage(buf, NULL);
   buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_mmap_source_is_buffer_file = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
@@ -781,7 +894,7 @@ static int ml_mmap_materialize(buf_T *buf)
     }
   }
   ml_flush_line(buf, false);
-  ml_mmap_retire_piece_storage(piece_tree, base, size, starts);
+  ml_mmap_retire_piece_storage(piece_tree, mmap_storage);
   return ret;
 }
 
@@ -1050,14 +1163,14 @@ int ml_set_mmap_lines(buf_T *buf, char *base, size_t size, size_t *line_starts,
   }
 
   ml_flush_line(buf, false);
+  ml_mmap_line_index_T *line_index = ml_mmap_line_index_new(line_starts, index_count);
+  ml_mmap_storage_T *mmap_storage = ml_mmap_storage_new(base, size, line_index);
   const size_t newline_count = (size_t)line_count - (noeol ? 1 : 0);
   buf->b_ml.ml_piece_tree = xmalloc(sizeof *buf->b_ml.ml_piece_tree);
-  piece_tree_init_with_line_index(buf->b_ml.ml_piece_tree, base, size, line_starts, index_count,
+  piece_tree_init_with_line_index(buf->b_ml.ml_piece_tree, mmap_storage->base, mmap_storage->size,
+                                  line_index->starts, line_index->count,
                                   ML_MMAP_INDEX_STRIDE, newline_count);
-  buf->b_ml.ml_mmap_base = base;
-  buf->b_ml.ml_mmap_size = size;
-  buf->b_ml.ml_mmap_line_starts = line_starts;
-  buf->b_ml.ml_mmap_index_count = index_count;
+  ml_mmap_set_active_storage(buf, mmap_storage);
   buf->b_ml.ml_mmap_noeol = noeol;
   buf->b_ml.ml_mmap_source_is_buffer_file = true;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
@@ -1078,6 +1191,23 @@ bool ml_buf_has_mmap_storage(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
   return ml_mmap_is_active(buf);
+}
+
+size_t ml_buf_mmap_storage_ref_count(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf->b_ml.ml_mmap_storage == NULL
+         ? 0
+         : ml_mmap_ref_count_load(&buf->b_ml.ml_mmap_storage->ref_count);
+}
+
+size_t ml_buf_mmap_line_index_ref_count(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf->b_ml.ml_mmap_storage == NULL
+         || buf->b_ml.ml_mmap_storage->line_index == NULL
+         ? 0
+         : ml_mmap_ref_count_load(&buf->b_ml.ml_mmap_storage->line_index->ref_count);
 }
 
 bool ml_buf_mmap_source_is_buffer_file(buf_T *buf)
@@ -1122,6 +1252,7 @@ int ml_buf_mmap_rebase_file(buf_T *buf, const char *fname)
 {
 #ifdef UNIX
   if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL
+      || buf->b_ml.ml_mmap_storage == NULL
       || !ml_buf_mmap_source_is_buffer_file(buf)) {
     return OK;
   }
@@ -1154,18 +1285,18 @@ int ml_buf_mmap_rebase_file(buf_T *buf, const char *fname)
     return FAIL;
   }
 
-  char *old_base = buf->b_ml.ml_mmap_base;
-  const size_t old_size = buf->b_ml.ml_mmap_size;
-  if (!piece_tree_rebase_original(buf->b_ml.ml_piece_tree, base, size)) {
-    munmap(base, size);
+  ml_mmap_storage_T *old_storage = buf->b_ml.ml_mmap_storage;
+  ml_mmap_storage_T *new_storage =
+    ml_mmap_storage_new(base, size, ml_mmap_line_index_ref(old_storage->line_index));
+  if (!piece_tree_rebase_original(buf->b_ml.ml_piece_tree, new_storage->base,
+                                  new_storage->size)) {
+    ml_mmap_storage_unref(new_storage);
     return FAIL;
   }
 
-  buf->b_ml.ml_mmap_base = base;
+  ml_mmap_set_active_storage(buf, new_storage);
   buf->b_ml.ml_mmap_source_is_buffer_file = false;
-  if (old_base != NULL) {
-    munmap(old_base, old_size);
-  }
+  ml_mmap_storage_unref(old_storage);
   ml_mmap_clear_cache(buf);
   return OK;
 #else
@@ -2558,6 +2689,7 @@ int ml_open(buf_T *buf)
   buf->b_ml.ml_mmap_size = 0;
   buf->b_ml.ml_mmap_line_starts = NULL;
   buf->b_ml.ml_mmap_index_count = 0;
+  buf->b_ml.ml_mmap_storage = NULL;
   buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_mmap_source_is_buffer_file = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
@@ -3106,6 +3238,7 @@ void ml_recover(bool checkext)
   buf->b_ml.ml_mmap_size = 0;
   buf->b_ml.ml_mmap_line_starts = NULL;
   buf->b_ml.ml_mmap_index_count = 0;
+  buf->b_ml.ml_mmap_storage = NULL;
   buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_mmap_source_is_buffer_file = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;

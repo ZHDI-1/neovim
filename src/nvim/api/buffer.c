@@ -1240,7 +1240,7 @@ Dict nvim__buf_stats(Buffer buf, Arena *arena, Error *err)
     return (Dict)ARRAY_DICT_INIT;
   }
 
-  Dict rv = arena_dict(arena, 20);
+  Dict rv = arena_dict(arena, 22);
   // Number of times the cached line was flushed.
   // This should generally not increase while editing the same
   // line in the same mode.
@@ -1255,6 +1255,9 @@ Dict nvim__buf_stats(Buffer buf, Arena *arena, Error *err)
   PUT_C(rv, "dirty_bytes2", INTEGER_OBJ((Integer)b->deleted_bytes2));
   PUT_C(rv, "virt_blocks", INTEGER_OBJ((Integer)buf_meta_total(b, kMTMetaLines)));
   PUT_C(rv, "mmap_active", BOOLEAN_OBJ(ml_buf_has_mmap_storage(b)));
+  PUT_C(rv, "mmap_storage_refs", INTEGER_OBJ((Integer)ml_buf_mmap_storage_ref_count(b)));
+  PUT_C(rv, "mmap_line_index_refs",
+        INTEGER_OBJ((Integer)ml_buf_mmap_line_index_ref_count(b)));
   PUT_C(rv, "mmap_source_is_buffer_file",
         BOOLEAN_OBJ(ml_buf_mmap_source_is_buffer_file(b)));
   PUT_C(rv, "mmap_piece_tree", BOOLEAN_OBJ(ml_buf_has_mmap_piece_tree(b)));
