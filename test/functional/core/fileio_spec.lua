@@ -5,6 +5,7 @@ local uv = vim.uv
 
 local assert_log = t.assert_log
 local assert_nolog = t.assert_nolog
+local pcall_err = t.pcall_err
 local clear = n.clear
 local command = n.command
 local eq = t.eq
@@ -630,7 +631,14 @@ describe('fileio', function()
     eq(true, stats.mmap_piece_journal_failed)
     eq(journal_path, stats.mmap_piece_journal_path)
 
-    eq(true, api.nvim__buf_recover_mmap_piece_journal(0))
+    local swaps = fn.swapfilelist()
+    eq(1, #swaps)
+    matches('Xtest_mmap_readfile%.swp%.pj$', swaps[1])
+    local info = fn.swapinfo(swaps[1])
+    eq(1, info.dirty)
+    matches('Xtest_mmap_readfile$', info.fname)
+
+    command('recover')
     stats = api.nvim__buf_stats(0)
     eq(true, stats.mmap_active)
     eq(true, stats.mmap_piece_tree)
@@ -640,6 +648,21 @@ describe('fileio', function()
     eq('recovered change', fn.getline(2))
     eq('recovered inserted', fn.getline(3))
     eq(lines[3], fn.getline(4))
+    eq(lines[5], fn.getline(5))
+    eq(1, fn.getbufvar('%', '&modified'))
+
+    command('bwipe!')
+    eq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile('Xtest_mmap_saved_journal', journal_path))
+
+    command('enew')
+    command('recover! ' .. fn.fnameescape(journal_path))
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(3, stats.mmap_piece_journal_record_count)
+    eq('recovered change', fn.getline(2))
+    eq('recovered inserted', fn.getline(3))
     eq(lines[5], fn.getline(5))
     eq(1, fn.getbufvar('%', '&modified'))
   end)
@@ -671,9 +694,10 @@ describe('fileio', function()
     eq(true, stats.mmap_piece_tree)
     eq(false, stats.mmap_piece_journal_active)
     eq(true, stats.mmap_piece_journal_failed)
-    eq(false, api.nvim__buf_recover_mmap_piece_journal(0))
+    matches('E308: Original file changed;', pcall_err(command, 'recover'))
     eq(lines[2], fn.getline(2))
     eq(0, fn.getbufvar('%', '&modified'))
+    os.remove(journal_path)
   end)
 
   it('defers stale legacy swap checks for mmap piece tree reads', function()

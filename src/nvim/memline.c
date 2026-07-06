@@ -947,6 +947,13 @@ static char *ml_mmap_piece_journal_name_from_swap(const char *swapname)
   return journal;
 }
 
+static bool ml_mmap_piece_journal_is_name(const char *fname)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  const size_t len = strlen(fname);
+  return len > 7 && strcmp(fname + len - 7, ".swp.pj") == 0;
+}
+
 static char *ml_mmap_piece_journal_make_name(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
 {
@@ -998,11 +1005,12 @@ static bool ml_mmap_piece_journal_write_all(int fd, const char *data, size_t len
 static void ml_mmap_piece_journal_close(buf_T *buf, bool delete_file)
   FUNC_ATTR_NONNULL_ALL
 {
+  const bool journal_open = buf->b_ml.ml_mmap_piece_journal_fd >= 0;
   if (buf->b_ml.ml_mmap_piece_journal_fd >= 0) {
     close(buf->b_ml.ml_mmap_piece_journal_fd);
     buf->b_ml.ml_mmap_piece_journal_fd = -1;
   }
-  if (delete_file && buf->b_ml.ml_mmap_piece_journal_fname != NULL) {
+  if (delete_file && journal_open && buf->b_ml.ml_mmap_piece_journal_fname != NULL) {
     os_remove(buf->b_ml.ml_mmap_piece_journal_fname);
   }
   XFREE_CLEAR(buf->b_ml.ml_mmap_piece_journal_fname);
@@ -1119,6 +1127,31 @@ static char *ml_mmap_piece_journal_read_file(const char *fname, size_t *lenp)
   close(fd);
   *lenp = len;
   return data;
+}
+
+static bool ml_mmap_piece_journal_decode_header_file(const char *fname, PieceJournalHeader *headerp,
+                                                     char **datap, size_t *lenp)
+  FUNC_ATTR_NONNULL_ARG(1, 2) FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  size_t len = 0;
+  char *data = ml_mmap_piece_journal_read_file(fname, &len);
+  if (data == NULL) {
+    return false;
+  }
+  if (piece_journal_header_decode(data, len, headerp, NULL) != kPieceJournalDecodeOK) {
+    xfree(data);
+    return false;
+  }
+
+  if (datap != NULL) {
+    *datap = data;
+  } else {
+    xfree(data);
+  }
+  if (lenp != NULL) {
+    *lenp = len;
+  }
+  return true;
 }
 
 static bool ml_mmap_piece_journal_header_matches(buf_T *buf, const PieceJournalHeader *header)
@@ -1247,6 +1280,73 @@ static bool ml_mmap_piece_journal_reopen_after_replay(buf_T *buf, size_t consume
 
   buf->b_ml.ml_mmap_piece_journal_fd = fd;
   buf->b_ml.ml_mmap_piece_journal_failed = false;
+  return true;
+}
+
+static bool ml_recover_mmap_piece_journal(const char *fname, bool called_from_main)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  PieceJournalHeader header = { 0 };
+  char *journal = NULL;
+  if (!ml_mmap_piece_journal_decode_header_file(fname, &header, &journal, NULL)
+      || header.path_len == 0) {
+    xfree(journal);
+    semsg(_("E307: %s does not look like a Nvim mmap piece journal"), fname);
+    return false;
+  }
+
+  char *original = xmemdupz(header.path, header.path_len);
+  if (curbuf->b_ffname == NULL || path_fnamecmp(curbuf->b_ffname, original) != 0) {
+    if (setfname(curbuf, original, NULL, true) == FAIL) {
+      xfree(original);
+      xfree(journal);
+      return false;
+    }
+  }
+  xfree(original);
+  xfree(journal);
+
+  if (called_from_main && ml_open(curbuf) == FAIL) {
+    getout(1);
+  }
+
+  if (!ml_buf_has_mmap_piece_tree(curbuf)) {
+    if (!(curbuf->b_ml.ml_flags & ML_EMPTY)) {
+      semsg(_("E308: Cannot recover %s without an empty mmap buffer"), fname);
+      return false;
+    }
+    if (readfile(curbuf->b_ffname, NULL, 0, 0, MAXLNUM, NULL, READ_NEW, false) != OK) {
+      semsg(_("E308: Cannot read original file for %s"), fname);
+      return false;
+    }
+  }
+
+  if (!ml_buf_has_mmap_piece_tree(curbuf)) {
+    semsg(_("E308: Original file for %s is not mmap piece-tree compatible"), fname);
+    return false;
+  }
+  if (curbuf->b_ml.ml_mmap_piece_journal_fd >= 0) {
+    semsg(_("E308: Cannot recover from active mmap piece journal %s"), fname);
+    return false;
+  }
+
+  XFREE_CLEAR(curbuf->b_ml.ml_mmap_piece_journal_fname);
+  curbuf->b_ml.ml_mmap_piece_journal_fname = xstrdup(fname);
+  curbuf->b_ml.ml_mmap_piece_journal_failed = true;
+  if (!ml_buf_mmap_piece_journal_recover(curbuf)) {
+    semsg(_("E308: Original file changed; mmap piece-journal recovery unsafe for %s"), fname);
+    return false;
+  }
+
+  msg_ext_set_kind("wmsg");
+  msg(_("Recovery completed. You should check if everything is OK."), 0);
+  msg_puts(_("\n(You might want to write out this file under another name\n"));
+  msg_puts(_("and run diff with the original file to check for changes)"));
+  msg_puts(_("\nYou may want to delete the .swp.pj file now."));
+  if (!ui_has(kUIMessages)) {
+    msg_puts("\n\n");
+  }
+  cmdline_row = msg_row;
   return true;
 }
 
@@ -3965,7 +4065,10 @@ void ml_recover(bool checkext)
     fname = "";
   }
   int len = (int)strlen(fname);
-  if (checkext && len >= 4
+  if (checkext && ml_mmap_piece_journal_is_name(fname)) {
+    directly = true;
+    fname_used = xstrdup(fname);
+  } else if (checkext && len >= 4
       && STRNICMP(fname + len - 4, ".s", 2) == 0
       && vim_strchr("abcdefghijklmnopqrstuvw", TOLOWER_ASC((uint8_t)fname[len - 2])) != NULL
       && ASCII_ISALPHA(fname[len - 1])) {
@@ -3998,6 +4101,11 @@ void ml_recover(bool checkext)
   }
   if (fname_used == NULL) {
     goto theend;  // user chose invalid number.
+  }
+  if (ml_mmap_piece_journal_is_name(fname_used)) {
+    serious_error = false;
+    ml_recover_mmap_piece_journal(fname_used, called_from_main);
+    goto theend;
   }
   // When called from main() still need to initialize storage structure
   if (called_from_main && ml_open(curbuf) == FAIL) {
@@ -4517,6 +4625,7 @@ void recover_names(char *fname, bool skip_curbuf, list_T *ret_list)
   String dir_name;
   dir_name.data = xmalloc(strlen(p_dir) + 1);
   char *dirp = p_dir;
+  bool listed_stale_piece_journal = false;
   while (*dirp) {
     // Isolate a directory name from *dirp and put it in dir_name (we know
     // it is large enough, so use 31000 for length).
@@ -4530,7 +4639,10 @@ void recover_names(char *fname, bool skip_curbuf, list_T *ret_list)
         // supports this too, on some file systems.
         names[1] = xmemdupz(S_LEN(".*.sw?"));
         names[2] = xmemdupz(S_LEN(".sw?"));
-        num_names = 3;
+        names[3] = xmemdupz(S_LEN("*.swp.pj"));
+        names[4] = xmemdupz(S_LEN(".*.swp.pj"));
+        names[5] = xmemdupz(S_LEN(".swp.pj"));
+        num_names = 6;
       } else {
         num_names = recov_file_names(names, fname_res, true);
       }
@@ -4541,7 +4653,10 @@ void recover_names(char *fname, bool skip_curbuf, list_T *ret_list)
         // supports this too, on some file systems.
         names[1] = concat_fnames(dir_name, STATIC_CSTR_AS_STRING(".*.sw?"), true).data;
         names[2] = concat_fnames(dir_name, STATIC_CSTR_AS_STRING(".sw?"), true).data;
-        num_names = 3;
+        names[3] = concat_fnames(dir_name, STATIC_CSTR_AS_STRING("*.swp.pj"), true).data;
+        names[4] = concat_fnames(dir_name, STATIC_CSTR_AS_STRING(".*.swp.pj"), true).data;
+        names[5] = concat_fnames(dir_name, STATIC_CSTR_AS_STRING(".swp.pj"), true).data;
+        num_names = 6;
       } else {
         p = dir_name.data + dir_name.size;
         if (after_pathsep(dir_name.data, p) && dir_name.size > 1 && p[-1] == p[-2]) {
@@ -4607,6 +4722,30 @@ void recover_names(char *fname, bool skip_curbuf, list_T *ret_list)
       tv_list_append_allocated_string(ret_list, xstrdup(files[i]));
     }
 
+    if (fname != NULL && !listed_stale_piece_journal) {
+      const char *active_journal = ml_buf_mmap_piece_journal_path(curbuf);
+      if (skip_curbuf && curbuf->b_ml.ml_mmap_piece_journal_fd < 0
+          && active_journal[0] != NUL && os_path_exists(active_journal)) {
+        tv_list_append_allocated_string(ret_list, xstrdup(active_journal));
+        listed_stale_piece_journal = true;
+      } else {
+        char *swapname = makeswapname(fname_res, fname_res, curbuf, dir_name.data);
+        if (swapname != NULL) {
+          char *journal_name = ml_mmap_piece_journal_name_from_swap(swapname);
+          if (os_path_exists(journal_name)) {
+            if (!skip_curbuf || curbuf->b_ml.ml_mmap_piece_journal_fd < 0
+                || path_full_compare((char *)active_journal, journal_name, true,
+                                     false) == kDifferentFiles) {
+              tv_list_append_allocated_string(ret_list, xstrdup(journal_name));
+              listed_stale_piece_journal = true;
+            }
+          }
+          xfree(journal_name);
+          xfree(swapname);
+        }
+      }
+    }
+
     for (int i = 0; i < num_names; i++) {
       xfree(names[i]);
     }
@@ -4669,6 +4808,27 @@ void swapfile_dict(const char *fname, dict_T *d)
 {
   int fd;
   ZeroBlock b0;
+
+  if (ml_mmap_piece_journal_is_name(fname)) {
+    PieceJournalHeader header = { 0 };
+    if (ml_mmap_piece_journal_decode_header_file(fname, &header, NULL, NULL)) {
+      FileInfo file_info;
+      if (os_fileinfo(fname, &file_info)) {
+        tv_dict_add_nr(d, S_LEN("mtime"), file_info.stat.st_mtim.tv_sec);
+      }
+      tv_dict_add_str_len(d, S_LEN("version"), S_LEN("Nvim mmap piece journal"));
+      tv_dict_add_str_len(d, S_LEN("user"), S_LEN(""));
+      tv_dict_add_str_len(d, S_LEN("host"), S_LEN(""));
+      tv_dict_add_str_len(d, S_LEN("fname"), header.path, header.path_len);
+      tv_dict_add_nr(d, S_LEN("pid"), 0);
+      tv_dict_add_nr(d, S_LEN("dirty"), 1);
+      tv_dict_add_nr(d, S_LEN("inode"), (varnumber_T)header.original_ino);
+      tv_dict_add_nr(d, S_LEN("size"), (varnumber_T)header.original_size);
+      return;
+    }
+    tv_dict_add_str_len(d, S_LEN("error"), S_LEN("Not a mmap piece journal"));
+    return;
+  }
 
   if ((fd = os_open(fname, O_RDONLY, 0)) >= 0) {
     if (read_eintr(fd, &b0, sizeof(b0)) == sizeof(b0)) {
