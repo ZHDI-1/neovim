@@ -3205,16 +3205,29 @@ void ex_change(exarg_T *eap)
     append_indent = get_indent_lnum(eap->line1);
   }
 
-  for (lnum = eap->line2; lnum >= eap->line1; lnum--) {
-    if (curbuf->b_ml.ml_flags & ML_EMPTY) {         // nothing to delete
-      break;
+  linenr_T deleted = 0;
+  linenr_T mmap_deleted = 0;
+  const linenr_T delete_count = eap->line2 - eap->line1 + 1;
+  const int mmap_delete_ret =
+    ml_buf_mmap_delete_lines(curbuf, eap->line1, delete_count, false, &mmap_deleted);
+  if (mmap_delete_ret == OK) {
+    deleted = mmap_deleted;
+  } else {
+    if (mmap_delete_ret == FAIL) {
+      return;
     }
-    ml_delete(eap->line1);
+    for (lnum = eap->line2; lnum >= eap->line1; lnum--) {
+      if (curbuf->b_ml.ml_flags & ML_EMPTY) {         // nothing to delete
+        break;
+      }
+      ml_delete(eap->line1);
+    }
+    deleted = eap->line2 - lnum;
   }
 
   // make sure the cursor is not beyond the end of the file now
   check_cursor_lnum(curwin);
-  deleted_lines_mark(eap->line1, (eap->line2 - lnum));
+  deleted_lines_mark(eap->line1, (int)deleted);
 
   // ":append" on the line above the deleted lines.
   eap->line2 = eap->line1;
@@ -4758,8 +4771,20 @@ skip:
               if (u_savedel(lnum, nmatch_tl) != OK) {
                 break;
               }
-              for (i = 0; i < nmatch_tl; i++) {
-                ml_delete(lnum);
+              linenr_T mmap_deleted = 0;
+              const int mmap_delete_ret =
+                ml_buf_mmap_delete_lines(curbuf, lnum, nmatch_tl, false, &mmap_deleted);
+              if (mmap_delete_ret == OK) {
+                if (mmap_deleted != nmatch_tl) {
+                  break;
+                }
+              } else {
+                if (mmap_delete_ret == FAIL) {
+                  break;
+                }
+                for (i = 0; i < nmatch_tl; i++) {
+                  ml_delete(lnum);
+                }
               }
               mark_adjust(lnum, lnum + nmatch_tl - 1, MAXLNUM, -nmatch_tl, kExtmarkNOOP);
               if (subflags.do_ask) {

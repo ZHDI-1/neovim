@@ -1010,6 +1010,58 @@ describe('fileio', function()
     eq(3, stats.mmap_piece_revision)
   end)
 
+  it('batches mmap piece tree change command deletes', function()
+    local lines = {}
+    for i = 1, 42000 do
+      lines[i] = ('change mmap row %05d plain ascii'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+
+    command([[execute "10,20change\nchanged mmap range\n."]])
+    eq(41990, fn.line('$'))
+    eq('changed mmap range', fn.getline(10))
+    eq(lines[21], fn.getline(11))
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(2, stats.mmap_piece_revision)
+  end)
+
+  it('batches mmap piece tree multiline substitute deletes', function()
+    local lines = {}
+    local payload = string.rep('x', 96)
+    for i = 1, 42000 do
+      lines[i] = ('multiline mmap row %05d %s'):format(i, payload)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+
+    command([[10,12s/multiline mmap row 00010.*\nmultiline mmap row 00011.*\nmultiline mmap row 00012/JOINED/]])
+    eq(41998, fn.line('$'))
+    eq('JOINED ' .. payload, fn.getline(10))
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(2, stats.mmap_piece_revision)
+  end)
+
   it('batches mmap piece tree sort cleanup', function()
     local lines = {}
     local line_count = 5000
