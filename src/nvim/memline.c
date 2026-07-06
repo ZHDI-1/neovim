@@ -408,6 +408,10 @@ static bool ml_mmap_can_edit_tree(const buf_T *buf)
 
 enum {
   ML_MMAP_PIECE_RECLAIM_EVENT_BUDGET = 256,
+  ML_MMAP_PIECE_COMPACT_DEAD_ADD_MIN = 16 * 1024 * 1024,
+  ML_MMAP_PIECE_COMPACT_FREE_NODE_MIN = 4096,
+  ML_MMAP_PIECE_COMPACT_TEST_DEAD_ADD_MIN = 4096,
+  ML_MMAP_PIECE_COMPACT_TEST_FREE_NODE_MIN = 128,
 };
 
 struct ml_mmap_line_index {
@@ -636,6 +640,41 @@ static bool ml_mmap_piece_reclaim_one(buf_T *buf, size_t *budgetp)
   return piece_tree_retired_node_count(buf->b_ml.ml_piece_tree) > 0;
 }
 
+static size_t ml_mmap_piece_compact_dead_add_min(void)
+{
+  return nvim_testing ? ML_MMAP_PIECE_COMPACT_TEST_DEAD_ADD_MIN
+                      : ML_MMAP_PIECE_COMPACT_DEAD_ADD_MIN;
+}
+
+static size_t ml_mmap_piece_compact_free_node_min(void)
+{
+  return nvim_testing ? ML_MMAP_PIECE_COMPACT_TEST_FREE_NODE_MIN
+                      : ML_MMAP_PIECE_COMPACT_FREE_NODE_MIN;
+}
+
+static bool ml_mmap_should_compact_piece_tree(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  PieceTree *tree = buf->b_ml.ml_piece_tree;
+  if (!ml_mmap_is_active(buf) || tree == NULL || buf->b_ml.ml_mmap_storage == NULL) {
+    return false;
+  }
+
+  const size_t spare_nodes = piece_tree_free_node_count(tree) + piece_tree_retired_node_count(tree);
+  if (spare_nodes >= ml_mmap_piece_compact_free_node_min()) {
+    return true;
+  }
+
+  const size_t add_len = tree->add_len;
+  const size_t dead_add_min = ml_mmap_piece_compact_dead_add_min();
+  if (add_len < dead_add_min) {
+    return false;
+  }
+
+  const size_t live_add_len = piece_tree_add_live_len(tree);
+  return add_len > live_add_len && add_len - live_add_len >= dead_add_min;
+}
+
 static void ml_mmap_piece_reclaim_schedule(void);
 
 static void ml_mmap_piece_reclaim_event(void **argv)
@@ -645,7 +684,12 @@ static void ml_mmap_piece_reclaim_event(void **argv)
 
   size_t budget = ML_MMAP_PIECE_RECLAIM_EVENT_BUDGET;
   bool has_more = false;
+  bool compacted = false;
   FOR_ALL_BUFFERS(buf) {
+    if (!compacted && ml_mmap_should_compact_piece_tree(buf)) {
+      compacted = ml_buf_mmap_compact_piece_tree(buf);
+      has_more |= compacted;
+    }
     has_more |= ml_mmap_piece_reclaim_one(buf, &budget);
     if (budget == 0) {
       break;
@@ -672,7 +716,8 @@ static void ml_mmap_maybe_schedule_piece_reclaim(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
   if (buf->b_ml.ml_piece_tree != NULL
-      && piece_tree_retired_node_count(buf->b_ml.ml_piece_tree) > 0) {
+      && (piece_tree_retired_node_count(buf->b_ml.ml_piece_tree) > 0
+          || ml_mmap_should_compact_piece_tree(buf))) {
     ml_mmap_piece_reclaim_schedule();
   }
 }
