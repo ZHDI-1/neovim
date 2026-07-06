@@ -293,6 +293,42 @@ static PieceTreeNode *pt_alloc_node(PieceTree *tree)
   return &tree->node_blocks->nodes[tree->node_blocks->used++];
 }
 
+static size_t pt_reader_count_load(const PieceTree *tree)
+{
+  return __atomic_load_n(&tree->reader_count, __ATOMIC_ACQUIRE);
+}
+
+static void pt_reader_count_increment(PieceTree *tree)
+{
+  size_t old = pt_reader_count_load(tree);
+  for (;;) {
+    assert(old < SIZE_MAX);
+    if (old == SIZE_MAX) {
+      return;
+    }
+    const size_t new_count = old + 1;
+    if (__atomic_compare_exchange_n(&tree->reader_count, &old, new_count, false,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+      return;
+    }
+  }
+}
+
+static size_t pt_reader_count_decrement(PieceTree *tree)
+{
+  const size_t old = __atomic_load_n(&tree->reader_count, __ATOMIC_ACQUIRE);
+  assert(old > 0);
+  if (old == 0) {
+    return 0;
+  }
+
+  const size_t remaining = __atomic_sub_fetch(&tree->reader_count, 1, __ATOMIC_RELEASE);
+  if (remaining == 0) {
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  }
+  return remaining;
+}
+
 static void pt_recycle_node(PieceTree *tree, PieceTreeNode *node)
 {
   memset(node, 0, sizeof *node);
@@ -313,7 +349,7 @@ static void pt_reclaim_retired_nodes(PieceTree *tree)
 
 static void pt_retire_node(PieceTree *tree, PieceTreeNode *node)
 {
-  if (tree->reader_count == 0) {
+  if (pt_reader_count_load(tree) == 0) {
     pt_recycle_node(tree, node);
     return;
   }
@@ -963,18 +999,12 @@ size_t piece_tree_retired_node_count(const PieceTree *tree)
 
 void piece_tree_reader_enter(PieceTree *tree)
 {
-  assert(tree->reader_count < SIZE_MAX);
-  tree->reader_count++;
+  pt_reader_count_increment(tree);
 }
 
 void piece_tree_reader_leave(PieceTree *tree)
 {
-  assert(tree->reader_count > 0);
-  if (tree->reader_count == 0) {
-    return;
-  }
-  tree->reader_count--;
-  if (tree->reader_count == 0) {
+  if (pt_reader_count_decrement(tree) == 0) {
     pt_reclaim_retired_nodes(tree);
   }
 }
