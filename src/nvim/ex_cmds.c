@@ -4732,9 +4732,40 @@ void ex_global(exarg_T *eap)
       global_exe_one(cmd, lnum);
     }
   } else {
+    const char *mmap_required_literal = NULL;
+    size_t mmap_required_literal_len = 0;
+    const bool mmap_regex_prefilter = type == 'g'
+                                      && ml_buf_has_mmap_lines(curbuf)
+                                      && !re_multiline(regmatch.regprog)
+                                      && vim_regprog_get_required_literal(regmatch.regprog,
+                                                                          regmatch.rmm_ic,
+                                                                          &mmap_required_literal,
+                                                                          &mmap_required_literal_len);
     int ndone = 0;
     // pass 1: set marks for each (not) matching line
     for (lnum = eap->line1; lnum <= eap->line2 && !got_int; lnum++) {
+      if (mmap_regex_prefilter) {
+        size_t line_start = 0;
+        if (ml_get_buf_mmap_line_start(curbuf, lnum, &line_start)) {
+          linenr_T literal_lnum = lnum;
+          size_t literal_offset = line_start;
+          size_t literal_line_start = line_start;
+          size_t literal_line_len = 0;
+          colnr_T literal_col = 0;
+          char *literal_line = NULL;
+          const bool has_literal =
+            ml_get_buf_mmap_literal_match_at(curbuf, &literal_offset, &literal_lnum,
+                                             &literal_line_start, mmap_required_literal,
+                                             mmap_required_literal_len, &literal_line,
+                                             &literal_line_len, &literal_col);
+          xfree(literal_line);
+          if (!has_literal || literal_lnum > eap->line2) {
+            break;
+          }
+          ml_buf_mmap_search_prefilter_record(curbuf);
+          lnum = literal_lnum;
+        }
+      }
       // a match on this line?
       int match = vim_regexec_multi(&regmatch, curwin, curbuf, lnum, 0, NULL, NULL);
       if (regmatch.regprog == NULL) {

@@ -601,6 +601,7 @@ describe('fileio', function()
     lines[202] = 'global-change beta'
     lines[1000] = 'global-delete one'
     lines[1001] = 'global-delete two'
+    lines[39950] = 'global-regex-12345 target'
     lines[41000] = 'global-delete tail'
 
     write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
@@ -615,6 +616,19 @@ describe('fileio', function()
     command('g/global-change/s/global-change/global-changed/')
     eq('global-changed alpha', fn.getline(200))
     eq('global-changed beta', fn.getline(202))
+
+    stats = api.nvim__buf_stats(0)
+    local prefilter_count = stats.mmap_search_prefilter_count
+    command('set regexpengine=1')
+    command([[g/.*global-regex-\d\+/s/target/done/]])
+    command('set regexpengine&')
+    eq('global-regex-12345 done', fn.getline(39950))
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    ok(stats.mmap_search_prefilter_count > prefilter_count)
 
     command('g/global-delete/d')
     eq(41997, fn.line('$'))
