@@ -156,6 +156,26 @@ describe('piece journal', function()
     eq(1, tonumber(decoded[0].delete_len))
   end)
 
+  itp('roundtrips replacements with empty inserted text', function()
+    local buf, size = encode_record({
+      op = REPLACE,
+      revision = 3,
+      offset = 12,
+      delete_len = 5,
+      insert_len = 0,
+      text_size_after = 20,
+      line_count_after = 2,
+    })
+
+    local decoded = ffi.new('PieceJournalRecord[1]')
+    local consumed = ffi.new('size_t[1]')
+    eq(OK, tonumber(lib.piece_journal_record_decode(buf, size, decoded, consumed)))
+    eq(size, tonumber(consumed[0]))
+    eq(REPLACE, tonumber(decoded[0].op))
+    eq(0, tonumber(decoded[0].insert_len))
+    eq(nil, decoded[0].insert_text)
+  end)
+
   itp('treats torn final writes as incomplete', function()
     local buf, size = encode_record({
       op = INSERT,

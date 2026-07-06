@@ -1251,7 +1251,7 @@ Dict nvim__buf_stats(Buffer buf, Arena *arena, Error *err)
     return (Dict)ARRAY_DICT_INIT;
   }
 
-  Dict rv = arena_dict(arena, 25);
+  Dict rv = arena_dict(arena, 30);
   // Number of times the cached line was flushed.
   // This should generally not increase while editing the same
   // line in the same mode.
@@ -1279,6 +1279,16 @@ Dict nvim__buf_stats(Buffer buf, Arena *arena, Error *err)
         INTEGER_OBJ((Integer)ml_buf_mmap_piece_write_copy_range_count(b)));
   PUT_C(rv, "mmap_piece_compact_count",
         INTEGER_OBJ((Integer)ml_buf_mmap_piece_compact_count(b)));
+  PUT_C(rv, "mmap_piece_journal_active",
+        BOOLEAN_OBJ(ml_buf_mmap_piece_journal_active(b)));
+  PUT_C(rv, "mmap_piece_journal_failed",
+        BOOLEAN_OBJ(ml_buf_mmap_piece_journal_failed(b)));
+  PUT_C(rv, "mmap_piece_journal_record_count",
+        INTEGER_OBJ((Integer)ml_buf_mmap_piece_journal_record_count(b)));
+  PUT_C(rv, "mmap_piece_journal_bytes",
+        INTEGER_OBJ((Integer)ml_buf_mmap_piece_journal_bytes(b)));
+  PUT_C(rv, "mmap_piece_journal_path",
+        CSTR_AS_OBJ(ml_buf_mmap_piece_journal_path(b)));
   PUT_C(rv, "mmap_text_size", INTEGER_OBJ((Integer)ml_buf_mmap_text_size(b)));
   PUT_C(rv, "mmap_piece_nodes", INTEGER_OBJ((Integer)ml_buf_mmap_piece_node_count(b)));
   PUT_C(rv, "mmap_piece_node_capacity",

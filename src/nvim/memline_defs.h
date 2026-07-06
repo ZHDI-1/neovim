@@ -87,6 +87,11 @@ typedef struct {
   bool ml_mmap_noeol;           // last line has no final EOL
   bool ml_mmap_source_is_buffer_file;  // mmap source still aliases buffer file
   PieceTree *ml_piece_tree;     // tree index/composition for mmap-backed text
+  char *ml_mmap_piece_journal_fname;  // append-only piece journal path
+  int ml_mmap_piece_journal_fd;  // append-only piece journal fd, -1 when closed
+  uint64_t ml_mmap_piece_journal_record_count;  // committed edit records
+  uint64_t ml_mmap_piece_journal_bytes;  // bytes written to piece journal
+  bool ml_mmap_piece_journal_failed;  // journal disabled after append/open failure
   uint64_t ml_mmap_piece_write_fast_count;  // successful direct piece-span writes
   uint64_t ml_mmap_piece_write_copy_range_count;  // original spans copied by kernel
   uint64_t ml_mmap_piece_compact_count;  // successful compact tree flips

@@ -552,6 +552,14 @@ describe('fileio', function()
     eq(lines[40000], fn.getline(40000))
 
     eq('', fn.swapname('%'))
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(0, stats.mmap_piece_journal_record_count)
+    ok(stats.mmap_piece_journal_bytes > 0)
+    neq('', stats.mmap_piece_journal_path)
+    neq(nil, uv.fs_stat(stats.mmap_piece_journal_path))
+    local journal_path = stats.mmap_piece_journal_path
+    local journal_bytes = stats.mmap_piece_journal_bytes
 
     command("call setline(2, 'changed with swap')")
     lines[2] = 'changed with swap'
@@ -563,9 +571,29 @@ describe('fileio', function()
     ok(stats.mmap_piece_revision >= 1)
     ok(stats.mmap_piece_nodes > 0)
     ok(stats.mmap_piece_add_len > 0)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(1, stats.mmap_piece_journal_record_count)
+    ok(stats.mmap_piece_journal_bytes > journal_bytes)
+    eq(journal_path, stats.mmap_piece_journal_path)
     eq('changed with swap', fn.getline(2))
     eq(lines[40000], fn.getline(40000))
     eq(40000, fn.line('$'))
+
+    command("call append(2, 'inserted with swap')")
+    stats = api.nvim__buf_stats(0)
+    eq(2, stats.mmap_piece_journal_record_count)
+    ok(stats.mmap_piece_journal_bytes > journal_bytes)
+    eq('inserted with swap', fn.getline(3))
+
+    command('3delete')
+    stats = api.nvim__buf_stats(0)
+    eq(3, stats.mmap_piece_journal_record_count)
+    eq('changed with swap', fn.getline(2))
+    eq(lines[3], fn.getline(3))
+
+    command('bwipe!')
+    eq(nil, uv.fs_stat(journal_path))
   end)
 
   it('defers stale legacy swap checks for mmap piece tree reads', function()

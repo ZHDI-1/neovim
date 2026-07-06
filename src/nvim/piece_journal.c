@@ -211,7 +211,7 @@ static bool pj_record_valid(const PieceJournalRecord *record)
   case kPieceJournalOpDelete:
     return record->delete_len > 0 && record->insert_len == 0;
   case kPieceJournalOpReplace:
-    return record->delete_len > 0 && record->insert_len > 0;
+    return record->delete_len > 0;
   }
   return false;
 }

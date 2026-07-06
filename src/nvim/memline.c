@@ -63,6 +63,10 @@
 # define NVIM_MEMLINE_AVX512BW_TARGET
 #endif
 
+#ifndef O_NOFOLLOW
+# define O_NOFOLLOW 0
+#endif
+
 #include "auto/config.h"
 #ifdef UNIX
 # include <sys/mman.h>
@@ -110,6 +114,7 @@
 #include "nvim/os/time.h"
 #include "nvim/os/time_defs.h"
 #include "nvim/path.h"
+#include "nvim/piece_journal.h"
 #include "nvim/piece_tree.h"
 #include "nvim/pos_defs.h"
 #include "nvim/spell.h"
@@ -926,6 +931,212 @@ static void ml_mmap_disable_legacy_swap(buf_T *buf)
   buf->b_may_swap = false;
 }
 
+static uint32_t ml_mmap_piece_journal_flags(const buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf->b_ml.ml_mmap_noeol ? PIECE_JOURNAL_FLAG_NOEOL : 0;
+}
+
+static char *ml_mmap_piece_journal_name_from_swap(const char *swapname)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  const size_t len = strlen(swapname);
+  char *journal = xmallocz(len + 3);
+  memcpy(journal, swapname, len);
+  memcpy(journal + len, ".pj", 3);
+  return journal;
+}
+
+static char *ml_mmap_piece_journal_make_name(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (buf->b_fname == NULL || buf->b_ffname == NULL || p_dir == NULL || *p_dir == NUL) {
+    return NULL;
+  }
+
+  char *dirp = p_dir;
+  char *dir_name = xmalloc(strlen(p_dir) + 1);
+  char *journal = NULL;
+  while (*dirp != NUL && journal == NULL) {
+    copy_option_part(&dirp, dir_name, strlen(p_dir) + 1, ",");
+    if (dir_name[0] == NUL) {
+      continue;
+    }
+    if (dir_name[0] != '.' || dir_name[1] != NUL) {
+      char *failed_dir = NULL;
+      if (!os_isdir(dir_name)
+          && os_mkdir_recurse(dir_name, 0755, &failed_dir, NULL) != 0) {
+        xfree(failed_dir);
+        continue;
+      }
+    }
+
+    char *swapname = makeswapname(buf->b_fname, buf->b_ffname, buf, dir_name);
+    if (swapname != NULL) {
+      journal = ml_mmap_piece_journal_name_from_swap(swapname);
+      xfree(swapname);
+    }
+  }
+  xfree(dir_name);
+  return journal;
+}
+
+static bool ml_mmap_piece_journal_write_all(int fd, const char *data, size_t len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  size_t written = 0;
+  while (written < len) {
+    const ssize_t n = write_eintr(fd, (void *)(data + written), len - written);
+    if (n <= 0) {
+      return false;
+    }
+    written += (size_t)n;
+  }
+  return true;
+}
+
+static void ml_mmap_piece_journal_close(buf_T *buf, bool delete_file)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (buf->b_ml.ml_mmap_piece_journal_fd >= 0) {
+    close(buf->b_ml.ml_mmap_piece_journal_fd);
+    buf->b_ml.ml_mmap_piece_journal_fd = -1;
+  }
+  if (delete_file && buf->b_ml.ml_mmap_piece_journal_fname != NULL) {
+    os_remove(buf->b_ml.ml_mmap_piece_journal_fname);
+  }
+  XFREE_CLEAR(buf->b_ml.ml_mmap_piece_journal_fname);
+  buf->b_ml.ml_mmap_piece_journal_record_count = 0;
+  buf->b_ml.ml_mmap_piece_journal_bytes = 0;
+  buf->b_ml.ml_mmap_piece_journal_failed = false;
+}
+
+static void ml_mmap_piece_journal_fail(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (buf->b_ml.ml_mmap_piece_journal_fd >= 0) {
+    close(buf->b_ml.ml_mmap_piece_journal_fd);
+    buf->b_ml.ml_mmap_piece_journal_fd = -1;
+  }
+  buf->b_ml.ml_mmap_piece_journal_failed = true;
+}
+
+static void ml_mmap_piece_journal_open(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (!buf->b_p_swf || p_uc == 0 || buf->b_ml.ml_mmap_piece_journal_fd >= 0
+      || buf->b_ml.ml_mmap_piece_journal_failed || buf->b_ffname == NULL) {
+    return;
+  }
+
+  FileInfo file_info;
+  if (!os_fileinfo(buf->b_ffname, &file_info)) {
+    buf->b_ml.ml_mmap_piece_journal_failed = true;
+    return;
+  }
+
+  char *journal_name = ml_mmap_piece_journal_make_name(buf);
+  if (journal_name == NULL) {
+    buf->b_ml.ml_mmap_piece_journal_failed = true;
+    return;
+  }
+
+  const int fd = os_open(journal_name, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0600);
+  if (fd < 0) {
+    xfree(journal_name);
+    buf->b_ml.ml_mmap_piece_journal_failed = true;
+    return;
+  }
+
+  const char *path = buf->b_ffname;
+  PieceJournalHeader header = {
+    .path = path,
+    .path_len = strlen(path),
+    .original_dev = (uint64_t)file_info.stat.st_dev,
+    .original_ino = (uint64_t)file_info.stat.st_ino,
+    .original_size = os_fileinfo_size(&file_info),
+    .original_mtime_sec = (uint64_t)file_info.stat.st_mtim.tv_sec,
+    .original_mtime_nsec = (uint64_t)file_info.stat.st_mtim.tv_nsec,
+    .text_size = (uint64_t)ml_mmap_text_size(buf),
+    .line_count = (uint64_t)buf->b_ml.ml_line_count,
+    .flags = ml_mmap_piece_journal_flags(buf),
+  };
+  const size_t size = piece_journal_header_encoded_size(&header);
+  char *encoded = size == 0 ? NULL : xmalloc(size);
+  size_t written = 0;
+  const bool ok = encoded != NULL
+                  && piece_journal_header_encode(&header, encoded, size, &written)
+                  && written == size
+                  && ml_mmap_piece_journal_write_all(fd, encoded, size);
+  xfree(encoded);
+  if (!ok) {
+    close(fd);
+    os_remove(journal_name);
+    xfree(journal_name);
+    buf->b_ml.ml_mmap_piece_journal_failed = true;
+    return;
+  }
+
+  buf->b_ml.ml_mmap_piece_journal_fname = journal_name;
+  buf->b_ml.ml_mmap_piece_journal_fd = fd;
+  buf->b_ml.ml_mmap_piece_journal_record_count = 0;
+  buf->b_ml.ml_mmap_piece_journal_bytes = (uint64_t)size;
+  buf->b_ml.ml_mmap_piece_journal_failed = false;
+}
+
+static void ml_mmap_piece_journal_append(buf_T *buf, PieceJournalOp op, size_t offset,
+                                         size_t delete_len, const char *insert_text,
+                                         size_t insert_len)
+  FUNC_ATTR_NONNULL_ARG(1)
+{
+  if (buf->b_ml.ml_mmap_piece_journal_fd < 0 || buf->b_ml.ml_mmap_piece_journal_failed) {
+    return;
+  }
+
+  PieceJournalRecord record = {
+    .op = op,
+    .revision = buf->b_ml.ml_piece_tree == NULL ? 0 : buf->b_ml.ml_piece_tree->revision,
+    .offset = (uint64_t)offset,
+    .delete_len = (uint64_t)delete_len,
+    .insert_len = (uint64_t)insert_len,
+    .text_size_after = (uint64_t)ml_mmap_text_size(buf),
+    .line_count_after = (uint64_t)buf->b_ml.ml_line_count,
+    .flags_after = ml_mmap_piece_journal_flags(buf),
+    .insert_text = insert_text,
+  };
+  const size_t size = piece_journal_record_encoded_size(&record);
+  char *encoded = size == 0 ? NULL : xmalloc(size);
+  size_t written = 0;
+  const bool ok = encoded != NULL
+                  && piece_journal_record_encode(&record, encoded, size, &written)
+                  && written == size
+                  && ml_mmap_piece_journal_write_all(buf->b_ml.ml_mmap_piece_journal_fd,
+                                                     encoded, size);
+  xfree(encoded);
+  if (!ok) {
+    ml_mmap_piece_journal_fail(buf);
+    return;
+  }
+
+  buf->b_ml.ml_mmap_piece_journal_record_count++;
+  buf->b_ml.ml_mmap_piece_journal_bytes += (uint64_t)size;
+}
+
+static void ml_mmap_piece_journal_append_replace(buf_T *buf, size_t offset, size_t delete_len,
+                                                 const char *insert_text, size_t insert_len)
+  FUNC_ATTR_NONNULL_ARG(1)
+{
+  if (delete_len == 0 && insert_len == 0) {
+    return;
+  }
+  if (delete_len == 0) {
+    ml_mmap_piece_journal_append(buf, kPieceJournalOpInsert, offset, 0, insert_text, insert_len);
+  } else {
+    ml_mmap_piece_journal_append(buf, kPieceJournalOpReplace, offset, delete_len, insert_text,
+                                 insert_len);
+  }
+}
+
 static void ml_mmap_clear_piece_tree(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
@@ -941,6 +1152,7 @@ static void ml_mmap_clear_piece_tree(buf_T *buf)
 static void ml_mmap_close(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
+  ml_mmap_piece_journal_close(buf, true);
   ml_mmap_clear_piece_tree(buf);
   buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_mmap_source_is_buffer_file = false;
@@ -1066,6 +1278,7 @@ static int ml_mmap_materialize(buf_T *buf)
   ml_mmap_set_active_storage(buf, NULL);
   buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_mmap_source_is_buffer_file = false;
+  ml_mmap_piece_journal_close(buf, true);
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
   buf->b_ml.ml_mmap_piece_compact_count = 0;
@@ -1148,10 +1361,11 @@ static int ml_mmap_replace_line(buf_T *buf, linenr_T lnum, char *line, size_t le
     return FAIL;
   }
 
+  ml_mmap_update_noeol(buf);
+  ml_mmap_piece_journal_append_replace(buf, start, end - start, line, len);
   if (!copy && !noalloc) {
     xfree(line);
   }
-  ml_mmap_update_noeol(buf);
   ml_mmap_clear_cache(buf);
   ml_mmap_maybe_schedule_piece_reclaim(buf);
   buf->b_ml.ml_flags &= ~ML_EMPTY;
@@ -1221,8 +1435,8 @@ static int ml_mmap_append_line(buf_T *buf, linenr_T lnum, char *line, colnr_T le
   assert(pos == insert_len);
 
   const bool ok = piece_tree_insert(buf->b_ml.ml_piece_tree, offset, insert, insert_len);
-  xfree(insert);
   if (!ok) {
+    xfree(insert);
     ml_mmap_clear_cache(buf);
     return FAIL;
   }
@@ -1232,6 +1446,8 @@ static int ml_mmap_append_line(buf_T *buf, linenr_T lnum, char *line, colnr_T le
   }
   buf->b_ml.ml_line_count++;
   ml_mmap_update_noeol(buf);
+  ml_mmap_piece_journal_append(buf, kPieceJournalOpInsert, offset, 0, insert, insert_len);
+  xfree(insert);
   ml_mmap_clear_cache(buf);
   ml_mmap_maybe_schedule_piece_reclaim(buf);
   buf->b_ml.ml_flags &= ~ML_EMPTY;
@@ -1261,12 +1477,16 @@ static int ml_mmap_delete_line(buf_T *buf, linenr_T lnum, bool message)
       set_keep_msg(_(no_lines_msg), 0);
     }
 
-    if (!piece_tree_replace(buf->b_ml.ml_piece_tree, 0, ml_mmap_text_size(buf), "", 0)) {
+    const size_t old_total = ml_mmap_text_size(buf);
+    if (!piece_tree_replace(buf->b_ml.ml_piece_tree, 0, old_total, "", 0)) {
       ml_mmap_clear_cache(buf);
       return FAIL;
     }
 
     ml_mmap_update_noeol(buf);
+    if (old_total > 0) {
+      ml_mmap_piece_journal_append(buf, kPieceJournalOpDelete, 0, old_total, NULL, 0);
+    }
     ml_mmap_clear_cache(buf);
     ml_mmap_maybe_schedule_piece_reclaim(buf);
     buf->b_ml.ml_flags |= ML_EMPTY;
@@ -1326,6 +1546,7 @@ static int ml_mmap_delete_line(buf_T *buf, linenr_T lnum, bool message)
   }
   buf->b_ml.ml_line_count--;
   ml_mmap_update_noeol(buf);
+  ml_mmap_piece_journal_append(buf, kPieceJournalOpDelete, delete_start, delete_len, NULL, 0);
   ml_mmap_clear_cache(buf);
   ml_mmap_maybe_schedule_piece_reclaim(buf);
   ml_upd_lastbuf = NULL;
@@ -1355,10 +1576,11 @@ static bool ml_mmap_flush_dirty_line(buf_T *buf, bool noalloc)
     return false;
   }
 
+  ml_mmap_update_noeol(buf);
+  ml_mmap_piece_journal_append_replace(buf, start, end - start, line, len);
   if (!noalloc) {
     xfree(line);
   }
-  ml_mmap_update_noeol(buf);
   buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
   buf->b_ml.ml_line_lnum = 0;
   buf->b_ml.ml_line_offset = 0;
@@ -1406,6 +1628,7 @@ int ml_set_mmap_lines(buf_T *buf, char *base, size_t size, size_t *line_starts,
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_line_count = line_count;
   buf->b_ml.ml_flags &= ~ML_EMPTY;
+  ml_mmap_piece_journal_open(buf);
   ml_upd_lastbuf = NULL;
   return OK;
 }
@@ -1596,6 +1819,38 @@ uint64_t ml_buf_mmap_piece_compact_count(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
   return ml_mmap_is_active(buf) ? buf->b_ml.ml_mmap_piece_compact_count : 0;
+}
+
+bool ml_buf_mmap_piece_journal_active(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) && buf->b_ml.ml_mmap_piece_journal_fd >= 0;
+}
+
+bool ml_buf_mmap_piece_journal_failed(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) && buf->b_ml.ml_mmap_piece_journal_failed;
+}
+
+uint64_t ml_buf_mmap_piece_journal_record_count(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) ? buf->b_ml.ml_mmap_piece_journal_record_count : 0;
+}
+
+uint64_t ml_buf_mmap_piece_journal_bytes(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) ? buf->b_ml.ml_mmap_piece_journal_bytes : 0;
+}
+
+const char *ml_buf_mmap_piece_journal_path(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) && buf->b_ml.ml_mmap_piece_journal_fname != NULL
+         ? buf->b_ml.ml_mmap_piece_journal_fname
+         : "";
 }
 
 uint64_t ml_buf_mmap_piece_revision(buf_T *buf)
@@ -2976,6 +3231,11 @@ int ml_open(buf_T *buf)
   buf->b_ml.ml_mmap_storage = NULL;
   buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_mmap_source_is_buffer_file = false;
+  buf->b_ml.ml_mmap_piece_journal_fname = NULL;
+  buf->b_ml.ml_mmap_piece_journal_fd = -1;
+  buf->b_ml.ml_mmap_piece_journal_record_count = 0;
+  buf->b_ml.ml_mmap_piece_journal_bytes = 0;
+  buf->b_ml.ml_mmap_piece_journal_failed = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
   buf->b_ml.ml_mmap_piece_compact_count = 0;
@@ -3531,6 +3791,11 @@ void ml_recover(bool checkext)
   buf->b_ml.ml_mmap_storage = NULL;
   buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_mmap_source_is_buffer_file = false;
+  buf->b_ml.ml_mmap_piece_journal_fname = NULL;
+  buf->b_ml.ml_mmap_piece_journal_fd = -1;
+  buf->b_ml.ml_mmap_piece_journal_record_count = 0;
+  buf->b_ml.ml_mmap_piece_journal_bytes = 0;
+  buf->b_ml.ml_mmap_piece_journal_failed = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
   buf->b_ml.ml_mmap_piece_compact_count = 0;
