@@ -348,6 +348,8 @@ typedef struct {
   bool ok;
 } ml_mmap_piece_literal_match_job_T;
 
+typedef struct ml_mmap_retired_piece_storage ml_mmap_retired_piece_storage_T;
+
 #include "memline.c.generated.h"
 
 static const char e_ml_get_invalid_lnum_nr[]
@@ -407,7 +409,97 @@ enum {
   ML_MMAP_PIECE_RECLAIM_EVENT_BUDGET = 256,
 };
 
+struct ml_mmap_retired_piece_storage {
+  struct ml_mmap_retired_piece_storage *next;
+  PieceTree *tree;
+  char *mmap_base;
+  size_t mmap_size;
+  size_t *line_starts;
+};
+
 static bool ml_mmap_piece_reclaim_scheduled = false;
+static ml_mmap_retired_piece_storage_T *ml_mmap_retired_piece_storage = NULL;
+
+static void ml_mmap_piece_reclaim_schedule(void);
+
+static void ml_mmap_retired_piece_storage_free(ml_mmap_retired_piece_storage_T *storage)
+  FUNC_ATTR_NONNULL_ALL
+{
+  xfree(storage->tree);
+#ifdef UNIX
+  if (storage->mmap_base != NULL && storage->mmap_size > 0) {
+    munmap(storage->mmap_base, storage->mmap_size);
+  }
+#endif
+  xfree(storage->line_starts);
+  xfree(storage);
+}
+
+static bool ml_mmap_retired_piece_storage_try_dispose(ml_mmap_retired_piece_storage_T *storage,
+                                                      size_t *budgetp)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (piece_tree_storage_ref_count(storage->tree) != 0) {
+    return false;
+  }
+  if (storage->tree != NULL && !piece_tree_dispose_budget(storage->tree, budgetp)) {
+    return false;
+  }
+  return true;
+}
+
+static void ml_mmap_retire_piece_storage(PieceTree *tree, char *mmap_base, size_t mmap_size,
+                                         size_t *line_starts)
+{
+  if (tree == NULL && mmap_base == NULL && line_starts == NULL) {
+    return;
+  }
+
+  ml_mmap_retired_piece_storage_T *storage = xmalloc(sizeof *storage);
+  *storage = (ml_mmap_retired_piece_storage_T){
+    .tree = tree,
+    .mmap_base = mmap_base,
+    .mmap_size = mmap_size,
+    .line_starts = line_starts,
+  };
+
+  if (main_loop.events == NULL || main_loop.closing) {
+    size_t budget = SIZE_MAX;
+    if (ml_mmap_retired_piece_storage_try_dispose(storage, &budget)) {
+      ml_mmap_retired_piece_storage_free(storage);
+      return;
+    }
+  }
+
+  storage->next = ml_mmap_retired_piece_storage;
+  ml_mmap_retired_piece_storage = storage;
+  ml_mmap_piece_reclaim_schedule();
+}
+
+static bool ml_mmap_retired_piece_storage_reclaim(size_t *budgetp)
+  FUNC_ATTR_NONNULL_ALL
+{
+  bool has_more = false;
+  ml_mmap_retired_piece_storage_T **storagep = &ml_mmap_retired_piece_storage;
+
+  while (*storagep != NULL) {
+    ml_mmap_retired_piece_storage_T *storage = *storagep;
+    if (*budgetp == 0) {
+      has_more = true;
+      break;
+    }
+    if (!ml_mmap_retired_piece_storage_try_dispose(storage, budgetp)) {
+      has_more = true;
+      storagep = &storage->next;
+      continue;
+    }
+
+    *storagep = storage->next;
+    ml_mmap_retired_piece_storage_free(storage);
+  }
+
+  return has_more;
+}
 
 static bool ml_mmap_piece_reclaim_one(buf_T *buf, size_t *budgetp)
   FUNC_ATTR_NONNULL_ALL
@@ -438,6 +530,7 @@ static void ml_mmap_piece_reclaim_event(void **argv)
       break;
     }
   }
+  has_more |= ml_mmap_retired_piece_storage_reclaim(&budget);
 
   if (has_more || budget == 0) {
     ml_mmap_piece_reclaim_schedule();
@@ -492,27 +585,24 @@ static void ml_mmap_clear_cache(buf_T *buf)
 static void ml_mmap_clear_piece_tree(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
-  if (buf->b_ml.ml_piece_tree == NULL) {
+  if (buf->b_ml.ml_piece_tree == NULL && buf->b_ml.ml_mmap_base == NULL
+      && buf->b_ml.ml_mmap_line_starts == NULL) {
     return;
   }
 
-  piece_tree_clear(buf->b_ml.ml_piece_tree);
-  XFREE_CLEAR(buf->b_ml.ml_piece_tree);
+  ml_mmap_retire_piece_storage(buf->b_ml.ml_piece_tree, buf->b_ml.ml_mmap_base,
+                               buf->b_ml.ml_mmap_size, buf->b_ml.ml_mmap_line_starts);
+  buf->b_ml.ml_piece_tree = NULL;
+  buf->b_ml.ml_mmap_base = NULL;
+  buf->b_ml.ml_mmap_size = 0;
+  buf->b_ml.ml_mmap_line_starts = NULL;
+  buf->b_ml.ml_mmap_index_count = 0;
 }
 
 static void ml_mmap_close(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
   ml_mmap_clear_piece_tree(buf);
-  if (buf->b_ml.ml_mmap_base != NULL) {
-#ifdef UNIX
-    munmap(buf->b_ml.ml_mmap_base, buf->b_ml.ml_mmap_size);
-#endif
-    buf->b_ml.ml_mmap_base = NULL;
-    buf->b_ml.ml_mmap_size = 0;
-  }
-  XFREE_CLEAR(buf->b_ml.ml_mmap_line_starts);
-  buf->b_ml.ml_mmap_index_count = 0;
   buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_mmap_source_is_buffer_file = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
@@ -691,15 +781,7 @@ static int ml_mmap_materialize(buf_T *buf)
     }
   }
   ml_flush_line(buf, false);
-  if (piece_tree != NULL) {
-    piece_tree_clear(piece_tree);
-    xfree(piece_tree);
-  }
-
-#ifdef UNIX
-  munmap(base, size);
-#endif
-  xfree(starts);
+  ml_mmap_retire_piece_storage(piece_tree, base, size, starts);
   return ret;
 }
 

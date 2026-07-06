@@ -1014,6 +1014,54 @@ void piece_tree_clear(PieceTree *tree)
   memset(tree, 0, sizeof *tree);
 }
 
+bool piece_tree_dispose_budget(PieceTree *tree, size_t *budgetp)
+{
+  if (tree == NULL || budgetp == NULL) {
+    return true;
+  }
+  if (pt_reader_count_load(tree) != 0 || pt_span_ref_count_load(tree) != 0) {
+    return false;
+  }
+  if (*budgetp == 0) {
+    return tree->node_blocks == NULL && tree->add_chunks == NULL;
+  }
+
+  tree->original = NULL;
+  tree->original_len = 0;
+  tree->original_line_starts = NULL;
+  tree->original_index_count = 0;
+  tree->original_index_stride = 0;
+  tree->add_tail = NULL;
+  tree->root = NULL;
+  tree->free_nodes = NULL;
+  tree->retired_nodes = NULL;
+  tree->add_len = 0;
+  tree->add_cap = 0;
+  tree->node_count = 0;
+  tree->node_capacity = 0;
+  tree->retired_node_count = 0;
+  tree->revision = 0;
+
+  while (*budgetp > 0 && tree->node_blocks != NULL) {
+    PieceTreeNodeBlock *next = tree->node_blocks->next;
+    xfree(tree->node_blocks);
+    tree->node_blocks = next;
+    (*budgetp)--;
+  }
+  while (*budgetp > 0 && tree->add_chunks != NULL) {
+    PieceTreeAddChunk *next = tree->add_chunks->next;
+    xfree(tree->add_chunks);
+    tree->add_chunks = next;
+    (*budgetp)--;
+  }
+
+  const bool done = tree->node_blocks == NULL && tree->add_chunks == NULL;
+  if (done) {
+    memset(tree, 0, sizeof *tree);
+  }
+  return done;
+}
+
 bool piece_tree_rebase_original(PieceTree *tree, const char *original, size_t original_len)
 {
   if (tree == NULL || original_len != tree->original_len
@@ -1058,6 +1106,14 @@ size_t piece_tree_free_node_count(const PieceTree *tree)
 size_t piece_tree_retired_node_count(const PieceTree *tree)
 {
   return tree->retired_node_count;
+}
+
+size_t piece_tree_storage_ref_count(const PieceTree *tree)
+{
+  if (tree == NULL) {
+    return 0;
+  }
+  return pt_reader_count_load(tree) + pt_span_ref_count_load(tree);
 }
 
 void piece_tree_reader_enter(PieceTree *tree)

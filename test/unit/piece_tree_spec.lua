@@ -708,6 +708,46 @@ describe('piece tree', function()
     eq(0, tonumber(w.tree[0].span_ref_count))
   end)
 
+  itp('disposes storage incrementally after span leases are released', function()
+    local w = new_tree('abcdef')
+    local inserted = string.rep('x', 9000)
+    local null = ffi.cast('void *', 0)
+
+    ok(lib.piece_tree_insert(w.tree, 3, inserted, #inserted))
+    ok(w.tree[0].node_blocks ~= null)
+    ok(w.tree[0].add_chunks ~= null)
+
+    local vec = collect_span_vec(w.tree, 0, 3)
+    eq(1, tonumber(lib.piece_tree_storage_ref_count(w.tree)))
+
+    local budget = ffi.new('size_t[1]', 1)
+    eq(false, lib.piece_tree_dispose_budget(w.tree, budget))
+    eq(1, tonumber(budget[0]))
+    ok(w.tree[0].node_blocks ~= null)
+    ok(w.tree[0].add_chunks ~= null)
+
+    lib.piece_tree_span_vec_clear(vec)
+    eq(0, tonumber(lib.piece_tree_storage_ref_count(w.tree)))
+
+    budget[0] = 0
+    eq(false, lib.piece_tree_dispose_budget(w.tree, budget))
+    ok(w.tree[0].node_blocks ~= null)
+    ok(w.tree[0].add_chunks ~= null)
+
+    budget[0] = 1
+    eq(false, lib.piece_tree_dispose_budget(w.tree, budget))
+    eq(0, tonumber(budget[0]))
+    ok(w.tree[0].node_blocks == null)
+    ok(w.tree[0].add_chunks ~= null)
+    eq(0, tonumber(w.tree[0].node_capacity))
+
+    budget[0] = 1
+    eq(true, lib.piece_tree_dispose_budget(w.tree, budget))
+    eq(0, tonumber(w.tree[0].node_capacity))
+    ok(w.tree[0].node_blocks == null)
+    ok(w.tree[0].add_chunks == null)
+  end)
+
   itp('stores appended text in multiple add chunks', function()
     local w = new_tree('start\nend')
     local first = string.rep('a', 5000) .. 'BOUNDARY-'
