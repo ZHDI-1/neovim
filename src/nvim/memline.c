@@ -3588,6 +3588,103 @@ bool ml_get_buf_mmap_literal_match_at(buf_T *buf, size_t *start_offsetp, linenr_
   return true;
 }
 
+typedef struct {
+  size_t last_offset;
+  bool found;
+} ml_mmap_piece_last_literal_match_T;
+
+static bool ml_mmap_piece_last_literal_match(size_t offset, void *ctx)
+{
+  ml_mmap_piece_last_literal_match_T *match = ctx;
+  match->last_offset = offset;
+  match->found = true;
+  return true;
+}
+
+bool ml_get_buf_mmap_literal_match_before(buf_T *buf, size_t *end_offsetp, linenr_T *lnump,
+                                          size_t *line_startp, const char *pat, size_t pat_len,
+                                          char **linep, size_t *line_lenp, colnr_T *colp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  *linep = NULL;
+  *line_lenp = 0;
+  if (!ml_mmap_is_active(buf) || pat_len == 0 || *lnump < 1
+      || *lnump > buf->b_ml.ml_line_count) {
+    return false;
+  }
+
+  size_t match_offset = 0;
+  bool found = false;
+  if (!ml_mmap_is_pristine(buf)) {
+    PieceTree *tree = buf->b_ml.ml_piece_tree;
+    const size_t total = tree == NULL ? 0 : piece_tree_byte_len(tree);
+    const size_t end_offset = MIN(*end_offsetp, total);
+    if (tree == NULL || end_offset == 0 || pat_len > end_offset) {
+      return false;
+    }
+
+    ml_mmap_piece_last_literal_match_T ctx = { 0 };
+    if (!piece_tree_find_literals(tree, 0, end_offset, pat, pat_len,
+                                  ml_mmap_piece_last_literal_match, &ctx)
+        || !ctx.found) {
+      return false;
+    }
+    match_offset = ctx.last_offset;
+    found = true;
+  } else {
+    const size_t end_offset = MIN(*end_offsetp, buf->b_ml.ml_mmap_size);
+    if (end_offset == 0 || pat_len > end_offset) {
+      return false;
+    }
+
+    size_t offset = 0;
+    while (offset < end_offset) {
+      const char *match = ml_mmap_find_literal(buf->b_ml.ml_mmap_base + offset,
+                                               end_offset - offset, pat, pat_len);
+      if (match == NULL) {
+        break;
+      }
+      match_offset = (size_t)(match - buf->b_ml.ml_mmap_base);
+      found = true;
+      offset = match_offset + 1;
+    }
+  }
+  if (!found) {
+    return false;
+  }
+
+  size_t line_start = 0;
+  size_t line_end = 0;
+  const linenr_T found_lnum = ml_mmap_lnum_for_offset(buf, match_offset, &line_start, &line_end);
+  if (found_lnum == 0) {
+    return false;
+  }
+  if (match_offset < line_start || match_offset > line_end
+      || pat_len > line_end - match_offset) {
+    return false;
+  }
+
+  const size_t line_len = line_end - line_start;
+  char *line = NULL;
+  if (buf->b_ml.ml_piece_tree != NULL) {
+    line = xmallocz(line_len);
+    if (piece_tree_read(buf->b_ml.ml_piece_tree, line_start, line, line_len) != line_len) {
+      xfree(line);
+      return false;
+    }
+  } else {
+    line = xmemdupz(buf->b_ml.ml_mmap_base + line_start, line_len);
+  }
+
+  *linep = line;
+  *line_lenp = line_len;
+  *colp = (colnr_T)(match_offset - line_start);
+  *lnump = found_lnum;
+  *line_startp = line_start;
+  *end_offsetp = match_offset;
+  return true;
+}
+
 /// Open a new memline for "buf".
 ///
 /// @return  FAIL for failure, OK otherwise.

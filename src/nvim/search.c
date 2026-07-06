@@ -613,8 +613,7 @@ int searchit(win_T *win, buf_T *buf, pos_T *pos, pos_T *end_pos, Direction dir, 
   const bool search_from_match_end = vim_strchr(p_cpo, CPO_SEARCH) != NULL;
   const char *mmap_required_literal = NULL;
   size_t mmap_required_literal_len = 0;
-  const bool mmap_search_prefilter = dir == FORWARD
-                                     && ml_buf_has_mmap_lines(buf)
+  const bool mmap_search_prefilter = ml_buf_has_mmap_lines(buf)
                                      && !re_multiline(regmatch.regprog)
                                      && vim_regprog_get_required_literal(regmatch.regprog,
                                                                          regmatch.rmm_ic,
@@ -684,7 +683,7 @@ int searchit(win_T *win, buf_T *buf, pos_T *pos, pos_T *end_pos, Direction dir, 
 
         // Look for a match somewhere in line "lnum".
         colnr_T col = at_first_line && (options & SEARCH_COL) ? pos->col : 0;
-        if (mmap_search_prefilter) {
+        if (mmap_search_prefilter && dir == FORWARD) {
           size_t line_start = 0;
           if (ml_get_buf_mmap_line_start(buf, lnum, &line_start)
               && (size_t)col <= SIZE_MAX - line_start) {
@@ -703,6 +702,32 @@ int searchit(win_T *win, buf_T *buf, pos_T *pos, pos_T *end_pos, Direction dir, 
             if (!has_literal
                 || (stop_lnum != 0 && literal_lnum > stop_lnum)) {
               lnum = buf->b_ml.ml_line_count + 1;
+              break;
+            }
+            ml_buf_mmap_search_prefilter_record(buf);
+            if (literal_lnum != lnum) {
+              lnum = literal_lnum;
+              at_first_line = false;
+              col = 0;
+            }
+          }
+        } else if (mmap_search_prefilter && dir == BACKWARD) {
+          size_t end_offset = 0;
+          if (ml_get_buf_mmap_line_start(buf, lnum + 1, &end_offset)) {
+            linenr_T literal_lnum = lnum;
+            size_t literal_line_start = 0;
+            size_t literal_line_len = 0;
+            colnr_T literal_col = 0;
+            char *literal_line = NULL;
+            const bool has_literal =
+              ml_get_buf_mmap_literal_match_before(buf, &end_offset, &literal_lnum,
+                                                   &literal_line_start, mmap_required_literal,
+                                                   mmap_required_literal_len, &literal_line,
+                                                   &literal_line_len, &literal_col);
+            xfree(literal_line);
+            if (!has_literal
+                || (stop_lnum != 0 && literal_lnum < stop_lnum)) {
+              lnum = 0;
               break;
             }
             ml_buf_mmap_search_prefilter_record(buf);

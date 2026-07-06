@@ -546,7 +546,7 @@ describe('fileio', function()
     command('set regexpengine&')
   end)
 
-  it('uses mmap literal candidates for forward regex search', function()
+  it('uses mmap literal candidates for forward and backward regex search', function()
     local lines = {}
     for i = 1, 42000 do
       lines[i] = ('regex prefilter row %05d plain ascii'):format(i)
@@ -571,6 +571,18 @@ describe('fileio', function()
     command('set regexpengine=1')
     command('normal! gg0')
     eq(41000, fn.search([[.*prefilter-target-\d\+]], 'W'))
+    command('set regexpengine&')
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    ok(stats.mmap_search_prefilter_count > prefilter_count)
+
+    prefilter_count = stats.mmap_search_prefilter_count
+    command('set regexpengine=1')
+    command('normal! G$')
+    eq(41000, fn.search([[.*prefilter-target-\d\+]], 'bW'))
     command('set regexpengine&')
 
     stats = api.nvim__buf_stats(0)
