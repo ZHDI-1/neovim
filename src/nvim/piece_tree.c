@@ -1187,6 +1187,29 @@ size_t piece_tree_free_node_count(const PieceTree *tree)
   return count;
 }
 
+static size_t pt_add_live_len(const PieceTreeNode *node)
+{
+  if (node == NULL) {
+    return 0;
+  }
+  size_t len = node->source == kPieceTreeSourceAdd ? node->len : 0;
+  len += pt_add_live_len(node->left);
+  len += pt_add_live_len(node->right);
+  return len;
+}
+
+size_t piece_tree_add_live_len(PieceTree *tree)
+{
+  if (tree == NULL) {
+    return 0;
+  }
+
+  piece_tree_reader_enter(tree);
+  const size_t len = pt_add_live_len(tree->root);
+  piece_tree_reader_leave(tree);
+  return len;
+}
+
 size_t piece_tree_retired_node_count(const PieceTree *tree)
 {
   return tree->retired_node_count;
