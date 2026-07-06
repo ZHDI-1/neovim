@@ -1743,6 +1743,7 @@ static void ml_mmap_close(buf_T *buf)
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_mmap_piece_write_clone_range_count = 0;
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
+  buf->b_ml.ml_mmap_piece_write_raw_original_count = 0;
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_miss_count = 0;
@@ -1873,6 +1874,7 @@ static int ml_mmap_materialize(buf_T *buf)
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_mmap_piece_write_clone_range_count = 0;
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
+  buf->b_ml.ml_mmap_piece_write_raw_original_count = 0;
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_miss_count = 0;
@@ -2227,6 +2229,7 @@ int ml_set_mmap_lines(buf_T *buf, char *base, size_t size, size_t *line_starts,
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_mmap_piece_write_clone_range_count = 0;
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
+  buf->b_ml.ml_mmap_piece_write_raw_original_count = 0;
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_miss_count = 0;
@@ -2667,6 +2670,14 @@ void ml_buf_mmap_piece_write_copy_range_record(buf_T *buf)
   }
 }
 
+void ml_buf_mmap_piece_write_raw_original_record(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (ml_mmap_is_active(buf) && buf->b_ml.ml_piece_tree != NULL) {
+    buf->b_ml.ml_mmap_piece_write_raw_original_count++;
+  }
+}
+
 uint64_t ml_buf_mmap_piece_write_fast_count(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
@@ -2683,6 +2694,12 @@ uint64_t ml_buf_mmap_piece_write_copy_range_count(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
   return ml_mmap_is_active(buf) ? buf->b_ml.ml_mmap_piece_write_copy_range_count : 0;
+}
+
+uint64_t ml_buf_mmap_piece_write_raw_original_count(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) ? buf->b_ml.ml_mmap_piece_write_raw_original_count : 0;
 }
 
 uint64_t ml_buf_mmap_piece_compact_count(buf_T *buf)
@@ -4427,6 +4444,7 @@ int ml_open(buf_T *buf)
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_mmap_piece_write_clone_range_count = 0;
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
+  buf->b_ml.ml_mmap_piece_write_raw_original_count = 0;
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_miss_count = 0;
@@ -5008,6 +5026,7 @@ void ml_recover(bool checkext)
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_mmap_piece_write_clone_range_count = 0;
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
+  buf->b_ml.ml_mmap_piece_write_raw_original_count = 0;
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_miss_count = 0;

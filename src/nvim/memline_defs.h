@@ -103,6 +103,7 @@ typedef struct {
   uint64_t ml_mmap_piece_write_fast_count;  // successful direct piece-span writes
   uint64_t ml_mmap_piece_write_clone_range_count;  // original spans reflink-cloned by kernel
   uint64_t ml_mmap_piece_write_copy_range_count;  // original spans copied by kernel
+  uint64_t ml_mmap_piece_write_raw_original_count;  // original spans written from memory
   uint64_t ml_mmap_piece_compact_count;  // successful compact tree flips
   uint64_t ml_mmap_search_prefilter_count;  // regex searches skipped via mmap literal
   uint64_t ml_mmap_search_prefilter_miss_count;  // regex literal prefilters missed in range

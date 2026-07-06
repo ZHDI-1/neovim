@@ -541,6 +541,9 @@ static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, const char *
         break;
       }
     }
+    if (source_fd >= 0 && span->source == kPieceTreeSourceOriginal) {
+      ml_buf_mmap_piece_write_raw_original_record(buf);
+    }
     if (buf_write_raw_bytes(ip->bw_fd, span->data, span->len, ncharsp) == FAIL) {
       ret = FAIL;
       break;
