@@ -1200,15 +1200,40 @@ describe('fileio', function()
     stats = api.nvim__buf_stats(0)
     eq(true, stats.mmap_active)
     eq(true, stats.mmap_piece_tree)
-    eq(false, stats.mmap_source_is_buffer_file)
+    eq(true, stats.mmap_source_is_buffer_file)
     eq(0, stats.virt_blocks)
     eq(fast_before + 1, stats.mmap_piece_write_fast_count)
     local original_after = stats.mmap_piece_write_clone_range_count
       + stats.mmap_piece_write_copy_range_count
       + stats.mmap_piece_write_raw_original_count
     eq(original_before, original_after)
+    eq(0, stats.mmap_piece_revision)
+    eq(0, stats.mmap_piece_add_len)
     eq(#lines, fn.line('$'))
     eq(appended, fn.getline('$'))
+    eq(table.concat(lines, '\n') .. '\n', read_file('Xtest_mmap_readfile'))
+
+    fast_before = stats.mmap_piece_write_fast_count
+    original_before = original_after
+    local appended_again = 'tail-write mmap appended after rebase'
+    command("call append('$', '" .. appended_again .. "')")
+    lines[#lines + 1] = appended_again
+    command('write')
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_source_is_buffer_file)
+    eq(0, stats.virt_blocks)
+    eq(fast_before + 1, stats.mmap_piece_write_fast_count)
+    original_after = stats.mmap_piece_write_clone_range_count
+      + stats.mmap_piece_write_copy_range_count
+      + stats.mmap_piece_write_raw_original_count
+    eq(original_before, original_after)
+    eq(0, stats.mmap_piece_revision)
+    eq(0, stats.mmap_piece_add_len)
+    eq(#lines, fn.line('$'))
+    eq(appended_again, fn.getline('$'))
     eq(table.concat(lines, '\n') .. '\n', read_file('Xtest_mmap_readfile'))
   end)
 

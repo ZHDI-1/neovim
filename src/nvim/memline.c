@@ -2652,6 +2652,160 @@ int ml_buf_mmap_rebase_file(buf_T *buf, const char *fname)
 #endif
 }
 
+int ml_buf_mmap_rebase_file_after_append(buf_T *buf, const char *fname)
+  FUNC_ATTR_NONNULL_ALL
+{
+#ifdef UNIX
+  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL
+      || buf->b_ml.ml_mmap_storage == NULL
+      || buf->b_ml.ml_mmap_storage->line_index == NULL
+      || !ml_buf_mmap_source_is_buffer_file(buf)) {
+    return FAIL;
+  }
+
+  ml_flush_line(buf, false);
+  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL) {
+    return FAIL;
+  }
+
+  PieceTree *old_tree = buf->b_ml.ml_piece_tree;
+  ml_mmap_storage_T *old_storage = buf->b_ml.ml_mmap_storage;
+  const size_t old_size = old_tree->original_len;
+  if (old_size == 0 || old_size >= piece_tree_byte_len(old_tree)
+      || old_tree->original == NULL || old_tree->original[old_size - 1] != NL) {
+    return FAIL;
+  }
+
+  PieceTreeSnapshot snapshot = { 0 };
+  if (!piece_tree_snapshot(old_tree, &snapshot)
+      || snapshot.byte_len <= old_size
+      || snapshot.line_count == 0
+      || snapshot.line_count > (size_t)MAXLNUM
+      || snapshot.line_count != (size_t)buf->b_ml.ml_line_count) {
+    return FAIL;
+  }
+
+  size_t first_tail_lnum = 0;
+  size_t tail_line_start = 0;
+  if (!piece_tree_lnum_for_offset(old_tree, old_size, &first_tail_lnum, &tail_line_start)
+      || tail_line_start != old_size || first_tail_lnum < 2) {
+    return FAIL;
+  }
+  const size_t old_line_count = first_tail_lnum - 1;
+  const size_t expected_index_count = ml_mmap_index_for_lnum((linenr_T)snapshot.line_count) + 1;
+  size_t *line_starts = xcalloc(expected_index_count, sizeof *line_starts);
+  size_t filled = 1;
+
+  for (; filled < expected_index_count; filled++) {
+    const size_t target_lnum = filled * (size_t)ML_MMAP_INDEX_STRIDE + 1;
+    if (target_lnum > old_line_count) {
+      break;
+    }
+    if (filled >= old_storage->line_index->count) {
+      xfree(line_starts);
+      return FAIL;
+    }
+    line_starts[filled] = old_storage->line_index->starts[filled];
+  }
+
+  PieceTreeSpanVec tail_vec = { 0 };
+  if (!piece_tree_collect_span_vec_at_revision(old_tree, old_size, snapshot.byte_len - old_size,
+                                               snapshot.revision, &tail_vec)) {
+    xfree(line_starts);
+    return FAIL;
+  }
+
+  size_t lnum = first_tail_lnum;
+  if (filled < expected_index_count
+      && filled * (size_t)ML_MMAP_INDEX_STRIDE + 1 == lnum) {
+    line_starts[filled++] = old_size;
+  }
+
+  bool index_ok = true;
+  for (size_t i = 0; i < tail_vec.count && index_ok; i++) {
+    const PieceTreeSpan *span = &tail_vec.items[i];
+    if (span->source != kPieceTreeSourceAdd) {
+      index_ok = false;
+      break;
+    }
+
+    const char *scan = span->data;
+    const char *const end = span->data + span->len;
+    while (scan < end) {
+      const char *nl = memchr(scan, NL, (size_t)(end - scan));
+      if (nl == NULL) {
+        break;
+      }
+
+      const size_t next_offset = span->offset + (size_t)(nl - span->data) + 1;
+      lnum++;
+      if (next_offset < snapshot.byte_len
+          && filled < expected_index_count
+          && filled * (size_t)ML_MMAP_INDEX_STRIDE + 1 == lnum) {
+        line_starts[filled++] = next_offset;
+      }
+      scan = nl + 1;
+    }
+  }
+  piece_tree_span_vec_clear(&tail_vec);
+
+  if (!index_ok || filled != expected_index_count) {
+    xfree(line_starts);
+    return FAIL;
+  }
+
+  char last = NUL;
+  if (!piece_tree_byte_at(old_tree, snapshot.byte_len - 1, &last)) {
+    xfree(line_starts);
+    return FAIL;
+  }
+  const bool noeol = last != NL;
+
+  int fd = os_open(fname, O_RDONLY, 0);
+  if (fd < 0) {
+    xfree(line_starts);
+    return FAIL;
+  }
+
+  FileInfo file_info;
+  if (!os_fileinfo_fd(fd, &file_info) || !S_ISREG(file_info.stat.st_mode)
+      || (uintmax_t)file_info.stat.st_size != (uintmax_t)snapshot.byte_len) {
+    close(fd);
+    xfree(line_starts);
+    return FAIL;
+  }
+
+  char *base = mmap(NULL, snapshot.byte_len, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+  if (base == MAP_FAILED) {
+    xfree(line_starts);
+    return FAIL;
+  }
+
+  ml_mmap_line_index_T *line_index = ml_mmap_line_index_new(line_starts, expected_index_count);
+  ml_mmap_storage_T *new_storage = ml_mmap_storage_new(base, snapshot.byte_len, line_index);
+  PieceTree *new_tree = xmalloc(sizeof *new_tree);
+  piece_tree_init_with_line_index(new_tree, new_storage->base, new_storage->size,
+                                  line_index->starts, line_index->count,
+                                  ML_MMAP_INDEX_STRIDE, snapshot.newline_count);
+
+  ml_mmap_clear_cache(buf);
+  buf->b_ml.ml_piece_tree = new_tree;
+  ml_mmap_set_active_storage(buf, new_storage);
+  buf->b_ml.ml_mmap_noeol = noeol;
+  buf->b_ml.ml_mmap_source_is_buffer_file = true;
+  buf->b_ml.ml_line_count = (linenr_T)snapshot.line_count;
+  buf->b_ml.ml_flags &= ~ML_EMPTY;
+  ml_mmap_retire_piece_storage(old_tree, old_storage);
+  ml_upd_lastbuf = NULL;
+  return OK;
+#else
+  (void)buf;
+  (void)fname;
+  return FAIL;
+#endif
+}
+
 void ml_buf_mmap_piece_write_fast_record(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {

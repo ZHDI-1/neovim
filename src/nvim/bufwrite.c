@@ -2337,7 +2337,8 @@ write_loop_done:
       buf->b_flags &= ~BF_WRITE_MASK;
     }
   }
-  if (mmap_tail_append_did_write) {
+  if (mmap_tail_append_did_write
+      && ml_buf_mmap_rebase_file_after_append(buf, ffname) == FAIL) {
     ml_buf_mmap_source_detach_buffer_file(buf);
   }
   if (reset_changed && whole && !append && overwriting && !write_info.bw_conv_error) {
