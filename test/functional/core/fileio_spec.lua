@@ -314,6 +314,31 @@ describe('fileio', function()
       read_file('Xtest_mmap_readfile'))
     command('set writebackup backupcopy& backup&')
 
+    mkdir('Xtest_startup_swapdir')
+    command('set undodir=Xtest_startup_swapdir// undofile')
+    command("call setline(4, 'undofile mmap write')")
+    lines[4] = 'undofile mmap write'
+    write_stats = expect_mmap_piece(1)
+    command('write')
+    written_stats = expect_mmap_piece(1)
+    eq(write_stats.mmap_piece_write_fast_count + 1,
+      written_stats.mmap_piece_write_fast_count)
+    matches('^line1 ascii text for mmap smoke\nZhanged\nnowritebackup mmap write\n'
+      .. 'undofile mmap write', read_file('Xtest_mmap_readfile'))
+
+    local undo_file = fn.undofile(fn.expand('%:p'))
+    neq('', undo_file)
+    neq(nil, uv.fs_stat(undo_file))
+    command('bwipe!')
+    command('set undodir=Xtest_startup_swapdir// undofile')
+    command('edit Xtest_mmap_readfile')
+    command('rundo ' .. fn.fnameescape(undo_file))
+    command('earlier 1f')
+    eq('line4 ascii text for mmap smoke', fn.getline(4))
+    command('later 1f')
+    eq('undofile mmap write', fn.getline(4))
+    command('set noundofile undodir&')
+
     command('edit! Xtest_mmap_noeol')
     expect_mmap_piece(0)
     eq(40000, fn.line('$'))

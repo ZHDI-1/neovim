@@ -438,10 +438,39 @@ static bool buf_write_span_vec_ends_in_nl(const PieceTreeSpanVec *span_vec)
   return false;
 }
 
+static void buf_write_mmap_piece_hash_span_vec(const PieceTreeSpanVec *span_vec,
+                                               context_sha256_T *sha_ctx)
+  FUNC_ATTR_NONNULL_ALL
+{
+  static const uint8_t nul = NUL;
+
+  for (size_t i = 0; i < span_vec->count; i++) {
+    const PieceTreeSpan *span = &span_vec->items[i];
+    const char *p = span->data;
+    const char *end = span->data + span->len;
+    while (p < end) {
+      const char *nl = memchr(p, NL, (size_t)(end - p));
+      if (nl == NULL) {
+        sha256_update(sha_ctx, (const uint8_t *)p, (size_t)(end - p));
+        break;
+      }
+      if (nl > p) {
+        sha256_update(sha_ctx, (const uint8_t *)p, (size_t)(nl - p));
+      }
+      sha256_update(sha_ctx, &nul, 1);
+      p = nl + 1;
+    }
+  }
+
+  if (!buf_write_span_vec_ends_in_nl(span_vec)) {
+    sha256_update(sha_ctx, &nul, 1);
+  }
+}
+
 static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, const char *copy_source,
                                     linenr_T start, linenr_T end, bool write_final_eol,
-                                    bool *no_eolp, off_T *ncharsp)
-  FUNC_ATTR_NONNULL_ARG(1, 2, 7, 8)
+                                    context_sha256_T *sha_ctx, bool *no_eolp, off_T *ncharsp)
+  FUNC_ATTR_NONNULL_ARG(1, 2, 8, 9)
 {
   if (ip->bw_fd < 0 || ip->bw_len != 0 || buf->b_ml.ml_piece_tree == NULL
       || start < 1 || end < start) {
@@ -520,6 +549,9 @@ static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, const char *
 
   if (source_fd >= 0) {
     close(source_fd);
+  }
+  if (ret == OK && sha_ctx != NULL) {
+    buf_write_mmap_piece_hash_span_vec(&span_vec, sha_ctx);
   }
   if (ret == OK && !buf_write_span_vec_ends_in_nl(&span_vec)) {
     if (write_final_eol) {
@@ -1785,7 +1817,6 @@ restore_backup:
         && !append
         && !filtering
         && !write_bin
-        && !write_undo_file
         && !converted
         && wb_flags == 0
         && write_info.bw_iconv_fd == (iconv_t)-1
@@ -1797,7 +1828,8 @@ restore_backup:
       const bool write_final_eol = buf->b_p_fixeol || buf->b_p_eol;
       const int mmap_write_ret =
         buf_write_mmap_piece_raw(buf, &write_info, mmap_piece_copy_source, start, end,
-                                 write_final_eol, &no_eol, &nchars);
+                                 write_final_eol, write_undo_file ? &sha_ctx : NULL, &no_eol,
+                                 &nchars);
       if (mmap_write_ret == OK) {
         lnum = end + 1;
         goto write_loop_done;
