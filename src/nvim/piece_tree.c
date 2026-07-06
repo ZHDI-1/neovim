@@ -1708,6 +1708,9 @@ static bool pt_insert(PieceTree *tree, size_t offset, const char *text, size_t l
 
 bool piece_tree_insert(PieceTree *tree, size_t offset, const char *text, size_t len)
 {
+  if (len > 0 && pt_reader_count_load(tree) != 0) {
+    return false;
+  }
   return pt_insert(tree, offset, text, len, true);
 }
 
@@ -1742,6 +1745,9 @@ static bool pt_delete(PieceTree *tree, size_t offset, size_t len, bool bump_revi
 
 bool piece_tree_delete(PieceTree *tree, size_t offset, size_t len)
 {
+  if (len > 0 && pt_reader_count_load(tree) != 0) {
+    return false;
+  }
   return pt_delete(tree, offset, len, true);
 }
 
@@ -1754,6 +1760,9 @@ bool piece_tree_replace(PieceTree *tree, size_t offset, size_t len, const char *
   }
   if (len == 0 && text_len == 0) {
     return true;
+  }
+  if (pt_reader_count_load(tree) != 0) {
+    return false;
   }
   if (text_len > 0 && !pt_reserve_add(tree, text_len)) {
     return false;

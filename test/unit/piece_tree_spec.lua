@@ -369,44 +369,49 @@ describe('piece tree', function()
     eq(capacity, tonumber(lib.piece_tree_node_capacity(w.tree)))
   end)
 
-  itp('defers node reuse while read guards are active', function()
+  itp('blocks mutations while read guards are active', function()
     local w = new_tree('abcdef')
-    local null = ffi.cast('void *', 0)
     check_tree(w.tree, 'abcdef')
-    eq(0, tonumber(lib.piece_tree_retired_node_count(w.tree)))
-    ok(w.tree[0].free_nodes == null)
 
     lib.piece_tree_reader_enter(w.tree)
-    lib.piece_tree_reader_enter(w.tree)
-    eq(2, tonumber(w.tree[0].reader_count))
+    eq(1, tonumber(w.tree[0].reader_count))
 
+    eq(false, lib.piece_tree_insert(w.tree, 3, 'XYZ', 3))
+    eq(false, lib.piece_tree_delete(w.tree, 3, 2))
+    eq(false, lib.piece_tree_replace(w.tree, 3, 2, 'XYZ', 3))
+    check_tree(w.tree, 'abcdef')
+
+    lib.piece_tree_reader_leave(w.tree)
+    eq(0, tonumber(w.tree[0].reader_count))
     ok(lib.piece_tree_insert(w.tree, 3, 'XYZ', 3))
     check_tree(w.tree, 'abcXYZdef')
+  end)
+
+  itp('reclaims manually retired nodes only after readers leave', function()
+    local w = new_tree('abcdef')
+    local null = ffi.cast('void *', 0)
+    ok(lib.piece_tree_insert(w.tree, 3, 'XYZ', 3))
     ok(lib.piece_tree_delete(w.tree, 3, 3))
     check_tree(w.tree, 'abcdef')
 
-    local retired_count = tonumber(lib.piece_tree_retired_node_count(w.tree))
-    ok(retired_count >= 2)
-    ok(w.tree[0].retired_nodes ~= null)
-    ok(w.tree[0].free_nodes == null)
+    local retired_count = tonumber(lib.piece_tree_free_node_count(w.tree))
+    ok(retired_count > 0)
+    w.tree[0].retired_nodes = w.tree[0].free_nodes
+    w.tree[0].retired_node_count = retired_count
+    w.tree[0].free_nodes = null
 
-    lib.piece_tree_reader_leave(w.tree)
-    eq(1, tonumber(w.tree[0].reader_count))
+    lib.piece_tree_reader_enter(w.tree)
     eq(false, lib.piece_tree_reclaim_retired(w.tree))
     eq(retired_count, tonumber(lib.piece_tree_retired_node_count(w.tree)))
     ok(w.tree[0].retired_nodes ~= null)
     ok(w.tree[0].free_nodes == null)
 
     lib.piece_tree_reader_leave(w.tree)
-    eq(0, tonumber(w.tree[0].reader_count))
-    eq(retired_count, tonumber(lib.piece_tree_retired_node_count(w.tree)))
-    ok(w.tree[0].retired_nodes ~= null)
-    ok(w.tree[0].free_nodes == null)
-
     ok(lib.piece_tree_reclaim_retired(w.tree))
     eq(0, tonumber(lib.piece_tree_retired_node_count(w.tree)))
     ok(w.tree[0].retired_nodes == null)
     ok(w.tree[0].free_nodes ~= null)
+    eq(retired_count, tonumber(lib.piece_tree_free_node_count(w.tree)))
     check_tree(w.tree, 'abcdef')
   end)
 
