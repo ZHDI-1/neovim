@@ -36,6 +36,11 @@ typedef struct {
   size_t line_len;
 } mmap_literal_match_T;
 
+typedef struct {
+  linenr_T start;
+  linenr_T end;
+} mmap_marked_range_T;
+
 // Flags when calling ml_updatechunk()
 #define ML_CHNK_ADDLINE 1
 #define ML_CHNK_DELLINE 2
@@ -97,6 +102,10 @@ typedef struct {
   uint64_t ml_mmap_piece_write_copy_range_count;  // original spans copied by kernel
   uint64_t ml_mmap_piece_compact_count;  // successful compact tree flips
   uint64_t ml_mmap_search_prefilter_count;  // regex searches skipped via mmap literal
+  mmap_marked_range_T *ml_mmap_marked_ranges;  // temporary :global marks
+  size_t ml_mmap_marked_count;  // active entries in ml_mmap_marked_ranges
+  size_t ml_mmap_marked_cap;  // allocated entries in ml_mmap_marked_ranges
+  size_t ml_mmap_marked_idx;  // first range not fully consumed by ml_firstmarked()
 
   bhdr_T *ml_locked;       // block used by last ml_get
   linenr_T ml_locked_low;       // first line in ml_locked

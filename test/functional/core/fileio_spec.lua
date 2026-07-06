@@ -592,6 +592,42 @@ describe('fileio', function()
     ok(stats.mmap_search_prefilter_count > prefilter_count)
   end)
 
+  it('keeps mmap piece tree active for :global mark execution', function()
+    local lines = {}
+    for i = 1, 42000 do
+      lines[i] = ('global mmap row %05d plain ascii'):format(i)
+    end
+    lines[200] = 'global-change alpha'
+    lines[202] = 'global-change beta'
+    lines[1000] = 'global-delete one'
+    lines[1001] = 'global-delete two'
+    lines[41000] = 'global-delete tail'
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+
+    command('g/global-change/s/global-change/global-changed/')
+    eq('global-changed alpha', fn.getline(200))
+    eq('global-changed beta', fn.getline(202))
+
+    command('g/global-delete/d')
+    eq(41997, fn.line('$'))
+    command('normal! gg0')
+    eq(0, fn.search('global-delete', 'nw'))
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    ok(stats.mmap_piece_revision >= 5)
+  end)
+
   it('keeps mmap piece tree active for same-file copy-backup writes', function()
     local lines = {}
     for i = 1, 40000 do

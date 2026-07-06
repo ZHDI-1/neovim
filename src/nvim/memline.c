@@ -418,6 +418,178 @@ static bool ml_mmap_can_edit_tree(const buf_T *buf)
          && buf->b_ml.ml_piece_tree != NULL;
 }
 
+static void ml_mmap_marked_clear(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  XFREE_CLEAR(buf->b_ml.ml_mmap_marked_ranges);
+  buf->b_ml.ml_mmap_marked_count = 0;
+  buf->b_ml.ml_mmap_marked_cap = 0;
+  buf->b_ml.ml_mmap_marked_idx = 0;
+}
+
+static bool ml_mmap_marked_has(const buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf->b_ml.ml_mmap_marked_idx < buf->b_ml.ml_mmap_marked_count;
+}
+
+static void ml_mmap_marked_drop_consumed(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  const size_t idx = buf->b_ml.ml_mmap_marked_idx;
+  if (idx == 0) {
+    return;
+  }
+  if (idx >= buf->b_ml.ml_mmap_marked_count) {
+    buf->b_ml.ml_mmap_marked_count = 0;
+    buf->b_ml.ml_mmap_marked_idx = 0;
+    return;
+  }
+
+  const size_t remaining = buf->b_ml.ml_mmap_marked_count - idx;
+  memmove(buf->b_ml.ml_mmap_marked_ranges,
+          buf->b_ml.ml_mmap_marked_ranges + idx,
+          remaining * sizeof *buf->b_ml.ml_mmap_marked_ranges);
+  buf->b_ml.ml_mmap_marked_count = remaining;
+  buf->b_ml.ml_mmap_marked_idx = 0;
+}
+
+static void ml_mmap_marked_reserve(buf_T *buf, size_t needed)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (needed <= buf->b_ml.ml_mmap_marked_cap) {
+    return;
+  }
+
+  size_t new_cap = buf->b_ml.ml_mmap_marked_cap == 0 ? 8 : buf->b_ml.ml_mmap_marked_cap;
+  while (new_cap < needed) {
+    new_cap *= 2;
+  }
+  buf->b_ml.ml_mmap_marked_ranges =
+    xrealloc(buf->b_ml.ml_mmap_marked_ranges,
+             new_cap * sizeof *buf->b_ml.ml_mmap_marked_ranges);
+  buf->b_ml.ml_mmap_marked_cap = new_cap;
+}
+
+static void ml_mmap_marked_set(buf_T *buf, linenr_T lnum)
+  FUNC_ATTR_NONNULL_ALL
+{
+  ml_mmap_marked_drop_consumed(buf);
+  if (buf->b_ml.ml_mmap_marked_count > 0) {
+    mmap_marked_range_T *last =
+      &buf->b_ml.ml_mmap_marked_ranges[buf->b_ml.ml_mmap_marked_count - 1];
+    if (lnum <= last->end) {
+      return;
+    }
+    if (last->end < MAXLNUM && lnum == last->end + 1) {
+      last->end = lnum;
+      return;
+    }
+  }
+
+  ml_mmap_marked_reserve(buf, buf->b_ml.ml_mmap_marked_count + 1);
+  buf->b_ml.ml_mmap_marked_ranges[buf->b_ml.ml_mmap_marked_count++] =
+    (mmap_marked_range_T){
+      .start = lnum,
+      .end = lnum,
+    };
+}
+
+static void ml_mmap_marked_update_lowest(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  lowest_marked = ml_mmap_marked_has(buf)
+                  ? buf->b_ml.ml_mmap_marked_ranges[buf->b_ml.ml_mmap_marked_idx].start
+                  : 0;
+}
+
+static void ml_mmap_marked_insert(buf_T *buf, linenr_T lnum)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (!ml_mmap_marked_has(buf)) {
+    return;
+  }
+
+  ml_mmap_marked_drop_consumed(buf);
+  mmap_marked_range_T *ranges = buf->b_ml.ml_mmap_marked_ranges;
+  for (size_t i = 0; i < buf->b_ml.ml_mmap_marked_count; i++) {
+    mmap_marked_range_T *range = &ranges[i];
+    if (range->end <= lnum) {
+      continue;
+    }
+    if (range->start > lnum) {
+      range->start++;
+      range->end++;
+      continue;
+    }
+
+    const linenr_T old_end = range->end;
+    range->end = lnum;
+    ml_mmap_marked_reserve(buf, buf->b_ml.ml_mmap_marked_count + 1);
+    ranges = buf->b_ml.ml_mmap_marked_ranges;
+    memmove(ranges + i + 2, ranges + i + 1,
+            (buf->b_ml.ml_mmap_marked_count - i - 1) * sizeof *ranges);
+    ranges[i + 1] = (mmap_marked_range_T){
+      .start = lnum + 2,
+      .end = old_end + 1,
+    };
+    buf->b_ml.ml_mmap_marked_count++;
+    i++;
+  }
+  ml_mmap_marked_update_lowest(buf);
+}
+
+static void ml_mmap_marked_merge(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (buf->b_ml.ml_mmap_marked_count <= 1) {
+    return;
+  }
+
+  mmap_marked_range_T *ranges = buf->b_ml.ml_mmap_marked_ranges;
+  size_t out = 0;
+  for (size_t i = 0; i < buf->b_ml.ml_mmap_marked_count; i++) {
+    if (out > 0 && ranges[i].start <= ranges[out - 1].end + 1) {
+      ranges[out - 1].end = MAX(ranges[out - 1].end, ranges[i].end);
+    } else {
+      ranges[out++] = ranges[i];
+    }
+  }
+  buf->b_ml.ml_mmap_marked_count = out;
+}
+
+static void ml_mmap_marked_delete(buf_T *buf, linenr_T lnum)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (!ml_mmap_marked_has(buf)) {
+    return;
+  }
+
+  ml_mmap_marked_drop_consumed(buf);
+  mmap_marked_range_T *ranges = buf->b_ml.ml_mmap_marked_ranges;
+  for (size_t i = 0; i < buf->b_ml.ml_mmap_marked_count;) {
+    mmap_marked_range_T *range = &ranges[i];
+    if (range->end < lnum) {
+      i++;
+    } else if (range->start > lnum) {
+      range->start--;
+      range->end--;
+      i++;
+    } else {
+      range->end--;
+      if (range->start > range->end) {
+        memmove(ranges + i, ranges + i + 1,
+                (buf->b_ml.ml_mmap_marked_count - i - 1) * sizeof *ranges);
+        buf->b_ml.ml_mmap_marked_count--;
+      } else {
+        i++;
+      }
+    }
+  }
+  ml_mmap_marked_merge(buf);
+  ml_mmap_marked_update_lowest(buf);
+}
+
 enum {
   ML_MMAP_PIECE_RECLAIM_EVENT_BUDGET = 256,
   ML_MMAP_PIECE_COMPACT_DEAD_ADD_MIN = 16 * 1024 * 1024,
@@ -1427,6 +1599,7 @@ static void ml_mmap_close(buf_T *buf)
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
+  ml_mmap_marked_clear(buf);
   ml_mmap_clear_cache(buf);
 }
 
@@ -1542,6 +1715,7 @@ static int ml_mmap_materialize(buf_T *buf)
   PieceTree *piece_tree = buf->b_ml.ml_piece_tree;
   const linenr_T line_count = buf->b_ml.ml_line_count;
 
+  ml_mmap_marked_clear(buf);
   ml_mmap_clear_cache(buf);
   ml_mmap_set_active_storage(buf, NULL);
   buf->b_ml.ml_mmap_noeol = false;
@@ -1715,6 +1889,7 @@ static int ml_mmap_append_line(buf_T *buf, linenr_T lnum, char *line, colnr_T le
     buf->b_prev_line_count = buf->b_ml.ml_line_count;
   }
   buf->b_ml.ml_line_count++;
+  ml_mmap_marked_insert(buf, lnum);
   ml_mmap_update_noeol(buf);
   ml_mmap_piece_journal_append(buf, kPieceJournalOpInsert, offset, 0, insert, insert_len);
   xfree(insert);
@@ -1815,6 +1990,7 @@ static int ml_mmap_delete_line(buf_T *buf, linenr_T lnum, bool message)
     buf->b_prev_line_count = buf->b_ml.ml_line_count;
   }
   buf->b_ml.ml_line_count--;
+  ml_mmap_marked_delete(buf, lnum);
   ml_mmap_update_noeol(buf);
   ml_mmap_piece_journal_append(buf, kPieceJournalOpDelete, delete_start, delete_len, NULL, 0);
   ml_mmap_clear_cache(buf);
@@ -1898,6 +2074,7 @@ int ml_set_mmap_lines(buf_T *buf, char *base, size_t size, size_t *line_starts,
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
+  ml_mmap_marked_clear(buf);
   buf->b_ml.ml_line_count = line_count;
   buf->b_ml.ml_flags &= ~ML_EMPTY;
   ml_mmap_piece_journal_open(buf);
@@ -3728,6 +3905,10 @@ int ml_open(buf_T *buf)
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
+  buf->b_ml.ml_mmap_marked_ranges = NULL;
+  buf->b_ml.ml_mmap_marked_count = 0;
+  buf->b_ml.ml_mmap_marked_cap = 0;
+  buf->b_ml.ml_mmap_marked_idx = 0;
   buf->b_ml.ml_piece_tree = NULL;
   buf->b_ml.ml_chunksize = NULL;
   buf->b_ml.ml_usedchunks = 0;
@@ -4298,6 +4479,10 @@ void ml_recover(bool checkext)
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
   buf->b_ml.ml_mmap_piece_compact_count = 0;
   buf->b_ml.ml_mmap_search_prefilter_count = 0;
+  buf->b_ml.ml_mmap_marked_ranges = NULL;
+  buf->b_ml.ml_mmap_marked_count = 0;
+  buf->b_ml.ml_mmap_marked_cap = 0;
+  buf->b_ml.ml_mmap_marked_idx = 0;
   buf->b_ml.ml_piece_tree = NULL;
   buf->b_ml.ml_locked = NULL;           // no locked block
   buf->b_ml.ml_flags = 0;
@@ -6783,6 +6968,16 @@ int ml_delete_flags(linenr_T lnum, int flags)
 /// set the DB_MARKED flag for line 'lnum'
 void ml_setmarked(linenr_T lnum)
 {
+  if (ml_mmap_can_edit_tree(curbuf)) {
+    if (lnum >= 1 && lnum <= curbuf->b_ml.ml_line_count) {
+      if (lowest_marked == 0 || lowest_marked > lnum) {
+        lowest_marked = lnum;
+      }
+      ml_mmap_marked_set(curbuf, lnum);
+    }
+    return;
+  }
+
   if (ml_mmap_materialize(curbuf) == FAIL) {
     return;
   }
@@ -6810,6 +7005,21 @@ void ml_setmarked(linenr_T lnum)
 /// find the first line with its DB_MARKED flag set
 linenr_T ml_firstmarked(void)
 {
+  if (ml_mmap_can_edit_tree(curbuf)) {
+    if (ml_mmap_marked_has(curbuf)) {
+      mmap_marked_range_T *range =
+        &curbuf->b_ml.ml_mmap_marked_ranges[curbuf->b_ml.ml_mmap_marked_idx];
+      const linenr_T lnum = range->start++;
+      if (range->start > range->end) {
+        curbuf->b_ml.ml_mmap_marked_idx++;
+      }
+      ml_mmap_marked_update_lowest(curbuf);
+      return lnum;
+    }
+    lowest_marked = 0;
+    return 0;
+  }
+
   if (ml_mmap_materialize(curbuf) == FAIL) {
     return 0;
   }
@@ -6846,6 +7056,12 @@ linenr_T ml_firstmarked(void)
 /// clear all DB_MARKED flags
 void ml_clearmarked(void)
 {
+  if (ml_mmap_can_edit_tree(curbuf)) {
+    ml_mmap_marked_clear(curbuf);
+    lowest_marked = 0;
+    return;
+  }
+
   if (ml_mmap_materialize(curbuf) == FAIL) {
     return;
   }
