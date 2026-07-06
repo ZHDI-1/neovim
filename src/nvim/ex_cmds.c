@@ -661,8 +661,21 @@ void ex_sort(exarg_T *eap)
 
   // delete the original lines if appending worked
   if (i == count) {
-    for (i = 0; i < count; i++) {
-      ml_delete(eap->line1);
+    linenr_T mmap_deleted = 0;
+    const int mmap_delete_ret =
+      ml_buf_mmap_delete_lines(curbuf, eap->line1, (linenr_T)count, false, &mmap_deleted);
+    if (mmap_delete_ret == OK) {
+      if (mmap_deleted != (linenr_T)count) {
+        count = 0;
+      }
+    } else {
+      if (mmap_delete_ret == FAIL) {
+        count = 0;
+      } else {
+        for (i = 0; i < count; i++) {
+          ml_delete(eap->line1);
+        }
+      }
     }
   } else {
     count = 0;
@@ -1013,8 +1026,20 @@ int do_move(linenr_T line1, linenr_T line2, linenr_T dest)
     return FAIL;
   }
 
-  for (linenr_T l = line1; l <= line2; l++) {
-    ml_delete_flags(line1 + extra, ML_DEL_MESSAGE);
+  linenr_T mmap_deleted = 0;
+  const int mmap_delete_ret =
+    ml_buf_mmap_delete_lines(curbuf, line1 + extra, num_lines, true, &mmap_deleted);
+  if (mmap_delete_ret == OK) {
+    if (mmap_deleted != num_lines) {
+      return FAIL;
+    }
+  } else {
+    if (mmap_delete_ret == FAIL) {
+      return FAIL;
+    }
+    for (linenr_T l = line1; l <= line2; l++) {
+      ml_delete_flags(line1 + extra, ML_DEL_MESSAGE);
+    }
   }
   if (!global_busy && num_lines > p_report) {
     smsg(0, NGETTEXT("%" PRId64 " line moved",

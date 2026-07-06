@@ -894,7 +894,7 @@ describe('fileio', function()
     eq(true, stats.mmap_active)
     eq(true, stats.mmap_piece_tree)
     eq(0, stats.virt_blocks)
-    ok(stats.mmap_piece_revision > 0)
+    eq(1, stats.mmap_piece_revision)
     ok(stats.mmap_piece_add_len > 0)
     eq(text_size, stats.mmap_text_size)
 
@@ -908,6 +908,7 @@ describe('fileio', function()
     eq(true, stats.mmap_active)
     eq(true, stats.mmap_piece_tree)
     eq(0, stats.virt_blocks)
+    eq(2, stats.mmap_piece_revision)
     eq(text_size, stats.mmap_text_size)
   end)
 
@@ -947,7 +948,7 @@ describe('fileio', function()
     eq(true, stats.mmap_active)
     eq(true, stats.mmap_piece_tree)
     eq(0, stats.virt_blocks)
-    ok(stats.mmap_piece_revision > 0)
+    eq(2, stats.mmap_piece_revision)
     ok(stats.mmap_piece_add_len > 0)
     eq(text_size, stats.mmap_text_size)
 
@@ -970,6 +971,7 @@ describe('fileio', function()
     eq(true, stats.mmap_active)
     eq(true, stats.mmap_piece_tree)
     eq(0, stats.virt_blocks)
+    eq(4, stats.mmap_piece_revision)
     eq(text_size, stats.mmap_text_size)
   end)
 
@@ -1006,6 +1008,34 @@ describe('fileio', function()
     eq(true, stats.mmap_piece_tree)
     eq(0, stats.virt_blocks)
     eq(3, stats.mmap_piece_revision)
+  end)
+
+  it('batches mmap piece tree sort cleanup', function()
+    local lines = {}
+    local line_count = 5000
+    local payload = string.rep('x', 512)
+    for i = 1, line_count do
+      lines[i] = ('sort cleanup mmap row %05d %s'):format(line_count + 1 - i, payload)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+
+    command('%sort')
+    eq(line_count, fn.line('$'))
+    eq('sort cleanup mmap row 00001 ' .. payload, fn.getline(1))
+    eq(('sort cleanup mmap row %05d %s'):format(line_count, payload), fn.getline('$'))
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(line_count + 1, stats.mmap_piece_revision)
   end)
 
   it('keeps mmap piece tree active for same-file copy-backup writes', function()
