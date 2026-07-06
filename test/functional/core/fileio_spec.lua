@@ -46,6 +46,8 @@ describe('fileio', function()
     os.remove('Xtest_mmap_noeol')
     os.remove('Xtest_mmap_empty_delete_written')
     os.remove('Xtest_mmap_noeol_written')
+    os.remove('Xtest_mmap_range_noeol_written')
+    os.remove('Xtest_mmap_range_written')
     os.remove('Xtest_mmap_written')
     os.remove('Xtest_тест.md')
     os.remove('Xtest-u8-int-max')
@@ -239,6 +241,14 @@ describe('fileio', function()
     matches('^line1 ascii text for mmap smoke\nZhanged\nline3 ascii text for mmap smoke',
       read_file('Xtest_mmap_written'))
 
+    write_stats = written_stats
+    command('3,5write Xtest_mmap_range_written')
+    written_stats = expect_mmap_piece(1)
+    eq(write_stats.mmap_piece_write_fast_count + 1,
+      written_stats.mmap_piece_write_fast_count)
+    eq(table.concat({ lines[3], lines[4], lines[5] }, '\n') .. '\n',
+      read_file('Xtest_mmap_range_written'))
+
     command("call setline(3, 'nowritebackup mmap write')")
     lines[3] = 'nowritebackup mmap write'
     command('set nowritebackup nobackup backupcopy=yes')
@@ -275,6 +285,13 @@ describe('fileio', function()
     local nofixeol_written = read_file('Xtest_mmap_noeol_written')
     matches('\ntail without eol$', nofixeol_written)
     eq(nil, nofixeol_written:match('\n$'))
+
+    write_stats = written_stats
+    command('$write Xtest_mmap_range_noeol_written')
+    written_stats = expect_mmap_piece(1)
+    eq(write_stats.mmap_piece_write_fast_count + 1,
+      written_stats.mmap_piece_write_fast_count)
+    eq('tail without eol', read_file('Xtest_mmap_range_noeol_written'))
     command('setlocal fixeol')
 
     command('%delete _')

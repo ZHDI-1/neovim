@@ -347,11 +347,13 @@ static bool buf_write_span_vec_ends_in_nl(const PieceTreeSpanVec *span_vec)
   return false;
 }
 
-static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, bool write_final_eol,
-                                    bool *no_eolp, off_T *ncharsp)
+static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, linenr_T start,
+                                    linenr_T end, bool write_final_eol, bool *no_eolp,
+                                    off_T *ncharsp)
   FUNC_ATTR_NONNULL_ALL
 {
-  if (ip->bw_fd < 0 || ip->bw_len != 0 || buf->b_ml.ml_piece_tree == NULL) {
+  if (ip->bw_fd < 0 || ip->bw_len != 0 || buf->b_ml.ml_piece_tree == NULL
+      || start < 1 || end < start) {
     return NOTDONE;
   }
   if (!ml_buf_flush_mmap_piece_tree(buf) || buf->b_ml.ml_piece_tree == NULL) {
@@ -361,13 +363,29 @@ static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, bool write_f
   PieceTree *tree = buf->b_ml.ml_piece_tree;
   PieceTreeSnapshot snapshot = { 0 };
   if (!piece_tree_snapshot(tree, &snapshot)
-      || snapshot.line_count != (size_t)buf->b_ml.ml_line_count) {
+      || snapshot.line_count != (size_t)buf->b_ml.ml_line_count
+      || (size_t)end > snapshot.line_count) {
+    return NOTDONE;
+  }
+
+  size_t range_start = 0;
+  size_t range_end = snapshot.byte_len;
+  if (!piece_tree_line_start_at_revision(tree, (size_t)start, snapshot.revision,
+                                         &range_start)) {
+    return NOTDONE;
+  }
+  if ((size_t)end < snapshot.line_count
+      && !piece_tree_line_start_at_revision(tree, (size_t)end + 1, snapshot.revision,
+                                            &range_end)) {
+    return NOTDONE;
+  }
+  if (range_start > range_end) {
     return NOTDONE;
   }
 
   PieceTreeSpanVec span_vec = { 0 };
-  if (!piece_tree_collect_span_vec_at_revision(tree, 0, snapshot.byte_len, snapshot.revision,
-                                               &span_vec)) {
+  if (!piece_tree_collect_span_vec_at_revision(tree, range_start, range_end - range_start,
+                                               snapshot.revision, &span_vec)) {
     return NOTDONE;
   }
 
@@ -1596,7 +1614,6 @@ restore_backup:
 
     if (end > 0
         && !checking_conversion
-        && whole
         && !append
         && !filtering
         && !write_bin
@@ -1611,7 +1628,7 @@ restore_backup:
         && ml_buf_has_mmap_piece_tree(buf)) {
       const bool write_final_eol = buf->b_p_fixeol || buf->b_p_eol;
       const int mmap_write_ret =
-        buf_write_mmap_piece_raw(buf, &write_info, write_final_eol, &no_eol, &nchars);
+        buf_write_mmap_piece_raw(buf, &write_info, start, end, write_final_eol, &no_eol, &nchars);
       if (mmap_write_ret == OK) {
         lnum = end + 1;
         goto write_loop_done;

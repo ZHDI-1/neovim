@@ -289,16 +289,16 @@ structures. This remains the main safety valve for compatibility.
 
 ### Writing edited mmap buffers
 
-Whole-buffer `:write` has a guarded piece-span fast path. `buf_write()` still
-owns the normal Neovim write setup: backup handling, file opening, permissions,
-fsync, timestamp updates, messages, and autocmd sequencing. The optimized branch
-only replaces the inner byte-production loop when the output can be written as
-raw logical bytes from the piece tree.
+`:write` has a guarded piece-span fast path for contiguous line ranges.
+`buf_write()` still owns the normal Neovim write setup: backup handling, file
+opening, permissions, fsync, timestamp updates, messages, and autocmd sequencing.
+The optimized branch only replaces the inner byte-production loop when the
+output can be written as raw logical bytes from the piece tree.
 
 The fast path currently requires:
 
 - mmap piece tree is still active
-- whole-buffer write, not append and not filtering
+- line-range write, not append and not filtering
 - Unix fileformat
 - no binary write mode and no trailing CTRL-Z behavior
 - no encoding conversion, BOM conversion, or iconv path
