@@ -250,6 +250,71 @@ it(':vimgrep keeps literal fast path separate from regex patterns', function()
   eq({ 7, 8, 10 }, { list[1].lnum, list[1].col, list[1].end_col })
 end)
 
+it(':vimgrep searches edited mmap buffers through the piece tree', function()
+  local file = file_base .. '_vimgrep_mmap_piece_tree'
+  local lines = {}
+  for i = 1, 40000 do
+    lines[i] = ('line%d ascii text for mmap quickfix'):format(i)
+  end
+  lines[1001] = 'after empty mmap line'
+
+  write_file(file, table.concat(lines, '\n') .. '\n', false)
+  finally(function()
+    os.remove(file)
+  end)
+
+  clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+  command('set noignorecase nosmartcase regexpengine=2')
+  command('edit ' .. file)
+  eq(40000, fn.line('$'))
+
+  command("call setline(2, 'changed Zhanged')")
+  command('call cursor(2, 1)')
+  command('normal! rZ')
+  eq('Zhanged Zhanged', fn.getline(2))
+
+  command('vimgrep /Zhanged/j %')
+  local list = fn.getqflist()
+  eq(1, #list)
+  eq({ 2, 1, 8 }, { list[1].lnum, list[1].col, list[1].end_col })
+
+  command('vimgrep /Zhanged/gj %')
+  list = fn.getqflist()
+  eq(2, #list)
+  eq({ 2, 1, 8 }, { list[1].lnum, list[1].col, list[1].end_col })
+  eq({ 2, 9, 16 }, { list[2].lnum, list[2].col, list[2].end_col })
+
+  command('1vimgrep /Zhanged/gj %')
+  list = fn.getqflist()
+  eq(1, #list)
+  eq({ 2, 1, 8 }, { list[1].lnum, list[1].col, list[1].end_col })
+
+  command('vimgrep /after empty mmap line/gj %')
+  list = fn.getqflist()
+  eq(1, #list)
+  eq({ 1001, 1, 22 }, { list[1].lnum, list[1].col, list[1].end_col })
+
+  eq('Vim(vimgrep):E480: No match: definitely-missing-piece-text',
+    pcall_err(command, 'vimgrep /definitely-missing-piece-text/gj %'))
+
+  api.nvim_buf_set_text(0, 1000, 6, 1000, 6, { 'piece-' })
+  eq('after piece-empty mmap line', fn.getline(1001))
+  command('vimgrep /piece-empty/gj %')
+  list = fn.getqflist()
+  eq(1, #list)
+  eq({ 1001, 7, 18 }, { list[1].lnum, list[1].col, list[1].end_col })
+
+  for i = 1, 100 do
+    command(('call setline(%d, "fragmark avx %d")'):format(1500 + i * 100, i))
+  end
+
+  command('25vimgrep /fragmark/gj %')
+  list = fn.getqflist()
+  eq(25, #list)
+  eq({ 1600, 1, 9 }, { list[1].lnum, list[1].col, list[1].end_col })
+  eq({ 4000, 1, 9 }, { list[25].lnum, list[25].col, list[25].end_col })
+end)
+
 it(':vimgrep can specify Unicode pattern without delimiters', function()
   eq(
     'Vim(vimgrep):E480: No match: →',

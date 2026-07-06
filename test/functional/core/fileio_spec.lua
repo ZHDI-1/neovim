@@ -43,6 +43,9 @@ describe('fileio', function()
     os.remove('Xtest_startup_file2~')
     os.remove('Xtest_mmap_readfile')
     os.remove('Xtest_mmap_noeol')
+    os.remove('Xtest_mmap_empty_delete_written')
+    os.remove('Xtest_mmap_noeol_written')
+    os.remove('Xtest_mmap_written')
     os.remove('Xtest_тест.md')
     os.remove('Xtest-u8-int-max')
     os.remove('Xtest-overwrite-forced')
@@ -66,10 +69,48 @@ describe('fileio', function()
     return screen
   end
 
-  it('opens large UTF-8 files with mmap and materializes on edit', function()
+  it('opens large UTF-8 files with mmap and supports edits', function()
     local lines = {}
     for i = 1, 40000 do
       lines[i] = ('line%d ascii text for mmap smoke'):format(i)
+    end
+    lines[1000] = ''
+    lines[1001] = 'after empty mmap line'
+
+    local function line2byte(lnum)
+      local byte = 1
+      for i = 1, lnum - 1 do
+        byte = byte + #lines[i] + 1
+      end
+      return byte
+    end
+
+    local function replace_slice(line, start_col, end_col, replacement)
+      return line:sub(1, start_col) .. replacement .. line:sub(end_col + 1)
+    end
+
+    local function expect_mmap_piece(min_revision, text_size)
+      local stats = api.nvim__buf_stats(0)
+      eq(true, stats.mmap_active)
+      eq(true, stats.mmap_piece_tree)
+      ok(stats.mmap_piece_revision >= min_revision)
+      ok(stats.mmap_piece_write_fast_count >= 0)
+      ok(stats.mmap_piece_node_capacity >= stats.mmap_piece_nodes)
+      ok(stats.mmap_piece_node_capacity
+         >= stats.mmap_piece_nodes + stats.mmap_piece_free_nodes
+         + stats.mmap_piece_retired_nodes)
+      eq(0, stats.mmap_piece_retired_nodes)
+      if text_size == nil or text_size > 0 then
+        ok(stats.mmap_piece_nodes > 0)
+      end
+      if min_revision > 0 then
+        ok(stats.mmap_piece_add_cap >= stats.mmap_piece_add_len)
+        ok(stats.mmap_piece_add_len > 0)
+      end
+      if text_size ~= nil then
+        eq(text_size, stats.mmap_text_size)
+      end
+      return stats
     end
 
     write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
@@ -77,21 +118,290 @@ describe('fileio', function()
 
     clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
     command('edit Xtest_mmap_readfile')
+    expect_mmap_piece(0)
     eq(40000, fn.line('$'))
     eq(lines[1], fn.getline(1))
     eq(lines[40000], fn.getline(40000))
     eq(#lines[1] + 2, fn.line2byte(2))
+    eq('', fn.getline(1000))
+    eq(line2byte(1001), fn.line2byte(1001))
+    eq(1001, fn.byte2line(fn.line2byte(1001)))
     eq(40000, fn.byte2line(fn.line2byte(40000)))
 
     command("call setline(2, 'changed')")
+    lines[2] = 'changed'
+    expect_mmap_piece(1)
     eq('changed', fn.getline(2))
     eq(40000, fn.line('$'))
+    eq(line2byte(3), fn.line2byte(3))
+    eq(3, fn.byte2line(fn.line2byte(3)))
+
+    command('call cursor(2, 1)')
+    command('normal! rZ')
+    lines[2] = 'Zhanged'
+    expect_mmap_piece(1)
+    eq('Zhanged', fn.getline(2))
+    eq(line2byte(3), fn.line2byte(3))
+
+    command("call append(2, 'inserted')")
+    table.insert(lines, 3, 'inserted')
+    expect_mmap_piece(1)
+    eq(40001, fn.line('$'))
+    eq('inserted', fn.getline(3))
+    eq(line2byte(4), fn.line2byte(4))
+
+    command('3delete _')
+    table.remove(lines, 3)
+    expect_mmap_piece(1)
+    eq(40000, fn.line('$'))
+    eq(line2byte(3), fn.line2byte(3))
+
+    api.nvim_buf_set_lines(0, 3, 3, false, { 'api inserted' })
+    table.insert(lines, 4, 'api inserted')
+    expect_mmap_piece(1)
+    eq(40001, fn.line('$'))
+    eq('api inserted', fn.getline(4))
+    eq(line2byte(5), fn.line2byte(5))
+
+    api.nvim_buf_set_lines(0, 3, 4, false, {})
+    table.remove(lines, 4)
+    expect_mmap_piece(1)
+    eq(40000, fn.line('$'))
+    eq(line2byte(4), fn.line2byte(4))
+
+    api.nvim_buf_set_text(0, 4, 4, 4, 9, { 'TEXT' })
+    lines[5] = replace_slice(lines[5], 4, 9, 'TEXT')
+    expect_mmap_piece(1)
+    eq(lines[5], fn.getline(5))
+    eq(line2byte(6), fn.line2byte(6))
+
+    api.nvim_buf_set_text(0, 4, 4, 4, 4, { ' split-left', 'split-right ' })
+    local split_suffix = lines[5]:sub(5)
+    lines[5] = lines[5]:sub(1, 4) .. ' split-left'
+    table.insert(lines, 6, 'split-right ' .. split_suffix)
+    expect_mmap_piece(1)
+    eq(40001, fn.line('$'))
+    eq(lines[5], fn.getline(5))
+    eq(lines[6], fn.getline(6))
+    eq(line2byte(7), fn.line2byte(7))
+
+    api.nvim_buf_set_text(0, 4, 5, 5, 6, { 'JOIN' })
+    lines[5] = lines[5]:sub(1, 5) .. 'JOIN' .. lines[6]:sub(7)
+    table.remove(lines, 6)
+    expect_mmap_piece(1)
+    eq(40000, fn.line('$'))
+    eq(lines[5], fn.getline(5))
+    eq(line2byte(6), fn.line2byte(6))
+
+    command("call append('$', 'tail inserted')")
+    table.insert(lines, 'tail inserted')
+    local tail_stats = expect_mmap_piece(1)
+    local tail_nodes = tail_stats.mmap_piece_nodes
+    local tail_free_nodes = tail_stats.mmap_piece_free_nodes
+    eq(40001, fn.line('$'))
+    eq('tail inserted', fn.getline(40001))
+    eq(line2byte(40001), fn.line2byte(40001))
+
+    for i = 1, 5 do
+      local text = ('tail append run %d'):format(i)
+      command("call append('$', '" .. text .. "')")
+      table.insert(lines, text)
+      tail_stats = expect_mmap_piece(1)
+      eq(tail_nodes, tail_stats.mmap_piece_nodes)
+      eq(tail_free_nodes, tail_stats.mmap_piece_free_nodes)
+      eq(#lines, fn.line('$'))
+      eq(text, fn.getline(#lines))
+      eq(line2byte(#lines), fn.line2byte(#lines))
+    end
+
+    for _ = 1, 6 do
+      command('$delete _')
+      table.remove(lines)
+      expect_mmap_piece(1)
+    end
+    eq(40000, fn.line('$'))
+    eq(lines[40000], fn.getline(40000))
+
+    local write_stats = expect_mmap_piece(1)
+    command('write')
+    local written_stats = expect_mmap_piece(1)
+    eq(write_stats.mmap_piece_write_fast_count + 1,
+      written_stats.mmap_piece_write_fast_count)
+    matches('^line1 ascii text for mmap smoke\nZhanged\nline3 ascii text for mmap smoke',
+      read_file('Xtest_mmap_readfile'))
+
+    write_stats = written_stats
+    command('write Xtest_mmap_written')
+    written_stats = expect_mmap_piece(1)
+    eq(write_stats.mmap_piece_write_fast_count + 1,
+      written_stats.mmap_piece_write_fast_count)
+    matches('^line1 ascii text for mmap smoke\nZhanged\nline3 ascii text for mmap smoke',
+      read_file('Xtest_mmap_written'))
 
     command('edit! Xtest_mmap_noeol')
+    expect_mmap_piece(0)
     eq(40000, fn.line('$'))
     eq(0, fn.eval('&endofline'))
     eq(lines[40000], fn.getline(40000))
     eq(40000, fn.byte2line(fn.line2byte(40000)))
+
+    command("call append('$', 'tail without eol')")
+    expect_mmap_piece(1)
+    eq(40001, fn.line('$'))
+    eq('tail without eol', fn.getline(40001))
+    eq(0, fn.eval('&endofline'))
+    eq(40001, fn.byte2line(fn.line2byte(40001)))
+
+    command('setlocal nofixeol')
+    write_stats = expect_mmap_piece(1)
+    command('write Xtest_mmap_noeol_written')
+    written_stats = expect_mmap_piece(1)
+    eq(write_stats.mmap_piece_write_fast_count + 1,
+      written_stats.mmap_piece_write_fast_count)
+    local nofixeol_written = read_file('Xtest_mmap_noeol_written')
+    matches('\ntail without eol$', nofixeol_written)
+    eq(nil, nofixeol_written:match('\n$'))
+    command('setlocal fixeol')
+
+    command('%delete _')
+    expect_mmap_piece(1, 0)
+    eq(1, fn.line('$'))
+    eq('', fn.getline(1))
+
+    command("call setline(1, 'after empty mmap delete')")
+    expect_mmap_piece(1)
+    eq(1, fn.line('$'))
+    eq('after empty mmap delete', fn.getline(1))
+    write_stats = expect_mmap_piece(1)
+    command('write Xtest_mmap_empty_delete_written')
+    written_stats = expect_mmap_piece(1)
+    eq(write_stats.mmap_piece_write_fast_count + 1,
+      written_stats.mmap_piece_write_fast_count)
+    eq('after empty mmap delete\n', read_file('Xtest_mmap_empty_delete_written'))
+  end)
+
+  it('keeps mmap piece tree active across API text boundary edits', function()
+    local lines = {}
+    for i = 1, 45000 do
+      lines[i] = ('row%05d alpha beta gamma'):format(i)
+    end
+    lines[2] = 'abcde'
+    lines[3] = ''
+    lines[4] = 'vwxyz'
+    lines[22000] = 'middle-left|middle-right'
+
+    local function text_size()
+      local size = 0
+      for i = 1, #lines do
+        size = size + #lines[i] + 1
+      end
+      return size
+    end
+
+    local function line2byte(lnum)
+      local byte = 1
+      for i = 1, lnum - 1 do
+        byte = byte + #lines[i] + 1
+      end
+      return byte
+    end
+
+    local function slice_lines(start_lnum, end_lnum)
+      local out = {}
+      for i = start_lnum, end_lnum do
+        out[#out + 1] = lines[i]
+      end
+      return out
+    end
+
+    local function set_text_shadow(start_row, start_col, end_row, end_col, replacement)
+      local start_lnum = start_row + 1
+      local end_lnum = end_row + 1
+      local prefix = lines[start_lnum]:sub(1, start_col)
+      local suffix = lines[end_lnum]:sub(end_col + 1)
+      local new_lines = {}
+
+      if #replacement == 1 then
+        new_lines[1] = prefix .. replacement[1] .. suffix
+      else
+        new_lines[1] = prefix .. replacement[1]
+        for i = 2, #replacement - 1 do
+          new_lines[#new_lines + 1] = replacement[i]
+        end
+        new_lines[#new_lines + 1] = replacement[#replacement] .. suffix
+      end
+
+      for _ = start_lnum, end_lnum do
+        table.remove(lines, start_lnum)
+      end
+      for i = #new_lines, 1, -1 do
+        table.insert(lines, start_lnum, new_lines[i])
+      end
+    end
+
+    local function set_lines_shadow(start_row, end_row, replacement)
+      local start_lnum = start_row + 1
+      for _ = start_row + 1, end_row do
+        table.remove(lines, start_lnum)
+      end
+      for i = #replacement, 1, -1 do
+        table.insert(lines, start_lnum, replacement[i])
+      end
+    end
+
+    local function expect_mmap_shadow(min_revision)
+      local stats = api.nvim__buf_stats(0)
+      eq(true, stats.mmap_active)
+      eq(true, stats.mmap_piece_tree)
+      ok(stats.mmap_piece_revision >= min_revision)
+      ok(stats.mmap_piece_write_fast_count >= 0)
+      eq(text_size(), stats.mmap_text_size)
+      eq(#lines, fn.line('$'))
+      eq(slice_lines(1, 8), api.nvim_buf_get_lines(0, 0, 8, true))
+      eq(slice_lines(21998, 22002), api.nvim_buf_get_lines(0, 21997, 22002, true))
+
+      for _, lnum in ipairs({ 1, 2, 3, 4, 5, 8, 21998, 22000, 22002, #lines }) do
+        eq(lines[lnum], fn.getline(lnum))
+        eq(line2byte(lnum), fn.line2byte(lnum))
+        eq(lnum, fn.byte2line(fn.line2byte(lnum)))
+      end
+
+      return stats
+    end
+
+    local function apply_set_text(start_row, start_col, end_row, end_col, replacement)
+      api.nvim_buf_set_text(0, start_row, start_col, end_row, end_col, replacement)
+      set_text_shadow(start_row, start_col, end_row, end_col, replacement)
+      expect_mmap_shadow(1)
+    end
+
+    local function apply_set_lines(start_row, end_row, replacement)
+      api.nvim_buf_set_lines(0, start_row, end_row, false, replacement)
+      set_lines_shadow(start_row, end_row, replacement)
+      expect_mmap_shadow(1)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    expect_mmap_shadow(0)
+
+    apply_set_text(0, 0, 0, 0, { 'HEAD-' })
+    apply_set_text(0, 0, 0, 0, { 'new-first', '' })
+    apply_set_text(1, #lines[2], 1, #lines[2], { '', 'after-second' })
+    apply_set_text(2, #lines[3], 3, 0, { '' })
+    apply_set_text(4, 2, 6, 3, { 'left', 'inside', 'right' })
+    apply_set_text(21999, 6, 21999, 17, { 'CENTER' })
+    apply_set_lines(1, 3, { 'line-boundary-A', '', 'line-boundary-B' })
+    apply_set_lines(21998, 22001, { 'bulk-middle' })
+
+    local write_stats = expect_mmap_shadow(1)
+    command('write Xtest_mmap_written')
+    local written_stats = expect_mmap_shadow(1)
+    eq(write_stats.mmap_piece_write_fast_count + 1,
+      written_stats.mmap_piece_write_fast_count)
+    eq(table.concat(lines, '\n') .. '\n', read_file('Xtest_mmap_written'))
   end)
 
   it('opens large UTF-8 files with mmap while swapfile is enabled', function()
@@ -104,6 +414,9 @@ describe('fileio', function()
 
     clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir swapfile' } })
     command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
     eq(40000, fn.line('$'))
     eq(lines[1], fn.getline(1))
     eq(lines[40000], fn.getline(40000))
@@ -113,6 +426,12 @@ describe('fileio', function()
     ok(uv.fs_stat(swapname) ~= nil)
 
     command("call setline(2, 'changed with swap')")
+    stats = api.nvim__buf_stats(0)
+    eq(false, stats.mmap_active)
+    eq(false, stats.mmap_piece_tree)
+    eq(0, stats.mmap_piece_nodes)
+    eq(0, stats.mmap_piece_free_nodes)
+    eq(0, stats.mmap_piece_add_len)
     eq('changed with swap', fn.getline(2))
     eq(lines[40000], fn.getline(40000))
     eq(40000, fn.line('$'))

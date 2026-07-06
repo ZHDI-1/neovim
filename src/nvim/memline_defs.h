@@ -6,6 +6,11 @@
 #include "nvim/memfile_defs.h"
 #include "nvim/pos_defs.h"
 
+#ifndef NVIM_PIECE_TREE_TYPEDEF
+# define NVIM_PIECE_TREE_TYPEDEF
+typedef struct piece_tree PieceTree;
+#endif
+
 ///
 /// When searching for a specific line, we remember what blocks in the tree
 /// are the branches leading to that block. This is stored in ml_stack.  Each
@@ -78,6 +83,8 @@ typedef struct {
   size_t *ml_mmap_line_starts;  // byte offsets for sparse line-index blocks
   size_t ml_mmap_index_count;   // number of sparse line-index blocks
   bool ml_mmap_noeol;           // last line has no final EOL
+  PieceTree *ml_piece_tree;     // tree index/composition for mmap-backed text
+  uint64_t ml_mmap_piece_write_fast_count;  // successful direct piece-span writes
 
   bhdr_T *ml_locked;       // block used by last ml_get
   linenr_T ml_locked_low;       // first line in ml_locked

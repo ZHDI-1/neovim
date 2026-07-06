@@ -5628,7 +5628,11 @@ static bool vgr_match_buflines(qf_list_T *qfl, char *fname, buf_T *buf, char *sp
                                         &matches, &match_count)) {
       for (size_t i = 0; i < match_count && *tomatch > 0 && !got_int; i++) {
         const mmap_literal_match_T match = matches[i];
-        char *str = xmemdupz(buf->b_ml.ml_mmap_base + match.line_start, match.line_len);
+        char *str = ml_get_buf_mmap_literal_match_line(buf, match);
+        if (str == NULL) {
+          got_int = true;
+          break;
+        }
         const colnr_T end_col = match.col + (colnr_T)pat_len;
         if (qf_add_entry_impl(qfl,
                               NULL,   // dir

@@ -43,6 +43,7 @@
 #include "nvim/os/input.h"
 #include "nvim/os/os_defs.h"
 #include "nvim/path.h"
+#include "nvim/piece_tree.h"
 #include "nvim/pos_defs.h"
 #include "nvim/sha256.h"
 #include "nvim/strings.h"
@@ -302,6 +303,120 @@ static int buf_write_bytes(struct bw_info *ip)
   }
 
   return OK;
+}
+
+static int buf_write_raw_bytes(int fd, const char *data, size_t len, off_T *ncharsp)
+  FUNC_ATTR_NONNULL_ARG(2, 4)
+{
+  enum { kRawWriteChunk = 16 * 1024 * 1024 };
+
+  while (len > 0) {
+    const size_t todo = MIN(len, (size_t)kRawWriteChunk);
+    const ssize_t written = write_eintr(fd, (void *)data, todo);
+    if (written < 0 || (size_t)written != todo) {
+      return FAIL;
+    }
+
+    *ncharsp += (off_T)todo;
+    data += todo;
+    len -= todo;
+
+    os_breakcheck();
+    if (got_int) {
+      return FAIL;
+    }
+  }
+
+  return OK;
+}
+
+static bool buf_write_span_vec_ends_in_nl(const PieceTreeSpanVec *span_vec)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (span_vec->byte_len == 0) {
+    return false;
+  }
+
+  for (size_t i = span_vec->count; i > 0; i--) {
+    const PieceTreeSpan *span = &span_vec->items[i - 1];
+    if (span->len > 0) {
+      return span->data[span->len - 1] == NL;
+    }
+  }
+
+  return false;
+}
+
+static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, bool write_final_eol,
+                                    bool *no_eolp, off_T *ncharsp)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (ip->bw_fd < 0 || ip->bw_len != 0 || buf->b_ml.ml_piece_tree == NULL) {
+    return NOTDONE;
+  }
+  if (!ml_buf_flush_mmap_piece_tree(buf) || buf->b_ml.ml_piece_tree == NULL) {
+    return NOTDONE;
+  }
+
+  PieceTree *tree = buf->b_ml.ml_piece_tree;
+  PieceTreeSnapshot snapshot = { 0 };
+  if (!piece_tree_snapshot(tree, &snapshot)
+      || snapshot.line_count != (size_t)buf->b_ml.ml_line_count) {
+    return NOTDONE;
+  }
+
+  PieceTreeSpanVec span_vec = { 0 };
+  if (!piece_tree_collect_span_vec_at_revision(tree, 0, snapshot.byte_len, snapshot.revision,
+                                               &span_vec)) {
+    return NOTDONE;
+  }
+
+  int ret = OK;
+  for (size_t i = 0; i < span_vec.count; i++) {
+    const PieceTreeSpan *span = &span_vec.items[i];
+    if (span->len == 0) {
+      continue;
+    }
+    if (buf_write_raw_bytes(ip->bw_fd, span->data, span->len, ncharsp) == FAIL) {
+      ret = FAIL;
+      break;
+    }
+  }
+
+  if (ret == OK && !buf_write_span_vec_ends_in_nl(&span_vec)) {
+    if (write_final_eol) {
+      ret = buf_write_raw_bytes(ip->bw_fd, "\n", 1, ncharsp);
+    } else {
+      *no_eolp = true;
+    }
+  }
+
+  piece_tree_span_vec_clear(&span_vec);
+  if (ret == OK) {
+    ml_buf_mmap_piece_write_fast_record(buf);
+  }
+  return ret;
+}
+
+static bool buf_write_mmap_source_can_stream(buf_T *buf, bool newfile, bool device,
+                                             bool backup_copy, const char *backup,
+                                             const FileInfo *file_info_old)
+  FUNC_ATTR_NONNULL_ARG(1, 6) FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (newfile || device) {
+    return true;
+  }
+  if (!buf->file_id_valid) {
+    return false;
+  }
+
+  FileID output_file_id;
+  os_fileinfo_id(file_info_old, &output_file_id);
+  if (!os_fileid_equal(&buf->file_id, &output_file_id)) {
+    return true;
+  }
+
+  return backup != NULL && !backup_copy;
 }
 
 /// Check modification time of file, before writing to it.
@@ -1156,6 +1271,8 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
       goto fail;
     }
   }
+  const bool mmap_source_can_stream =
+    buf_write_mmap_source_can_stream(buf, newfile, device, backup_copy, backup, &file_info_old);
 
 #ifdef UNIX
   bool made_writable = false;  // 'w' bit has been set
@@ -1275,7 +1392,7 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
   }
 
   bool no_eol = false;  // no end-of-line written
-  int nchars;
+  off_T nchars;
   linenr_T lnum;
   int fileformat;
   bool checking_conversion;
@@ -1432,6 +1549,34 @@ restore_backup:
     write_info.bw_len = 0;
     write_info.bw_flags = wb_flags;
     fileformat = get_fileformat_force(buf, eap);
+
+    if (end > 0
+        && !checking_conversion
+        && whole
+        && !append
+        && !filtering
+        && !write_bin
+        && !write_undo_file
+        && !converted
+        && wb_flags == 0
+        && write_info.bw_iconv_fd == (iconv_t)-1
+        && write_info.bw_len == 0
+        && fileformat == EOL_UNIX
+        && !buf->b_p_eof
+        && mmap_source_can_stream
+        && ml_buf_has_mmap_piece_tree(buf)) {
+      const bool write_final_eol = buf->b_p_fixeol || buf->b_p_eol;
+      const int mmap_write_ret =
+        buf_write_mmap_piece_raw(buf, &write_info, write_final_eol, &no_eol, &nchars);
+      if (mmap_write_ret == OK) {
+        lnum = end + 1;
+        goto write_loop_done;
+      } else if (mmap_write_ret == FAIL) {
+        end = 0;
+        goto write_loop_done;
+      }
+    }
+
     char *s = buffer;
     for (lnum = start; lnum <= end; lnum++) {
       // The next while loop is done once for each character written.
@@ -1510,6 +1655,7 @@ restore_backup:
       nchars += remaining - write_info.bw_len;
     }
 
+write_loop_done:
     // Did we convert & write everything?
     if (end != 0 && write_info.bw_len > 0) {
       write_info.bw_conv_error = true;

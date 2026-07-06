@@ -107,6 +107,7 @@
 #include "nvim/os/time.h"
 #include "nvim/os/time_defs.h"
 #include "nvim/path.h"
+#include "nvim/piece_tree.h"
 #include "nvim/pos_defs.h"
 #include "nvim/spell.h"
 #include "nvim/statusline.h"
@@ -296,6 +297,9 @@ enum {
   ML_MMAP_PARALLEL_MATCH_MIN_SIZE = 128 * 1024 * 1024,
   ML_MMAP_PARALLEL_MATCH_MAX_THREADS = 32,
   ML_MMAP_PARALLEL_MATCH_LIMIT = 1024 * 1024,
+  ML_MMAP_PARALLEL_MATCH_MIN_MATCHES = 4096,
+  ML_MMAP_PARALLEL_MATCH_STOP_LIMIT = 64 * 1024,
+  ML_MMAP_PIECE_LITERAL_PREFILTER_MAX_PAT = 4096,
 };
 
 typedef enum {
@@ -317,8 +321,29 @@ typedef struct {
   size_t match_count;
   size_t match_capacity;
   size_t match_limit;
+  bool stop_at_limit;
+  bool stopped;
   bool overflow;
 } ml_mmap_literal_match_job_T;
+
+typedef struct {
+  ml_mmap_literal_match_job_T *job;
+  const size_t *prefix;
+  size_t matched;
+  size_t logical_offset;
+  linenr_T lnum;
+  size_t line_start;
+  colnr_T *line_match_cols;
+  size_t line_match_count;
+  size_t line_match_capacity;
+} ml_mmap_piece_literal_line_match_ctx_T;
+
+typedef struct {
+  ml_mmap_literal_match_job_T job;
+  const size_t *prefix;
+  PieceTreeSpanVec span_vec;
+  bool ok;
+} ml_mmap_piece_literal_match_job_T;
 
 #include "memline.c.generated.h"
 
@@ -351,6 +376,44 @@ static inline bool ml_mmap_is_active(const buf_T *buf)
   return buf->b_ml.ml_mmap_base != NULL;
 }
 
+static size_t ml_mmap_text_size(const buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf->b_ml.ml_piece_tree == NULL
+         ? buf->b_ml.ml_mmap_size
+         : piece_tree_byte_len(buf->b_ml.ml_piece_tree);
+}
+
+static bool ml_mmap_is_pristine(const buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf)
+         && (buf->b_ml.ml_piece_tree == NULL || buf->b_ml.ml_piece_tree->revision == 0);
+}
+
+static bool ml_mmap_can_edit_tree(const buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf)
+         && buf->b_ml.ml_piece_tree != NULL
+         && buf->b_ml.ml_mfp != NULL
+         && buf->b_ml.ml_mfp->mf_fd < 0;
+}
+
+static void ml_mmap_update_noeol(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  const size_t len = ml_mmap_text_size(buf);
+  if (len == 0 || buf->b_ml.ml_piece_tree == NULL) {
+    buf->b_ml.ml_mmap_noeol = false;
+    return;
+  }
+
+  char last = NUL;
+  buf->b_ml.ml_mmap_noeol =
+    piece_tree_byte_at(buf->b_ml.ml_piece_tree, len - 1, &last) && last != NL;
+}
+
 static void ml_mmap_clear_cache(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
@@ -363,9 +426,21 @@ static void ml_mmap_clear_cache(buf_T *buf)
   buf->b_ml.ml_line_offset = 0;
 }
 
+static void ml_mmap_clear_piece_tree(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (buf->b_ml.ml_piece_tree == NULL) {
+    return;
+  }
+
+  piece_tree_clear(buf->b_ml.ml_piece_tree);
+  XFREE_CLEAR(buf->b_ml.ml_piece_tree);
+}
+
 static void ml_mmap_close(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
+  ml_mmap_clear_piece_tree(buf);
   if (buf->b_ml.ml_mmap_base != NULL) {
 #ifdef UNIX
     munmap(buf->b_ml.ml_mmap_base, buf->b_ml.ml_mmap_size);
@@ -376,6 +451,7 @@ static void ml_mmap_close(buf_T *buf)
   XFREE_CLEAR(buf->b_ml.ml_mmap_line_starts);
   buf->b_ml.ml_mmap_index_count = 0;
   buf->b_ml.ml_mmap_noeol = false;
+  buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   ml_mmap_clear_cache(buf);
 }
 
@@ -388,6 +464,14 @@ static inline size_t ml_mmap_index_for_lnum(linenr_T lnum)
 static size_t ml_mmap_line_start_offset(const buf_T *buf, linenr_T lnum)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
 {
+  if (buf->b_ml.ml_piece_tree != NULL) {
+    size_t offset = 0;
+    if (piece_tree_line_start(buf->b_ml.ml_piece_tree, (size_t)lnum, &offset)) {
+      return offset;
+    }
+    return ml_mmap_text_size(buf);
+  }
+
   const size_t index = ml_mmap_index_for_lnum(lnum);
   linenr_T cur_lnum = (linenr_T)(index * ML_MMAP_INDEX_STRIDE) + 1;
   size_t offset = buf->b_ml.ml_mmap_line_starts[index];
@@ -407,6 +491,11 @@ static size_t ml_mmap_line_start_offset(const buf_T *buf, linenr_T lnum)
 static void ml_mmap_line_bounds(const buf_T *buf, linenr_T lnum, size_t *startp, size_t *endp)
   FUNC_ATTR_NONNULL_ALL
 {
+  if (buf->b_ml.ml_piece_tree != NULL
+      && piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)lnum, startp, endp)) {
+    return;
+  }
+
   const size_t start = ml_mmap_line_start_offset(buf, lnum);
   const char *nl = memchr(buf->b_ml.ml_mmap_base + start, NL, buf->b_ml.ml_mmap_size - start);
 
@@ -418,8 +507,18 @@ static linenr_T ml_mmap_lnum_for_offset(const buf_T *buf, size_t offset, size_t 
                                         size_t *endp)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
 {
-  if (offset >= buf->b_ml.ml_mmap_size || buf->b_ml.ml_mmap_index_count == 0) {
+  if (offset >= ml_mmap_text_size(buf) || buf->b_ml.ml_mmap_index_count == 0) {
     return 0;
+  }
+
+  if (buf->b_ml.ml_piece_tree != NULL) {
+    size_t lnum = 0;
+    if (!piece_tree_lnum_for_offset(buf->b_ml.ml_piece_tree, offset, &lnum, startp)
+        || lnum == 0 || lnum > (size_t)buf->b_ml.ml_line_count
+        || !piece_tree_line_bounds(buf->b_ml.ml_piece_tree, lnum, startp, endp)) {
+      return 0;
+    }
+    return (linenr_T)lnum;
   }
 
   size_t low = 0;
@@ -465,6 +564,7 @@ static int ml_mmap_materialize(buf_T *buf)
   char *base = buf->b_ml.ml_mmap_base;
   const size_t size = buf->b_ml.ml_mmap_size;
   size_t *starts = buf->b_ml.ml_mmap_line_starts;
+  PieceTree *piece_tree = buf->b_ml.ml_piece_tree;
   const linenr_T line_count = buf->b_ml.ml_line_count;
 
   ml_mmap_clear_cache(buf);
@@ -473,6 +573,8 @@ static int ml_mmap_materialize(buf_T *buf)
   buf->b_ml.ml_mmap_line_starts = NULL;
   buf->b_ml.ml_mmap_index_count = 0;
   buf->b_ml.ml_mmap_noeol = false;
+  buf->b_ml.ml_mmap_piece_write_fast_count = 0;
+  buf->b_ml.ml_piece_tree = NULL;
 
   XFREE_CLEAR(buf->b_ml.ml_chunksize);
   buf->b_ml.ml_numchunks = 0;
@@ -487,12 +589,31 @@ static int ml_mmap_materialize(buf_T *buf)
   char *line_start = base;
   char *const file_end = base + size;
   for (linenr_T lnum = 1; lnum <= line_count; lnum++) {
-    char *line_end = memchr(line_start, NL, (size_t)(file_end - line_start));
-    if (line_end == NULL) {
-      line_end = file_end;
+    size_t len = 0;
+    char *line = NULL;
+    if (piece_tree != NULL) {
+      size_t start = 0;
+      size_t end = 0;
+      if (!piece_tree_line_bounds(piece_tree, (size_t)lnum, &start, &end)) {
+        ret = FAIL;
+        break;
+      }
+      len = end - start;
+      line = xmallocz(len);
+      if (piece_tree_read(piece_tree, start, line, len) != len) {
+        xfree(line);
+        ret = FAIL;
+        break;
+      }
+    } else {
+      char *line_end = memchr(line_start, NL, (size_t)(file_end - line_start));
+      if (line_end == NULL) {
+        line_end = file_end;
+      }
+      len = (size_t)(line_end - line_start);
+      line = xmemdupz(line_start, len);
+      line_start = line_end < file_end ? line_end + 1 : line_end;
     }
-    const size_t len = (size_t)(line_end - line_start);
-    char *line = xmemdupz(line_start, len);
 
     if (lnum == 1) {
       ret = ml_replace_buf_len(buf, 1, line, len, false, false);
@@ -503,15 +624,255 @@ static int ml_mmap_materialize(buf_T *buf)
     if (ret == FAIL) {
       break;
     }
-    line_start = line_end < file_end ? line_end + 1 : line_end;
   }
   ml_flush_line(buf, false);
+  if (piece_tree != NULL) {
+    piece_tree_clear(piece_tree);
+    xfree(piece_tree);
+  }
 
 #ifdef UNIX
   munmap(base, size);
 #endif
   xfree(starts);
   return ret;
+}
+
+static int ml_mmap_replace_line(buf_T *buf, linenr_T lnum, char *line, size_t len, bool copy,
+                                bool noalloc)
+  FUNC_ATTR_NONNULL_ARG(1, 3)
+{
+  if (!ml_mmap_can_edit_tree(buf) || memchr(line, NL, len) != NULL) {
+    return NOTDONE;
+  }
+  if (lnum < 1 || lnum > buf->b_ml.ml_line_count) {
+    return FAIL;
+  }
+
+  if (kv_size(buf->update_callbacks)) {
+    ml_add_deleted_len_buf(buf, ml_get_buf(buf, lnum), -1);
+  }
+
+  size_t start = 0;
+  size_t end = 0;
+  if (!piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)lnum, &start, &end)
+      || !piece_tree_replace(buf->b_ml.ml_piece_tree, start, end - start, line, len)) {
+    ml_mmap_clear_cache(buf);
+    return FAIL;
+  }
+
+  if (!copy && !noalloc) {
+    xfree(line);
+  }
+  ml_mmap_update_noeol(buf);
+  ml_mmap_clear_cache(buf);
+  buf->b_ml.ml_flags &= ~ML_EMPTY;
+  ml_upd_lastbuf = NULL;
+  return OK;
+}
+
+static int ml_mmap_append_line(buf_T *buf, linenr_T lnum, char *line, colnr_T len)
+  FUNC_ATTR_NONNULL_ARG(1)
+{
+  if (!ml_mmap_can_edit_tree(buf) || line == NULL || lnum < 0
+      || lnum > buf->b_ml.ml_line_count) {
+    return NOTDONE;
+  }
+
+  if (len < 0) {
+    return NOTDONE;
+  }
+  const size_t text_len = len == 0 ? strlen(line) : (size_t)len - 1;
+  if (memchr(line, NL, text_len) != NULL) {
+    return NOTDONE;
+  }
+
+  size_t offset = 0;
+  bool add_leading_nl = false;
+  bool add_trailing_nl = false;
+  const linenr_T line_count = buf->b_ml.ml_line_count;
+  const size_t total = ml_mmap_text_size(buf);
+
+  if (lnum == 0) {
+    offset = 0;
+    add_trailing_nl = line_count > 0;
+  } else if (lnum < line_count) {
+    if (!piece_tree_line_start(buf->b_ml.ml_piece_tree, (size_t)lnum + 1, &offset)) {
+      return FAIL;
+    }
+    add_trailing_nl = true;
+  } else {
+    offset = total;
+    if (total > 0) {
+      char last = NUL;
+      if (!piece_tree_byte_at(buf->b_ml.ml_piece_tree, total - 1, &last)) {
+        return FAIL;
+      }
+      if (text_len == 0 && last != NL) {
+        return NOTDONE;
+      }
+      add_leading_nl = last != NL;
+      add_trailing_nl = last == NL;
+    }
+  }
+
+  const size_t insert_len = text_len + (add_leading_nl ? 1 : 0) + (add_trailing_nl ? 1 : 0);
+  if (insert_len == 0) {
+    return NOTDONE;
+  }
+  char *insert = xmalloc(insert_len);
+  size_t pos = 0;
+  if (add_leading_nl) {
+    insert[pos++] = NL;
+  }
+  memcpy(insert + pos, line, text_len);
+  pos += text_len;
+  if (add_trailing_nl) {
+    insert[pos++] = NL;
+  }
+  assert(pos == insert_len);
+
+  const bool ok = piece_tree_insert(buf->b_ml.ml_piece_tree, offset, insert, insert_len);
+  xfree(insert);
+  if (!ok) {
+    ml_mmap_clear_cache(buf);
+    return FAIL;
+  }
+
+  if (buf->b_prev_line_count == 0) {
+    buf->b_prev_line_count = buf->b_ml.ml_line_count;
+  }
+  buf->b_ml.ml_line_count++;
+  ml_mmap_update_noeol(buf);
+  ml_mmap_clear_cache(buf);
+  buf->b_ml.ml_flags &= ~ML_EMPTY;
+  ml_upd_lastbuf = NULL;
+  return OK;
+}
+
+static int ml_mmap_delete_line(buf_T *buf, linenr_T lnum, bool message)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (!ml_mmap_can_edit_tree(buf)) {
+    return NOTDONE;
+  }
+  if (lnum < 1 || lnum > buf->b_ml.ml_line_count) {
+    return FAIL;
+  }
+
+  if (lowest_marked && lowest_marked > lnum) {
+    lowest_marked--;
+  }
+
+  char *deleted = ml_get_buf(buf, lnum);
+  ml_add_deleted_len_buf(buf, deleted, -1);
+
+  if (buf->b_ml.ml_line_count == 1) {
+    if (message) {
+      set_keep_msg(_(no_lines_msg), 0);
+    }
+
+    if (!piece_tree_replace(buf->b_ml.ml_piece_tree, 0, ml_mmap_text_size(buf), "", 0)) {
+      ml_mmap_clear_cache(buf);
+      return FAIL;
+    }
+
+    ml_mmap_update_noeol(buf);
+    ml_mmap_clear_cache(buf);
+    buf->b_ml.ml_flags |= ML_EMPTY;
+    ml_upd_lastbuf = NULL;
+    return OK;
+  }
+
+  size_t start = 0;
+  size_t end = 0;
+  size_t delete_start = 0;
+  size_t delete_len = 0;
+  const linenr_T line_count = buf->b_ml.ml_line_count;
+  const size_t total = ml_mmap_text_size(buf);
+
+  if (!piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)lnum, &start, &end)) {
+    ml_mmap_clear_cache(buf);
+    return FAIL;
+  }
+
+  if (lnum < line_count) {
+    size_t next_start = 0;
+    if (!piece_tree_line_start(buf->b_ml.ml_piece_tree, (size_t)lnum + 1, &next_start)) {
+      ml_mmap_clear_cache(buf);
+      return FAIL;
+    }
+    delete_start = start;
+    delete_len = next_start - start;
+  } else {
+    char last = NUL;
+    if (total == 0 || !piece_tree_byte_at(buf->b_ml.ml_piece_tree, total - 1, &last)) {
+      ml_mmap_clear_cache(buf);
+      return FAIL;
+    }
+    if (last == NL) {
+      delete_start = start;
+      delete_len = total - start;
+    } else {
+      size_t prev_start = 0;
+      size_t prev_end = 0;
+      if (!piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)lnum - 1, &prev_start,
+                                  &prev_end)) {
+        ml_mmap_clear_cache(buf);
+        return FAIL;
+      }
+      delete_start = prev_end;
+      delete_len = total - prev_end;
+    }
+  }
+
+  if (!piece_tree_delete(buf->b_ml.ml_piece_tree, delete_start, delete_len)) {
+    ml_mmap_clear_cache(buf);
+    return FAIL;
+  }
+
+  if (buf->b_prev_line_count == 0) {
+    buf->b_prev_line_count = buf->b_ml.ml_line_count;
+  }
+  buf->b_ml.ml_line_count--;
+  ml_mmap_update_noeol(buf);
+  ml_mmap_clear_cache(buf);
+  ml_upd_lastbuf = NULL;
+  return OK;
+}
+
+static bool ml_mmap_flush_dirty_line(buf_T *buf, bool noalloc)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (!ml_mmap_can_edit_tree(buf) || buf->b_ml.ml_line_lnum < 1
+      || buf->b_ml.ml_line_lnum > buf->b_ml.ml_line_count
+      || buf->b_ml.ml_line_textlen < 1) {
+    return false;
+  }
+
+  const size_t len = (size_t)buf->b_ml.ml_line_textlen - 1;
+  char *line = buf->b_ml.ml_line_ptr;
+  if (memchr(line, NL, len) != NULL) {
+    return false;
+  }
+
+  size_t start = 0;
+  size_t end = 0;
+  if (!piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)buf->b_ml.ml_line_lnum, &start,
+                              &end)
+      || !piece_tree_replace(buf->b_ml.ml_piece_tree, start, end - start, line, len)) {
+    return false;
+  }
+
+  if (!noalloc) {
+    xfree(line);
+  }
+  ml_mmap_update_noeol(buf);
+  buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
+  buf->b_ml.ml_line_lnum = 0;
+  buf->b_ml.ml_line_offset = 0;
+  ml_upd_lastbuf = NULL;
+  return true;
 }
 
 /// Install an mmap-backed read-only memline representation.
@@ -531,16 +892,22 @@ int ml_set_mmap_lines(buf_T *buf, char *base, size_t size, size_t *line_starts,
       || !(buf->b_ml.ml_flags & ML_EMPTY)
       || index_count != expected_index_count
       || line_count < 1
-      || ml_mmap_is_active(buf)) {
+      || ml_mmap_is_active(buf)
+      || buf->b_ml.ml_piece_tree != NULL) {
     return FAIL;
   }
 
   ml_flush_line(buf, false);
+  const size_t newline_count = (size_t)line_count - (noeol ? 1 : 0);
+  buf->b_ml.ml_piece_tree = xmalloc(sizeof *buf->b_ml.ml_piece_tree);
+  piece_tree_init_with_line_index(buf->b_ml.ml_piece_tree, base, size, line_starts, index_count,
+                                  ML_MMAP_INDEX_STRIDE, newline_count);
   buf->b_ml.ml_mmap_base = base;
   buf->b_ml.ml_mmap_size = size;
   buf->b_ml.ml_mmap_line_starts = line_starts;
   buf->b_ml.ml_mmap_index_count = index_count;
   buf->b_ml.ml_mmap_noeol = noeol;
+  buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_line_count = line_count;
   buf->b_ml.ml_flags &= ~ML_EMPTY;
   ml_upd_lastbuf = NULL;
@@ -550,7 +917,95 @@ int ml_set_mmap_lines(buf_T *buf, char *base, size_t size, size_t *line_starts,
 bool ml_buf_has_mmap_lines(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
+  return ml_mmap_is_active(buf)
+         && (ml_mmap_is_pristine(buf) || buf->b_ml.ml_piece_tree != NULL);
+}
+
+bool ml_buf_has_mmap_storage(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
   return ml_mmap_is_active(buf);
+}
+
+bool ml_buf_has_mmap_piece_tree(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) && buf->b_ml.ml_piece_tree != NULL;
+}
+
+bool ml_buf_flush_mmap_piece_tree(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL) {
+    return false;
+  }
+
+  ml_flush_line(buf, false);
+  return ml_mmap_is_active(buf) && buf->b_ml.ml_piece_tree != NULL;
+}
+
+void ml_buf_mmap_piece_write_fast_record(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (ml_mmap_is_active(buf) && buf->b_ml.ml_piece_tree != NULL) {
+    buf->b_ml.ml_mmap_piece_write_fast_count++;
+  }
+}
+
+uint64_t ml_buf_mmap_piece_write_fast_count(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) ? buf->b_ml.ml_mmap_piece_write_fast_count : 0;
+}
+
+uint64_t ml_buf_mmap_piece_revision(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf->b_ml.ml_piece_tree == NULL ? 0 : buf->b_ml.ml_piece_tree->revision;
+}
+
+size_t ml_buf_mmap_text_size(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) ? ml_mmap_text_size(buf) : 0;
+}
+
+size_t ml_buf_mmap_piece_node_count(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf->b_ml.ml_piece_tree == NULL ? 0 : piece_tree_node_count(buf->b_ml.ml_piece_tree);
+}
+
+size_t ml_buf_mmap_piece_node_capacity(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf->b_ml.ml_piece_tree == NULL ? 0 : piece_tree_node_capacity(buf->b_ml.ml_piece_tree);
+}
+
+size_t ml_buf_mmap_piece_free_node_count(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf->b_ml.ml_piece_tree == NULL ? 0
+                                         : piece_tree_free_node_count(buf->b_ml.ml_piece_tree);
+}
+
+size_t ml_buf_mmap_piece_retired_node_count(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf->b_ml.ml_piece_tree == NULL ? 0
+                                         : piece_tree_retired_node_count(buf->b_ml.ml_piece_tree);
+}
+
+size_t ml_buf_mmap_piece_add_len(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf->b_ml.ml_piece_tree == NULL ? 0 : buf->b_ml.ml_piece_tree->add_len;
+}
+
+size_t ml_buf_mmap_piece_add_cap(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf->b_ml.ml_piece_tree == NULL ? 0 : buf->b_ml.ml_piece_tree->add_cap;
 }
 
 static const char *ml_mmap_find_literal_avx512bw(const char *text, size_t text_len,
@@ -877,11 +1332,26 @@ static size_t ml_mmap_count_newlines_with_scan(const char *text, size_t text_len
   return ml_mmap_count_newlines_scalar(text, text_len, last_nlp);
 }
 
+static ml_mmap_nl_scan_T ml_mmap_best_nl_scan(void)
+{
+  if (ml_mmap_can_use_avx512bw()) {
+    return kMlMmapNlScanAvx512bw;
+  }
+  if (ml_mmap_can_use_avx2()) {
+    return kMlMmapNlScanAvx2;
+  }
+  return kMlMmapNlScanScalar;
+}
+
 static bool ml_mmap_literal_match_append(ml_mmap_literal_match_job_T *job,
                                          mmap_literal_match_T match)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
 {
   if (job->match_count >= job->match_limit) {
+    if (job->stop_at_limit) {
+      job->stopped = true;
+      return false;
+    }
     job->overflow = true;
     return false;
   }
@@ -894,6 +1364,491 @@ static bool ml_mmap_literal_match_append(ml_mmap_literal_match_job_T *job,
   }
 
   job->matches[job->match_count++] = match;
+  if (job->stop_at_limit && job->match_count >= job->match_limit) {
+    job->stopped = true;
+    return false;
+  }
+  return true;
+}
+
+static size_t *ml_mmap_build_prefix_table(const char *pat, size_t pat_len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (pat_len > SIZE_MAX / sizeof(size_t)) {
+    return NULL;
+  }
+
+  size_t *prefix = xmalloc(sizeof(*prefix) * pat_len);
+  prefix[0] = 0;
+  for (size_t i = 1, matched = 0; i < pat_len; i++) {
+    while (matched > 0 && pat[i] != pat[matched]) {
+      matched = prefix[matched - 1];
+    }
+    if (pat[i] == pat[matched]) {
+      matched++;
+    }
+    prefix[i] = matched;
+  }
+  return prefix;
+}
+
+static bool ml_mmap_piece_literal_record_match(ml_mmap_piece_literal_line_match_ctx_T *ctx,
+                                               size_t match_offset)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  ml_mmap_literal_match_job_T *job = ctx->job;
+
+  if (!job->global && ctx->line_match_count > 0) {
+    return true;
+  }
+  if (match_offset < ctx->line_start || match_offset - ctx->line_start > MAXCOL) {
+    return true;
+  }
+
+  if (ctx->line_match_count == ctx->line_match_capacity) {
+    size_t new_capacity = ctx->line_match_capacity == 0 ? 4 : ctx->line_match_capacity * 2;
+    ctx->line_match_cols = xrealloc(ctx->line_match_cols,
+                                    new_capacity * sizeof *ctx->line_match_cols);
+    ctx->line_match_capacity = new_capacity;
+  }
+
+  ctx->line_match_cols[ctx->line_match_count++] = (colnr_T)(match_offset - ctx->line_start);
+  return true;
+}
+
+static bool ml_mmap_piece_literal_flush_line(ml_mmap_piece_literal_line_match_ctx_T *ctx,
+                                             size_t line_end)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (line_end < ctx->line_start) {
+    return false;
+  }
+
+  const size_t line_len = line_end - ctx->line_start;
+  for (size_t i = 0; i < ctx->line_match_count; i++) {
+    mmap_literal_match_T item = {
+      .lnum = ctx->lnum,
+      .col = ctx->line_match_cols[i],
+      .line_start = ctx->line_start,
+      .line_len = line_len,
+    };
+    if (!ml_mmap_literal_match_append(ctx->job, item)) {
+      return false;
+    }
+  }
+  ctx->line_match_count = 0;
+  return true;
+}
+
+static void ml_mmap_piece_literal_update_carry(char *carry, size_t carry_cap,
+                                               size_t *carry_lenp, const char *data,
+                                               size_t len)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (len >= carry_cap) {
+    memcpy(carry, data + len - carry_cap, carry_cap);
+    *carry_lenp = carry_cap;
+  } else if (*carry_lenp + len <= carry_cap) {
+    memcpy(carry + *carry_lenp, data, len);
+    *carry_lenp += len;
+  } else {
+    const size_t keep_from_carry = carry_cap - len;
+    memmove(carry, carry + *carry_lenp - keep_from_carry, keep_from_carry);
+    memcpy(carry + keep_from_carry, data, len);
+    *carry_lenp = carry_cap;
+  }
+}
+
+static bool ml_mmap_piece_literal_spans_may_match(const PieceTreeSpan *spans, size_t span_count,
+                                                  const char *pat, size_t pat_len)
+  FUNC_ATTR_NONNULL_ARG(1, 3) FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (pat_len == 0) {
+    return true;
+  }
+
+  if (pat_len == 1) {
+    for (size_t i = 0; i < span_count; i++) {
+      if (memchr(spans[i].data, (uint8_t)pat[0], spans[i].len) != NULL) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (pat_len > ML_MMAP_PIECE_LITERAL_PREFILTER_MAX_PAT) {
+    return true;
+  }
+
+  const size_t carry_cap = pat_len - 1;
+  char *carry = xmalloc(carry_cap);
+  char *window = xmalloc(carry_cap * 2);
+  size_t carry_len = 0;
+  bool found = false;
+
+  for (size_t i = 0; i < span_count && !found; i++) {
+    const char *data = spans[i].data;
+    const size_t len = spans[i].len;
+    if (len == 0) {
+      continue;
+    }
+
+    if (len >= pat_len && ml_mmap_find_literal(data, len, pat, pat_len) != NULL) {
+      found = true;
+      break;
+    }
+
+    if (carry_len > 0) {
+      const size_t head_len = MIN(len, carry_cap);
+      memcpy(window, carry, carry_len);
+      memcpy(window + carry_len, data, head_len);
+      if (ml_mmap_find_literal(window, carry_len + head_len, pat, pat_len) != NULL) {
+        found = true;
+        break;
+      }
+    }
+
+    ml_mmap_piece_literal_update_carry(carry, carry_cap, &carry_len, data, len);
+  }
+
+  xfree(window);
+  xfree(carry);
+  return found;
+}
+
+static bool ml_mmap_piece_literal_spans_have_boundary_match(const PieceTreeSpan *spans,
+                                                            size_t span_count,
+                                                            const char *pat, size_t pat_len)
+  FUNC_ATTR_NONNULL_ARG(1, 3) FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (pat_len <= 1) {
+    return false;
+  }
+  if (pat_len > ML_MMAP_PIECE_LITERAL_PREFILTER_MAX_PAT) {
+    return true;
+  }
+
+  const size_t carry_cap = pat_len - 1;
+  char *carry = xmalloc(carry_cap);
+  char *window = xmalloc(carry_cap * 2);
+  size_t carry_len = 0;
+  bool found = false;
+
+  for (size_t i = 0; i < span_count && !found; i++) {
+    const char *data = spans[i].data;
+    const size_t len = spans[i].len;
+    if (len == 0) {
+      continue;
+    }
+
+    if (carry_len > 0) {
+      const size_t head_len = MIN(len, carry_cap);
+      memcpy(window, carry, carry_len);
+      memcpy(window + carry_len, data, head_len);
+      if (ml_mmap_find_literal(window, carry_len + head_len, pat, pat_len) != NULL) {
+        found = true;
+        break;
+      }
+    }
+
+    ml_mmap_piece_literal_update_carry(carry, carry_cap, &carry_len, data, len);
+  }
+
+  xfree(window);
+  xfree(carry);
+  return found;
+}
+
+static bool ml_mmap_piece_literal_advance_lines(ml_mmap_piece_literal_line_match_ctx_T *ctx,
+                                                const char *data, size_t len,
+                                                size_t logical_offset)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  const char *scan = data;
+  const char *const end = data + len;
+  size_t offset = logical_offset;
+
+  if (ctx->line_match_count > 0) {
+    const char *nl = memchr(scan, NL, (size_t)(end - scan));
+    if (nl == NULL) {
+      return true;
+    }
+
+    const size_t line_end = offset + (size_t)(nl - scan);
+    if (!ml_mmap_piece_literal_flush_line(ctx, line_end)) {
+      return false;
+    }
+    ctx->lnum++;
+    ctx->line_start = line_end + 1;
+    ctx->matched = 0;
+    scan = nl + 1;
+    offset = line_end + 1;
+  }
+
+  const char *last_nl = NULL;
+  const size_t newline_count =
+    ml_mmap_count_newlines_with_scan(scan, (size_t)(end - scan), &last_nl,
+                                     ctx->job->nl_scan);
+  if (newline_count > 0) {
+    ctx->lnum += (linenr_T)newline_count;
+    ctx->line_start = offset + (size_t)(last_nl - scan) + 1;
+    ctx->matched = 0;
+  }
+  return true;
+}
+
+static bool ml_mmap_piece_literal_match_span_fast(const char *data, size_t len, void *ctxp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  ml_mmap_piece_literal_line_match_ctx_T *ctx = ctxp;
+  ml_mmap_literal_match_job_T *job = ctx->job;
+
+  const char *scan = data;
+  const char *const end = data + len;
+  size_t logical_offset = ctx->logical_offset;
+
+  while (scan < end) {
+    if (!job->global && ctx->line_match_count > 0) {
+      const char *nl = memchr(scan, NL, (size_t)(end - scan));
+      if (nl == NULL) {
+        if (!ml_mmap_piece_literal_advance_lines(ctx, scan, (size_t)(end - scan),
+                                                 logical_offset)) {
+          return false;
+        }
+        ctx->logical_offset += len;
+        return true;
+      }
+
+      const size_t todo = (size_t)(nl + 1 - scan);
+      if (!ml_mmap_piece_literal_advance_lines(ctx, scan, todo, logical_offset)) {
+        return false;
+      }
+      scan += todo;
+      logical_offset += todo;
+      continue;
+    }
+
+    const char *match = ml_mmap_find_literal(scan, (size_t)(end - scan),
+                                             job->pat, job->pat_len);
+    if (match == NULL) {
+      if (!ml_mmap_piece_literal_advance_lines(ctx, scan, (size_t)(end - scan),
+                                               logical_offset)) {
+        return false;
+      }
+      ctx->logical_offset += len;
+      return true;
+    }
+
+    const size_t skipped = (size_t)(match - scan);
+    if (!ml_mmap_piece_literal_advance_lines(ctx, scan, skipped, logical_offset)) {
+      return false;
+    }
+
+    const size_t match_offset = logical_offset + skipped;
+    if (!ml_mmap_piece_literal_record_match(ctx, match_offset)) {
+      return false;
+    }
+
+    const size_t consumed = skipped + job->pat_len;
+    scan += consumed;
+    logical_offset += consumed;
+  }
+
+  ctx->logical_offset += len;
+  return true;
+}
+
+static bool ml_mmap_piece_literal_match_span_slow(const char *data, size_t len, void *ctxp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  ml_mmap_piece_literal_line_match_ctx_T *ctx = ctxp;
+  ml_mmap_literal_match_job_T *job = ctx->job;
+
+  for (size_t i = 0; i < len; i++) {
+    const size_t offset = ctx->logical_offset + i;
+    if (data[i] == NL) {
+      if (!ml_mmap_piece_literal_flush_line(ctx, offset)) {
+        return false;
+      }
+      ctx->lnum++;
+      ctx->line_start = offset + 1;
+      ctx->matched = 0;
+      continue;
+    }
+
+    if (!job->global && ctx->line_match_count > 0) {
+      continue;
+    }
+    if (job->pat_len == 1) {
+      if (data[i] == job->pat[0]
+          && !ml_mmap_piece_literal_record_match(ctx, offset)) {
+        return false;
+      }
+      continue;
+    }
+
+    while (ctx->matched > 0 && data[i] != job->pat[ctx->matched]) {
+      ctx->matched = ctx->prefix[ctx->matched - 1];
+    }
+    if (data[i] == job->pat[ctx->matched]) {
+      ctx->matched++;
+    }
+    if (ctx->matched == job->pat_len) {
+      const size_t match_offset = offset + 1 - job->pat_len;
+      if (!ml_mmap_piece_literal_record_match(ctx, match_offset)) {
+        return false;
+      }
+      // Keep literal global search non-overlapping, matching the line-based
+      // quickfix path.
+      ctx->matched = 0;
+    }
+  }
+
+  ctx->logical_offset += len;
+  return true;
+}
+
+static size_t ml_mmap_piece_span_vec_end(const PieceTreeSpanVec *span_vec)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return span_vec->logical_start + span_vec->byte_len;
+}
+
+static bool ml_mmap_piece_literal_scan_spans(const PieceTreeSpanVec *span_vec,
+                                             ml_mmap_piece_literal_line_match_ctx_T *ctx)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  const PieceTreeSpan *spans = span_vec->items;
+  const size_t span_count = span_vec->count;
+  const size_t end_offset = ml_mmap_piece_span_vec_end(span_vec);
+
+  if (spans == NULL || span_count == 0) {
+    return ml_mmap_piece_literal_flush_line(ctx, end_offset);
+  }
+
+  if (!ml_mmap_piece_literal_spans_may_match(spans, span_count, ctx->job->pat,
+                                             ctx->job->pat_len)) {
+    return true;
+  }
+
+  const bool use_slow_scan =
+    memchr(ctx->job->pat, NL, ctx->job->pat_len) != NULL
+    || ml_mmap_piece_literal_spans_have_boundary_match(spans, span_count,
+                                                       ctx->job->pat, ctx->job->pat_len);
+
+  bool ok = true;
+  for (size_t i = 0; i < span_count; i++) {
+    ctx->logical_offset = spans[i].offset;
+    const bool span_ok = use_slow_scan
+                         ? ml_mmap_piece_literal_match_span_slow(spans[i].data,
+                                                                 spans[i].len, ctx)
+                         : ml_mmap_piece_literal_match_span_fast(spans[i].data,
+                                                                 spans[i].len, ctx);
+    if (!span_ok) {
+      ok = false;
+      break;
+    }
+  }
+
+  if (ok && ctx->line_start == end_offset && span_count > 0) {
+    const PieceTreeSpan *last_span = &spans[span_count - 1];
+    if (last_span->len > 0 && last_span->data[last_span->len - 1] == NL) {
+      return true;
+    }
+  }
+  return ok && ml_mmap_piece_literal_flush_line(ctx, end_offset);
+}
+
+static bool ml_mmap_piece_literal_collect(PieceTree *tree,
+                                          ml_mmap_piece_literal_line_match_ctx_T *ctx,
+                                          size_t text_len, uint64_t revision)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  PieceTreeSpanVec span_vec = { 0 };
+  if (!piece_tree_collect_span_vec_at_revision(tree, 0, text_len, revision, &span_vec)) {
+    return false;
+  }
+
+  const bool ok = ml_mmap_piece_literal_scan_spans(&span_vec, ctx);
+  piece_tree_span_vec_clear(&span_vec);
+  return ok;
+}
+
+static void ml_mmap_piece_literal_match_worker(void *arg)
+{
+  ml_mmap_piece_literal_match_job_T *piece_job = arg;
+  ml_mmap_piece_literal_line_match_ctx_T ctx = {
+    .job = &piece_job->job,
+    .prefix = piece_job->prefix,
+    .lnum = piece_job->job.start_lnum,
+    .line_start = piece_job->job.start_offset,
+  };
+
+  piece_job->ok = ml_mmap_piece_literal_scan_spans(&piece_job->span_vec, &ctx);
+  if (piece_job->job.stopped) {
+    piece_job->ok = true;
+  }
+  xfree(ctx.line_match_cols);
+}
+
+static bool ml_get_buf_mmap_piece_literal_matches(buf_T *buf, const char *pat, size_t pat_len,
+                                                  bool global, size_t max_matches,
+                                                  mmap_literal_match_T **matchesp,
+                                                  size_t *match_countp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  PieceTree *tree = buf->b_ml.ml_piece_tree;
+  PieceTreeSnapshot snapshot = { 0 };
+  if (tree != NULL && !piece_tree_snapshot(tree, &snapshot)) {
+    return false;
+  }
+  const size_t text_len = snapshot.byte_len;
+  if (tree == NULL || pat_len == 0 || pat_len > text_len || max_matches == 0) {
+    return false;
+  }
+  if (snapshot.line_count != (size_t)buf->b_ml.ml_line_count) {
+    return false;
+  }
+
+  size_t *prefix = pat_len == 1 ? NULL : ml_mmap_build_prefix_table(pat, pat_len);
+  if (pat_len > 1 && prefix == NULL) {
+    return false;
+  }
+
+  const size_t collect_limit = MIN(max_matches, (size_t)ML_MMAP_PARALLEL_MATCH_LIMIT);
+  const bool stop_at_limit = max_matches <= collect_limit;
+  ml_mmap_literal_match_job_T job = {
+    .pat = pat,
+    .pat_len = pat_len,
+    .global = global,
+    .nl_scan = ml_mmap_best_nl_scan(),
+    .match_limit = collect_limit,
+    .stop_at_limit = stop_at_limit,
+  };
+  ml_mmap_piece_literal_line_match_ctx_T ctx = {
+    .job = &job,
+    .prefix = prefix,
+    .lnum = 1,
+  };
+
+  if (ml_mmap_parallel_match_enabled(text_len, buf->b_ml.ml_line_count, pat_len, max_matches)
+      && ml_get_buf_mmap_piece_literal_matches_parallel(buf, pat, pat_len, global,
+                                                        max_matches, prefix, matchesp,
+                                                        match_countp)) {
+    xfree(prefix);
+    return true;
+  }
+
+  const bool ok = ml_mmap_piece_literal_collect(tree, &ctx, text_len, snapshot.revision);
+  xfree(ctx.line_match_cols);
+  xfree(prefix);
+  if ((!ok && !job.stopped) || job.overflow) {
+    xfree(job.matches);
+    return false;
+  }
+
+  *matchesp = job.matches;
+  *match_countp = job.match_count;
   return true;
 }
 
@@ -968,12 +1923,162 @@ static unsigned ml_mmap_parallel_match_thread_count(size_t size, size_t line_cou
     uv_free_cpu_info(cpu_infos, cpu_count);
   }
 
-  threads = MIN(threads, (unsigned)ML_MMAP_PARALLEL_MATCH_MAX_THREADS);
+  threads = MIN(threads, nvim_testing ? 4u : (unsigned)ML_MMAP_PARALLEL_MATCH_MAX_THREADS);
   threads = MIN(threads, (unsigned)line_count);
-  while (threads > 2 && size / threads < 16 * 1024 * 1024) {
+  const size_t min_bytes_per_thread = nvim_testing ? 64 * 1024 : 16 * 1024 * 1024;
+  while (threads > 2 && size / threads < min_bytes_per_thread) {
     threads--;
   }
   return MAX(threads, 2);
+}
+
+static bool ml_mmap_parallel_match_enabled(size_t size, linenr_T line_count, size_t pat_len,
+                                           size_t max_matches)
+  FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  const size_t min_size = nvim_testing ? 1024 * 1024 : ML_MMAP_PARALLEL_MATCH_MIN_SIZE;
+  const size_t min_matches = nvim_testing ? 1 : ML_MMAP_PARALLEL_MATCH_MIN_MATCHES;
+  return size >= min_size
+         && line_count >= 2
+         && pat_len >= 3
+         && max_matches >= min_matches;
+}
+
+static bool ml_get_buf_mmap_piece_literal_matches_parallel(buf_T *buf, const char *pat,
+                                                           size_t pat_len, bool global,
+                                                           size_t max_matches,
+                                                           const size_t *prefix,
+                                                           mmap_literal_match_T **matchesp,
+                                                           size_t *match_countp)
+  FUNC_ATTR_NONNULL_ARG(1, 2, 7, 8) FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  PieceTree *tree = buf->b_ml.ml_piece_tree;
+  PieceTreeSnapshot snapshot = { 0 };
+  if (tree != NULL && !piece_tree_snapshot(tree, &snapshot)) {
+    return false;
+  }
+  const size_t text_len = snapshot.byte_len;
+  const size_t line_count = snapshot.line_count;
+  if (tree == NULL || text_len == 0 || line_count < 2) {
+    return false;
+  }
+  if (line_count != (size_t)buf->b_ml.ml_line_count) {
+    return false;
+  }
+
+  const unsigned thread_count = ml_mmap_parallel_match_thread_count(text_len, line_count);
+  if (thread_count < 2) {
+    return false;
+  }
+
+  const size_t collect_limit = MIN(max_matches, (size_t)ML_MMAP_PARALLEL_MATCH_LIMIT);
+  const bool stop_at_limit = max_matches <= collect_limit
+                             && max_matches <= ML_MMAP_PARALLEL_MATCH_STOP_LIMIT;
+  const size_t per_job_limit = stop_at_limit
+                               ? collect_limit
+                               : MIN(collect_limit, MAX((size_t)4096,
+                                                        collect_limit / thread_count + 1024));
+  uv_thread_t *threads = xmalloc(thread_count * sizeof *threads);
+  ml_mmap_piece_literal_match_job_T *jobs = xcalloc(thread_count, sizeof *jobs);
+  unsigned created = 0;
+  bool fallback = false;
+
+  for (unsigned i = 0; i < thread_count; i++) {
+    const linenr_T start_lnum =
+      (linenr_T)(1 + ((uint64_t)i * line_count / thread_count));
+    const linenr_T end_lnum =
+      (linenr_T)(((uint64_t)(i + 1) * line_count / thread_count));
+
+    size_t start_offset = 0;
+    size_t end_offset = text_len;
+    if (!piece_tree_line_start_at_revision(tree, (size_t)start_lnum, snapshot.revision,
+                                           &start_offset)
+        || start_offset > text_len) {
+      fallback = true;
+      break;
+    }
+    if ((size_t)end_lnum < line_count
+        && !piece_tree_line_start_at_revision(tree, (size_t)end_lnum + 1,
+                                              snapshot.revision, &end_offset)) {
+      fallback = true;
+      break;
+    }
+    if (end_offset < start_offset || end_offset > text_len) {
+      fallback = true;
+      break;
+    }
+
+    jobs[i].job.start_offset = start_offset;
+    jobs[i].job.end_offset = end_offset;
+    jobs[i].job.start_lnum = start_lnum;
+    jobs[i].job.pat = pat;
+    jobs[i].job.pat_len = pat_len;
+    jobs[i].job.global = global;
+    jobs[i].job.nl_scan = ml_mmap_best_nl_scan();
+    jobs[i].job.match_limit = per_job_limit;
+    jobs[i].job.stop_at_limit = stop_at_limit;
+    jobs[i].prefix = prefix;
+
+    if (!piece_tree_collect_span_vec_at_revision(tree, start_offset, end_offset - start_offset,
+                                                 snapshot.revision, &jobs[i].span_vec)
+        || jobs[i].span_vec.logical_start != start_offset
+        || jobs[i].span_vec.byte_len != end_offset - start_offset
+        || jobs[i].span_vec.revision != snapshot.revision) {
+      fallback = true;
+      break;
+    }
+    if (uv_thread_create(&threads[i], ml_mmap_piece_literal_match_worker, &jobs[i]) != 0) {
+      fallback = true;
+      break;
+    }
+    created++;
+  }
+
+  for (unsigned i = 0; i < created; i++) {
+    uv_thread_join(&threads[i]);
+  }
+
+  size_t total_matches = 0;
+  for (unsigned i = 0; i < created; i++) {
+    fallback = fallback || (!jobs[i].ok && !jobs[i].job.stopped) || jobs[i].job.overflow;
+    total_matches += jobs[i].job.match_count;
+  }
+  if (created != thread_count) {
+    fallback = true;
+  }
+  if (max_matches > collect_limit && total_matches > collect_limit) {
+    fallback = true;
+  }
+
+  mmap_literal_match_T *matches = NULL;
+  size_t match_count = 0;
+  if (!fallback && total_matches > 0) {
+    const size_t wanted = MIN(total_matches, max_matches);
+    matches = xmalloc(wanted * sizeof *matches);
+    for (unsigned i = 0; i < created && match_count < wanted; i++) {
+      const size_t todo = MIN(jobs[i].job.match_count, wanted - match_count);
+      if (todo > 0) {
+        memcpy(matches + match_count, jobs[i].job.matches, todo * sizeof *matches);
+        match_count += todo;
+      }
+    }
+  }
+
+  for (unsigned i = 0; i < thread_count; i++) {
+    piece_tree_span_vec_clear(&jobs[i].span_vec);
+    xfree(jobs[i].job.matches);
+  }
+  xfree(jobs);
+  xfree(threads);
+
+  if (fallback) {
+    xfree(matches);
+    return false;
+  }
+
+  *matchesp = matches;
+  *match_countp = match_count;
+  return true;
 }
 
 bool ml_get_buf_mmap_literal_matches(buf_T *buf, const char *pat, size_t pat_len, bool global,
@@ -984,11 +2089,13 @@ bool ml_get_buf_mmap_literal_matches(buf_T *buf, const char *pat, size_t pat_len
   *matchesp = NULL;
   *match_countp = 0;
 
-  if (!ml_mmap_is_active(buf)
-      || buf->b_ml.ml_mmap_size < ML_MMAP_PARALLEL_MATCH_MIN_SIZE
-      || buf->b_ml.ml_line_count < 2
-      || pat_len < 3
-      || max_matches < 4096) {
+  if (!ml_mmap_is_pristine(buf)) {
+    return ml_get_buf_mmap_piece_literal_matches(buf, pat, pat_len, global, max_matches,
+                                                 matchesp, match_countp);
+  }
+
+  if (!ml_mmap_parallel_match_enabled(buf->b_ml.ml_mmap_size, buf->b_ml.ml_line_count,
+                                      pat_len, max_matches)) {
     return false;
   }
 
@@ -1000,17 +2107,16 @@ bool ml_get_buf_mmap_literal_matches(buf_T *buf, const char *pat, size_t pat_len
     return false;
   }
 
-  ml_mmap_nl_scan_T nl_scan = kMlMmapNlScanScalar;
-  if (ml_mmap_can_use_avx512bw()) {
-    nl_scan = kMlMmapNlScanAvx512bw;
-  } else if (ml_mmap_can_use_avx2()) {
-    nl_scan = kMlMmapNlScanAvx2;
-  }
+  const ml_mmap_nl_scan_T nl_scan = ml_mmap_best_nl_scan();
 
   uv_thread_t *threads = xmalloc(thread_count * sizeof *threads);
   ml_mmap_literal_match_job_T *jobs = xcalloc(thread_count, sizeof *jobs);
-  const size_t per_job_limit =
-    MIN(collect_limit, MAX((size_t)4096, collect_limit / thread_count + 1024));
+  const bool stop_at_limit = max_matches <= collect_limit
+                             && max_matches <= ML_MMAP_PARALLEL_MATCH_STOP_LIMIT;
+  const size_t per_job_limit = stop_at_limit
+                               ? collect_limit
+                               : MIN(collect_limit, MAX((size_t)4096,
+                                                        collect_limit / thread_count + 1024));
   unsigned created = 0;
 
   for (unsigned i = 0; i < thread_count; i++) {
@@ -1030,6 +2136,7 @@ bool ml_get_buf_mmap_literal_matches(buf_T *buf, const char *pat, size_t pat_len
     jobs[i].global = global;
     jobs[i].nl_scan = nl_scan;
     jobs[i].match_limit = per_job_limit;
+    jobs[i].stop_at_limit = stop_at_limit;
 
     if (uv_thread_create(&threads[i], ml_mmap_literal_match_worker, &jobs[i]) != 0) {
       break;
@@ -1081,6 +2188,30 @@ bool ml_get_buf_mmap_literal_matches(buf_T *buf, const char *pat, size_t pat_len
   return true;
 }
 
+char *ml_get_buf_mmap_literal_match_line(buf_T *buf, mmap_literal_match_T match)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (!ml_mmap_is_active(buf)) {
+    return NULL;
+  }
+
+  if (buf->b_ml.ml_piece_tree != NULL) {
+    char *line = xmallocz(match.line_len);
+    if (piece_tree_read(buf->b_ml.ml_piece_tree, match.line_start, line, match.line_len)
+        != match.line_len) {
+      xfree(line);
+      return NULL;
+    }
+    return line;
+  }
+
+  if (match.line_start > buf->b_ml.ml_mmap_size
+      || match.line_len > buf->b_ml.ml_mmap_size - match.line_start) {
+    return NULL;
+  }
+  return xmemdupz(buf->b_ml.ml_mmap_base + match.line_start, match.line_len);
+}
+
 bool ml_get_buf_mmap_literal_match_at(buf_T *buf, size_t *start_offsetp, linenr_T *lnump,
                                       size_t *line_startp, const char *pat, size_t pat_len,
                                       char **linep, size_t *line_lenp, colnr_T *colp)
@@ -1088,8 +2219,53 @@ bool ml_get_buf_mmap_literal_match_at(buf_T *buf, size_t *start_offsetp, linenr_
 {
   *linep = NULL;
   *line_lenp = 0;
-  if (!ml_mmap_is_active(buf) || pat_len == 0 || *start_offsetp >= buf->b_ml.ml_mmap_size
+  if (!ml_mmap_is_active(buf) || pat_len == 0
       || *lnump < 1 || *lnump > buf->b_ml.ml_line_count) {
+    return false;
+  }
+
+  if (!ml_mmap_is_pristine(buf)) {
+    PieceTree *tree = buf->b_ml.ml_piece_tree;
+    const size_t total = tree == NULL ? 0 : piece_tree_byte_len(tree);
+    if (tree == NULL || *start_offsetp >= total) {
+      return false;
+    }
+
+    size_t match_offset = 0;
+    if (!piece_tree_find_literal(tree, *start_offsetp, total - *start_offsetp, pat, pat_len,
+                                 &match_offset)) {
+      return false;
+    }
+
+    size_t lnum = 0;
+    size_t line_start = 0;
+    size_t line_end = 0;
+    if (!piece_tree_lnum_for_offset(tree, match_offset, &lnum, &line_start)
+        || lnum == 0 || lnum > (size_t)buf->b_ml.ml_line_count
+        || !piece_tree_line_bounds(tree, lnum, &line_start, &line_end)
+        || match_offset < line_start
+        || match_offset > line_end
+        || pat_len > line_end - match_offset) {
+      return false;
+    }
+
+    const size_t line_len = line_end - line_start;
+    char *line = xmallocz(line_len);
+    if (piece_tree_read(tree, line_start, line, line_len) != line_len) {
+      xfree(line);
+      return false;
+    }
+
+    *linep = line;
+    *line_lenp = line_len;
+    *colp = (colnr_T)(match_offset - line_start);
+    *lnump = (linenr_T)lnum;
+    *line_startp = line_start;
+    *start_offsetp = match_offset;
+    return true;
+  }
+
+  if (*start_offsetp >= buf->b_ml.ml_mmap_size) {
     return false;
   }
 
@@ -1146,6 +2322,8 @@ int ml_open(buf_T *buf)
   buf->b_ml.ml_mmap_line_starts = NULL;
   buf->b_ml.ml_mmap_index_count = 0;
   buf->b_ml.ml_mmap_noeol = false;
+  buf->b_ml.ml_mmap_piece_write_fast_count = 0;
+  buf->b_ml.ml_piece_tree = NULL;
   buf->b_ml.ml_chunksize = NULL;
   buf->b_ml.ml_usedchunks = 0;
 
@@ -1691,6 +2869,8 @@ void ml_recover(bool checkext)
   buf->b_ml.ml_mmap_line_starts = NULL;
   buf->b_ml.ml_mmap_index_count = 0;
   buf->b_ml.ml_mmap_noeol = false;
+  buf->b_ml.ml_mmap_piece_write_fast_count = 0;
+  buf->b_ml.ml_piece_tree = NULL;
   buf->b_ml.ml_locked = NULL;           // no locked block
   buf->b_ml.ml_flags = 0;
 
@@ -2785,7 +3965,7 @@ errorret:
   lnum = MAX(lnum, 1);  // pretend line 0 is line 1
 
   if (ml_mmap_is_active(buf)) {
-    if (will_change) {
+    if (will_change && !ml_mmap_can_edit_tree(buf)) {
       if (ml_mmap_materialize(buf) == FAIL) {
         goto errorret;
       }
@@ -2799,10 +3979,23 @@ errorret:
       size_t end;
       ml_mmap_line_bounds(buf, lnum, &start, &end);
       const size_t len = end - start;
-      buf->b_ml.ml_line_ptr = xmemdupz(buf->b_ml.ml_mmap_base + start, len);
+      if (buf->b_ml.ml_piece_tree != NULL) {
+        buf->b_ml.ml_line_ptr = xmallocz(len);
+        size_t copied = piece_tree_read(buf->b_ml.ml_piece_tree, start, buf->b_ml.ml_line_ptr, len);
+        if (copied != len) {
+          xfree(buf->b_ml.ml_line_ptr);
+          goto errorret;
+        }
+      } else {
+        buf->b_ml.ml_line_ptr = xmemdupz(buf->b_ml.ml_mmap_base + start, len);
+      }
       buf->b_ml.ml_line_textlen = (colnr_T)(len + 1);
       buf->b_ml.ml_line_lnum = lnum;
       buf->b_ml.ml_flags = (buf->b_ml.ml_flags & ~ML_LINE_DIRTY) | ML_ALLOCATED;
+    }
+    if (will_change) {
+      buf->b_ml.ml_flags = (buf->b_ml.ml_flags | ML_LINE_DIRTY | ML_ALLOCATED) & ~ML_EMPTY;
+      ml_add_deleted_len_buf(buf, buf->b_ml.ml_line_ptr, -1);
     }
     return buf->b_ml.ml_line_ptr;
   }
@@ -3619,6 +4812,10 @@ int ml_append(linenr_T lnum, char *line, colnr_T len, bool newfile)
 /// @return  FAIL for failure, OK otherwise
 int ml_append_flags(linenr_T lnum, char *line, colnr_T len, int flags)
 {
+  int mmap_append_ret = ml_mmap_append_line(curbuf, lnum, line, len);
+  if (mmap_append_ret != NOTDONE) {
+    return mmap_append_ret;
+  }
   if (ml_mmap_materialize(curbuf) == FAIL) {
     return FAIL;
   }
@@ -3722,6 +4919,33 @@ linenr_T ml_get_buf_literal_block_end(buf_T *buf, linenr_T lnum, const char *pat
   }
 
   if (ml_mmap_is_active(buf)) {
+    if (!ml_mmap_is_pristine(buf)) {
+      if (buf->b_ml.ml_piece_tree == NULL) {
+        return lnum;
+      }
+
+      const size_t block_idx = ml_mmap_index_for_lnum(lnum);
+      const linenr_T block_end = MIN(buf->b_ml.ml_line_count,
+                                     (linenr_T)((block_idx + 1) * ML_MMAP_INDEX_STRIDE));
+      size_t start = 0;
+      size_t end = 0;
+      if (!piece_tree_line_start(buf->b_ml.ml_piece_tree, (size_t)lnum, &start)) {
+        return lnum;
+      }
+      if (block_end < buf->b_ml.ml_line_count) {
+        if (!piece_tree_line_start(buf->b_ml.ml_piece_tree, (size_t)block_end + 1, &end)) {
+          return lnum;
+        }
+      } else {
+        end = ml_mmap_text_size(buf);
+      }
+      size_t match_offset = 0;
+      *contains = start <= end
+                  && piece_tree_find_literal(buf->b_ml.ml_piece_tree, start, end - start, pat,
+                                             pat_len, &match_offset);
+      return block_end;
+    }
+
     const size_t block_idx = ml_mmap_index_for_lnum(lnum);
     const linenr_T block_end = MIN(buf->b_ml.ml_line_count,
                                    (linenr_T)((block_idx + 1) * ML_MMAP_INDEX_STRIDE));
@@ -3763,6 +4987,10 @@ linenr_T ml_get_buf_literal_block_end(buf_T *buf, linenr_T lnum, const char *pat
 int ml_append_buf(buf_T *buf, linenr_T lnum, char *line, colnr_T len, bool newfile)
   FUNC_ATTR_NONNULL_ARG(1)
 {
+  int mmap_append_ret = ml_mmap_append_line(buf, lnum, line, len);
+  if (mmap_append_ret != NOTDONE) {
+    return mmap_append_ret;
+  }
   if (ml_mmap_materialize(buf) == FAIL) {
     return FAIL;
   }
@@ -3844,6 +5072,10 @@ int ml_replace_buf_len(buf_T *buf, linenr_T lnum, char *line_arg, size_t len_arg
   if (buf->b_ml.ml_mfp == NULL && open_buffer(false, NULL, 0) == FAIL) {
     return FAIL;
   }
+  int mmap_replace_ret = ml_mmap_replace_line(buf, lnum, line, len_arg, copy, noalloc);
+  if (mmap_replace_ret != NOTDONE) {
+    return mmap_replace_ret;
+  }
   if (ml_mmap_materialize(buf) == FAIL) {
     return FAIL;
   }
@@ -3891,6 +5123,10 @@ int ml_replace_buf_len(buf_T *buf, linenr_T lnum, char *line_arg, size_t len_arg
 int ml_delete_buf(buf_T *buf, linenr_T lnum, bool message)
   FUNC_ATTR_NONNULL_ALL
 {
+  int mmap_delete_ret = ml_mmap_delete_line(buf, lnum, message);
+  if (mmap_delete_ret != NOTDONE) {
+    return mmap_delete_ret;
+  }
   if (ml_mmap_materialize(buf) == FAIL) {
     return FAIL;
   }
@@ -4049,6 +5285,10 @@ int ml_delete(linenr_T lnum)
 /// @return  FAIL for failure, OK otherwise
 int ml_delete_flags(linenr_T lnum, int flags)
 {
+  int mmap_delete_ret = ml_mmap_delete_line(curbuf, lnum, (flags & ML_DEL_MESSAGE) != 0);
+  if (mmap_delete_ret != NOTDONE) {
+    return mmap_delete_ret;
+  }
   if (ml_mmap_materialize(curbuf) == FAIL) {
     return FAIL;
   }
@@ -4177,6 +5417,9 @@ static void ml_flush_line(buf_T *buf, bool noalloc)
   }
   if (ml_mmap_is_active(buf)) {
     if (buf->b_ml.ml_flags & ML_LINE_DIRTY) {
+      if (ml_mmap_flush_dirty_line(buf, noalloc)) {
+        return;
+      }
       (void)ml_mmap_materialize(buf);
       return;
     }
@@ -5448,7 +6691,7 @@ int ml_find_line_or_offset(buf_T *buf, linenr_T lnum, int *offp, bool no_ff)
         return -1;
       }
       size_t size = lnum > buf->b_ml.ml_line_count
-                    ? buf->b_ml.ml_mmap_size
+                    ? ml_mmap_text_size(buf)
                     : ml_mmap_line_start_offset(buf, lnum);
       if (ffdos) {
         linenr_T eol_count = lnum - 1;
@@ -5474,7 +6717,7 @@ int ml_find_line_or_offset(buf_T *buf, linenr_T lnum, int *offp, bool no_ff)
       return 1;
     }
     size_t pos = (size_t)mmap_offset;
-    if (pos >= buf->b_ml.ml_mmap_size) {
+    if (pos >= ml_mmap_text_size(buf)) {
       return -1;
     }
 

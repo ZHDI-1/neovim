@@ -231,6 +231,7 @@ size_t ml_mmap_size;
 size_t *ml_mmap_line_starts;
 size_t ml_mmap_index_count;
 bool ml_mmap_noeol;
+PieceTree *ml_piece_tree;
 ```
 
 These fields live in `memline_T`. When `ml_mmap_base != NULL`, the buffer is
@@ -249,7 +250,8 @@ Important invariants:
 
 - `ml_line_count` is set to the mmap line count.
 - `ML_EMPTY` is cleared.
-- the mmap state is read-only until materialization.
+- a piece tree is initialized over the mapped bytes so common no-swap edits can
+  update logical buffer content without copying the whole file.
 - if installation fails, `fileio.c` unmaps and frees the temporary metadata.
 
 ### Reading lines
@@ -267,9 +269,14 @@ machinery.
 
 ### Editing and materialization
 
-The mmap representation is not mutable. If a caller requests a line for change,
-or a mutating operation reaches memline, `ml_mmap_materialize()` converts the
-mapped file into normal memline blocks:
+The original mmap bytes remain immutable, but the buffer can become logically
+mutable through the piece tree. Common line-oriented operations replace, append,
+and delete piece-tree ranges directly when swapfile editing is not active and
+the payload can be represented as line text.
+
+Operations that are not yet represented safely, or edits while a swapfile is
+active, still use `ml_mmap_materialize()` to convert the mapped file into normal
+memline blocks:
 
 1. Save the mmap base, size, sparse index, and line count.
 2. Clear mmap fields from the buffer.
@@ -278,7 +285,39 @@ mapped file into normal memline blocks:
 5. Unmap the file and free the sparse index.
 
 After materialization, all existing edit paths operate on normal Neovim data
-structures. This is the main safety valve for compatibility.
+structures. This remains the main safety valve for compatibility.
+
+### Writing edited mmap buffers
+
+Whole-buffer `:write` has a guarded piece-span fast path. `buf_write()` still
+owns the normal Neovim write setup: backup handling, file opening, permissions,
+fsync, timestamp updates, messages, and autocmd sequencing. The optimized branch
+only replaces the inner byte-production loop when the output can be written as
+raw logical bytes from the piece tree.
+
+The fast path currently requires:
+
+- mmap piece tree is still active
+- whole-buffer write, not append and not filtering
+- Unix fileformat
+- no binary write mode and no trailing CTRL-Z behavior
+- no encoding conversion, BOM conversion, or iconv path
+- no persistent-undo hash pass
+- the output path must not truncate the mapped source in place; same-file writes
+  need a rename-style backup, while new files, different files, and devices are
+  safe
+
+Before collecting spans it flushes the mmap memline cache, so a dirty current
+line is either committed to the piece tree or the path declines. It then collects
+a stable `PieceTreeSpanVec` at one tree revision and writes each physical span
+directly. Final newline behavior follows the legacy `fixeol`/`endofline` rule:
+if the logical bytes do not end in `\n`, the writer appends one only when the
+normal line loop would have done so.
+
+Unsupported write shapes still use the existing line-oriented writer. This keeps
+correctness for DOS/Mac fileformats, conversion, partial ranges, filters,
+append writes, and persistent undo while giving the common `nvim -n hugefile`
+case an allocation-light save path.
 
 ### Closing
 
@@ -347,10 +386,33 @@ This replaced a hot `memmem()` profile point seen during mmap literal search.
 
 `ml_get_buf_mmap_literal_matches()` is the batch API used by quickfix.
 
-It runs only when the workload is large enough and bounded enough:
+For pristine mmap buffers, it scans the mapped file directly. For edited mmap
+buffers backed by the piece tree, it collects stable `PieceTreeSpanVec` objects
+for line-range partitions and workers scan those span vectors instead of
+traversing the tree. Each vector carries physical spans plus the logical start,
+byte length, and piece-tree revision observed during collection. Partition setup
+captures a piece-tree snapshot and requires every partition boundary and span
+vector to match that revision; if not, the batch path falls back.
+
+The edited piece-span scanner has two tiers:
+
+- A proven-empty prefilter scans physical spans with the same literal finder
+  used by raw mmap search, plus a small boundary window between adjacent spans.
+  If no in-span or cross-span literal is possible, the search returns zero
+  matches without walking every byte for line state.
+- If matches exist and no cross-span match is possible, each worker uses the
+  vector literal finder inside each span and advances line state with bulk
+  newline counting between matches. The older byte-by-byte streaming matcher is
+  kept for patterns that may cross piece boundaries.
+- For bounded searches, reaching the requested match count is a successful
+  stop, not an overflow. Workers can therefore stop after enough ordered
+  candidates have been collected instead of forcing the slow fallback path.
+
+The production path runs only when the workload is large enough and bounded
+enough:
 
 - mmap buffer is active
-- mmap size is at least 128 MiB
+- logical text size is at least 128 MiB
 - buffer has at least two lines
 - pattern length is at least 3 bytes
 - requested max matches is at least 4096
@@ -367,13 +429,19 @@ Thread partitioning is by line range, not raw byte range. Each worker receives:
 - starting line number
 - pattern bytes
 - global/non-global mode
-- newline-counting implementation to use
+- either a contiguous mmap byte range and newline-counting implementation, or a
+  stable `PieceTreeSpanVec`
 
 Workers scan their range and append only match metadata to a private vector.
-No quickfix state is touched from workers.
+They do not chase piece-tree parent/child links, and no quickfix state is
+touched from workers.
 
 After joining workers, the main thread merges match arrays in worker order,
 then `quickfix.c` creates quickfix entries.
+
+When running under the Neovim test harness (`NVIM_TEST`), these thresholds are
+lowered so focused functional tests can exercise the worker setup without
+creating a 128 MiB fixture. Normal builds keep the production thresholds above.
 
 ### Serial mmap fallback
 
@@ -450,6 +518,43 @@ Median timings from warmed-cache runs:
 | `5000vimgrep /avx/ %` bounded frequent match | 0.843 s |
 | standalone `logviewer` index, 32 threads | 0.553 s |
 
+After adding the mmap piece-tree search path, another warmed-cache comparison
+was run against `../panic.txt`, a symlink to the same 20 GiB log file:
+
+| Case | Open/index | Edit | Search |
+| --- | ---: | ---: | ---: |
+| pristine raw mmap `:vimgrep /zzzzzz/ %` no match | 0.414-0.421 s | n/a | 0.329-0.335 s |
+| edited piece tree `:vimgrep /zzzzzz/ %` no match | 0.402-0.435 s | ~0.00002 s | 0.326-0.330 s |
+| pristine raw mmap `5000vimgrep /avx/ %` | 0.409-0.412 s | n/a | 0.117-0.120 s |
+| edited piece tree `5000vimgrep /avx/ %` | 0.412-0.419 s | ~0.00002 s | 0.118-0.119 s |
+| edited piece tree after 10,000 distributed line replacements, `5000vimgrep /avx/ %` | 0.421 s | 3.390 s | 0.124 s |
+| edited piece tree after 10,000 distributed line replacements, `:vimgrep /zzzzzz/ %` no match | 0.419 s | 3.416 s | 0.336 s |
+
+Before the piece-span no-match prefilter, the edited no-match search took about
+3.76 s on the same warmed file because it used the streaming matcher over every
+byte. The prefilter brings the no-match case back into the raw mmap range.
+The vector within-span scanner plus successful bounded-stop handling reduced
+the bounded frequent edited search from about 1.73 s to about 0.12 s, matching
+the raw mmap range in this benchmark.
+The fragmented runs created about 20,001 active piece nodes. Search stayed in
+the same range as the lightly edited case; the cost was the edit workload that
+created the fragmentation.
+
+After adding the guarded piece-span writer, a 20 GiB edited-buffer smoke wrote
+to `/dev/null` in about 0.72 s:
+
+```text
+nvim -n -u NONE -i NONE --noplugin --headless ../panic.txt
+:call append("$", "mmap write smoke")
+:write! /dev/null
+```
+
+The buffer still reported `mmap_active=true`, `mmap_piece_tree=true`,
+`mmap_piece_revision=1`, `mmap_piece_add_len=17`, and
+`mmap_piece_write_fast_count=1` after the write. This validates the fast span
+path and avoids a 20 GiB output allocation, but it is not a real
+storage-throughput benchmark because `/dev/null` discards the stream.
+
 The internal open timer measures the mmap read/index path. Process wall time
 also includes Neovim startup, command execution, teardown, and unmapping.
 
@@ -512,8 +617,9 @@ the user starts sparse navigation/search workflows where it pays for itself.
   reader. This avoids changing CRLF/Mac behavior.
 - Files containing NUL bytes are rejected by the mmap path.
 - BOM-prefixed files are rejected by the mmap path.
-- The mmap representation is read-only. The first mutation materializes the
-  whole file into normal memline, which can be expensive for a very large file.
+- Common no-swap line edits stay mmap-backed through the piece tree. Unsupported
+  edit shapes and swap-enabled edits still materialize the whole file into
+  normal memline, which can be expensive for a very large file.
 - `:vimgrep` acceleration applies only to simple case-sensitive literal UTF-8
   patterns.
 - Dense unbounded searches intentionally fall back rather than building very
@@ -600,4 +706,3 @@ timeout 8s bash -c \
   after the current path is stable.
 - Revisit dense match handling with streaming quickfix insertion if quickfix can
   safely consume results incrementally without large temporary arrays.
-
