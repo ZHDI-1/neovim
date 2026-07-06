@@ -76,6 +76,8 @@
 #include "nvim/change.h"
 #include "nvim/cursor.h"
 #include "nvim/drawscreen.h"
+#include "nvim/event/loop.h"
+#include "nvim/event/multiqueue.h"
 #include "nvim/eval/typval.h"
 #include "nvim/eval/vars.h"
 #include "nvim/ex_cmds_defs.h"
@@ -401,6 +403,66 @@ static bool ml_mmap_can_edit_tree(const buf_T *buf)
          && buf->b_ml.ml_mfp->mf_fd < 0;
 }
 
+enum {
+  ML_MMAP_PIECE_RECLAIM_EVENT_BUDGET = 256,
+};
+
+static bool ml_mmap_piece_reclaim_scheduled = false;
+
+static bool ml_mmap_piece_reclaim_one(buf_T *buf, size_t *budgetp)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (*budgetp == 0 || buf->b_ml.ml_piece_tree == NULL
+      || piece_tree_retired_node_count(buf->b_ml.ml_piece_tree) == 0) {
+    return false;
+  }
+
+  const size_t reclaimed =
+    piece_tree_reclaim_retired_budget(buf->b_ml.ml_piece_tree, *budgetp);
+  *budgetp -= reclaimed;
+  return piece_tree_retired_node_count(buf->b_ml.ml_piece_tree) > 0;
+}
+
+static void ml_mmap_piece_reclaim_schedule(void);
+
+static void ml_mmap_piece_reclaim_event(void **argv)
+{
+  (void)argv;
+  ml_mmap_piece_reclaim_scheduled = false;
+
+  size_t budget = ML_MMAP_PIECE_RECLAIM_EVENT_BUDGET;
+  bool has_more = false;
+  FOR_ALL_BUFFERS(buf) {
+    has_more |= ml_mmap_piece_reclaim_one(buf, &budget);
+    if (budget == 0) {
+      break;
+    }
+  }
+
+  if (has_more || budget == 0) {
+    ml_mmap_piece_reclaim_schedule();
+  }
+}
+
+static void ml_mmap_piece_reclaim_schedule(void)
+{
+  if (ml_mmap_piece_reclaim_scheduled || main_loop.events == NULL || main_loop.closing) {
+    return;
+  }
+
+  ml_mmap_piece_reclaim_scheduled = true;
+  multiqueue_put(main_loop.events, ml_mmap_piece_reclaim_event, NULL);
+}
+
+static void ml_mmap_maybe_schedule_piece_reclaim(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (buf->b_ml.ml_piece_tree != NULL
+      && piece_tree_retired_node_count(buf->b_ml.ml_piece_tree) > 0) {
+    ml_mmap_piece_reclaim_schedule();
+  }
+}
+
 static void ml_mmap_update_noeol(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
@@ -669,6 +731,7 @@ static int ml_mmap_replace_line(buf_T *buf, linenr_T lnum, char *line, size_t le
   }
   ml_mmap_update_noeol(buf);
   ml_mmap_clear_cache(buf);
+  ml_mmap_maybe_schedule_piece_reclaim(buf);
   buf->b_ml.ml_flags &= ~ML_EMPTY;
   ml_upd_lastbuf = NULL;
   return OK;
@@ -748,6 +811,7 @@ static int ml_mmap_append_line(buf_T *buf, linenr_T lnum, char *line, colnr_T le
   buf->b_ml.ml_line_count++;
   ml_mmap_update_noeol(buf);
   ml_mmap_clear_cache(buf);
+  ml_mmap_maybe_schedule_piece_reclaim(buf);
   buf->b_ml.ml_flags &= ~ML_EMPTY;
   ml_upd_lastbuf = NULL;
   return OK;
@@ -782,6 +846,7 @@ static int ml_mmap_delete_line(buf_T *buf, linenr_T lnum, bool message)
 
     ml_mmap_update_noeol(buf);
     ml_mmap_clear_cache(buf);
+    ml_mmap_maybe_schedule_piece_reclaim(buf);
     buf->b_ml.ml_flags |= ML_EMPTY;
     ml_upd_lastbuf = NULL;
     return OK;
@@ -840,6 +905,7 @@ static int ml_mmap_delete_line(buf_T *buf, linenr_T lnum, bool message)
   buf->b_ml.ml_line_count--;
   ml_mmap_update_noeol(buf);
   ml_mmap_clear_cache(buf);
+  ml_mmap_maybe_schedule_piece_reclaim(buf);
   ml_upd_lastbuf = NULL;
   return OK;
 }
@@ -874,6 +940,7 @@ static bool ml_mmap_flush_dirty_line(buf_T *buf, bool noalloc)
   buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
   buf->b_ml.ml_line_lnum = 0;
   buf->b_ml.ml_line_offset = 0;
+  ml_mmap_maybe_schedule_piece_reclaim(buf);
   ml_upd_lastbuf = NULL;
   return true;
 }
@@ -1076,6 +1143,12 @@ size_t ml_buf_mmap_piece_retired_node_count(buf_T *buf)
 {
   return buf->b_ml.ml_piece_tree == NULL ? 0
                                          : piece_tree_retired_node_count(buf->b_ml.ml_piece_tree);
+}
+
+bool ml_buf_mmap_piece_reclaim_scheduled(void)
+  FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_piece_reclaim_scheduled;
 }
 
 size_t ml_buf_mmap_piece_add_len(buf_T *buf)

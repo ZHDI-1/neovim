@@ -1240,7 +1240,7 @@ Dict nvim__buf_stats(Buffer buf, Arena *arena, Error *err)
     return (Dict)ARRAY_DICT_INIT;
   }
 
-  Dict rv = arena_dict(arena, 19);
+  Dict rv = arena_dict(arena, 20);
   // Number of times the cached line was flushed.
   // This should generally not increase while editing the same
   // line in the same mode.
@@ -1269,6 +1269,8 @@ Dict nvim__buf_stats(Buffer buf, Arena *arena, Error *err)
         INTEGER_OBJ((Integer)ml_buf_mmap_piece_free_node_count(b)));
   PUT_C(rv, "mmap_piece_retired_nodes",
         INTEGER_OBJ((Integer)ml_buf_mmap_piece_retired_node_count(b)));
+  PUT_C(rv, "mmap_piece_reclaim_scheduled",
+        BOOLEAN_OBJ(ml_buf_mmap_piece_reclaim_scheduled()));
   PUT_C(rv, "mmap_piece_add_len", INTEGER_OBJ((Integer)ml_buf_mmap_piece_add_len(b)));
   PUT_C(rv, "mmap_piece_add_cap", INTEGER_OBJ((Integer)ml_buf_mmap_piece_add_cap(b)));
 

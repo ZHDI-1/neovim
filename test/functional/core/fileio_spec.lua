@@ -103,6 +103,7 @@ describe('fileio', function()
          >= stats.mmap_piece_nodes + stats.mmap_piece_free_nodes
          + stats.mmap_piece_retired_nodes)
       eq(0, stats.mmap_piece_retired_nodes)
+      eq(false, stats.mmap_piece_reclaim_scheduled)
       if text_size == nil or text_size > 0 then
         ok(stats.mmap_piece_nodes > 0)
       end
@@ -386,6 +387,7 @@ describe('fileio', function()
       eq(true, stats.mmap_piece_tree)
       ok(stats.mmap_piece_revision >= min_revision)
       ok(stats.mmap_piece_write_fast_count >= 0)
+      eq(false, stats.mmap_piece_reclaim_scheduled)
       eq(text_size(), stats.mmap_text_size)
       eq(#lines, fn.line('$'))
       eq(slice_lines(1, 8), api.nvim_buf_get_lines(0, 0, 8, true))
