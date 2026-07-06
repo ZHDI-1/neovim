@@ -3695,6 +3695,32 @@ static bool sub_mmap_literal_line(linenr_T lnum, const char *pat, size_t pat_len
   return true;
 }
 
+static bool sub_mmap_literal_line_count(linenr_T lnum, const char *pat, size_t pat_len,
+                                        bool do_all, size_t *match_countp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  *match_countp = 0;
+  ml_buf_mmap_substitute_literal_line_record(curbuf);
+  char *line = ml_get(lnum);
+  const size_t line_len = (size_t)ml_get_len(lnum);
+  size_t next_col = 0;
+
+  while (true) {
+    const char *match = sub_find_literal(line, line_len, next_col, pat, pat_len);
+    if (match == NULL) {
+      break;
+    }
+
+    (*match_countp)++;
+    next_col = (size_t)(match - line) + pat_len;
+    if (!do_all || next_col >= line_len) {
+      break;
+    }
+  }
+
+  return true;
+}
+
 static bool mmap_literal_next_candidate(linenr_T lnum, linenr_T line2, const char *pat,
                                         size_t pat_len, linenr_T *match_lnump)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
@@ -3736,9 +3762,12 @@ static bool sub_try_mmap_literal(exarg_T *eap, String pat, const char *sub,
   FUNC_ATTR_NONNULL_ARG(1, 3, 4, 7, 8, 9, 10, 11) FUNC_ATTR_WARN_UNUSED_RESULT
 {
   size_t sub_len = 0;
-  if (global_busy || subflags->do_ask || subflags->do_count || ignore_case
+  const bool count_only = subflags->do_count;
+  const bool expression_sub = sub[0] == '\\' && sub[1] == '=';
+  if (global_busy || subflags->do_ask || ignore_case || expression_sub
       || !ml_buf_has_mmap_piece_tree(curbuf)
-      || !sub_plain_literal_pattern(pat) || !sub_plain_literal_replacement(sub, &sub_len)) {
+      || !sub_plain_literal_pattern(pat)
+      || (!count_only && !sub_plain_literal_replacement(sub, &sub_len))) {
     return false;
   }
   if (pat.size > MAXCOL - 1 || sub_len > MAXCOL - 1) {
@@ -3753,19 +3782,32 @@ static bool sub_try_mmap_literal(exarg_T *eap, String pat, const char *sub,
     }
 
     size_t match_count = 0;
-    if (!sub_mmap_literal_line(match_lnum, pat.data, pat.size, sub, sub_len, subflags->do_all,
-                               got_matchp, did_savep, &match_count)) {
+    const bool ok = count_only
+                    ? sub_mmap_literal_line_count(match_lnum, pat.data, pat.size,
+                                                  subflags->do_all, &match_count)
+                    : sub_mmap_literal_line(match_lnum, pat.data, pat.size, sub, sub_len,
+                                            subflags->do_all, got_matchp, did_savep,
+                                            &match_count);
+    if (!ok) {
       *got_quitp = true;
       return true;
     }
 
     if (match_count > 0) {
+      if (match_count > (size_t)INT64_MAX
+          || sub_nsubs > INT64_MAX - (int64_t)match_count) {
+        *got_quitp = true;
+        return true;
+      }
       sub_nsubs += (int64_t)match_count;
       sub_nlines++;
-      if (*first_linep == 0) {
-        *first_linep = match_lnum;
+      *got_matchp = true;
+      if (!count_only) {
+        if (*first_linep == 0) {
+          *first_linep = match_lnum;
+        }
+        *last_linep = match_lnum + 1;
       }
-      *last_linep = match_lnum + 1;
     }
 
     if (match_lnum >= line2) {

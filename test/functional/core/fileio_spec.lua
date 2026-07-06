@@ -709,6 +709,41 @@ describe('fileio', function()
     eq(literal_count + 1, stats.mmap_substitute_literal_count)
   end)
 
+  it('counts literal substitutes through mmap candidates', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('count mmap row %05d ordinary ascii'):format(i)
+    end
+    lines[1234] = 'count mmap needle one needle two'
+    lines[30000] = 'count mmap needle three'
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    local literal_count = stats.mmap_substitute_literal_count
+    local literal_line_count = stats.mmap_substitute_literal_line_count
+    local revision = stats.mmap_piece_revision
+    local add_len = stats.mmap_piece_add_len
+
+    matches('3 matches on 2 lines', fn.execute([[%s/needle/replacement/gn]]))
+    eq(lines[1234], fn.getline(1234))
+    eq(lines[30000], fn.getline(30000))
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(revision, stats.mmap_piece_revision)
+    eq(add_len, stats.mmap_piece_add_len)
+    eq(literal_count + 1, stats.mmap_substitute_literal_count)
+    eq(literal_line_count + 2, stats.mmap_substitute_literal_line_count)
+  end)
+
   it('keeps mmap piece tree active for complex regex substitute', function()
     local lines = {}
     for i = 1, 42000 do
