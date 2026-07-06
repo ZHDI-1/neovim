@@ -3780,13 +3780,11 @@ static int do_sub(exarg_T *eap, const proftime_T timeout, const int cmdpreview_n
         size_t literal_line_start = line_start;
         size_t literal_line_len = 0;
         colnr_T literal_col = 0;
-        char *literal_line = NULL;
         const bool has_literal =
-          ml_get_buf_mmap_literal_match_at(curbuf, &literal_offset, &literal_lnum,
-                                           &literal_line_start, mmap_required_literal,
-                                           mmap_required_literal_len, &literal_line,
-                                           &literal_line_len, &literal_col);
-        xfree(literal_line);
+          ml_get_buf_mmap_literal_match_at_pos(curbuf, &literal_offset, &literal_lnum,
+                                               &literal_line_start, mmap_required_literal,
+                                               mmap_required_literal_len, &literal_line_len,
+                                               &literal_col);
         if (!has_literal || literal_lnum > line2) {
           break;
         }
@@ -4784,13 +4782,11 @@ void ex_global(exarg_T *eap)
           size_t literal_line_start = line_start;
           size_t literal_line_len = 0;
           colnr_T literal_col = 0;
-          char *literal_line = NULL;
           const bool has_literal =
-            ml_get_buf_mmap_literal_match_at(curbuf, &literal_offset, &literal_lnum,
-                                             &literal_line_start, mmap_required_literal,
-                                             mmap_required_literal_len, &literal_line,
-                                             &literal_line_len, &literal_col);
-          xfree(literal_line);
+            ml_get_buf_mmap_literal_match_at_pos(curbuf, &literal_offset, &literal_lnum,
+                                                 &literal_line_start, mmap_required_literal,
+                                                 mmap_required_literal_len, &literal_line_len,
+                                                 &literal_col);
           if (!has_literal || literal_lnum > eap->line2) {
             break;
           }

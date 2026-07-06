@@ -5787,13 +5787,11 @@ static bool vgr_match_buflines(qf_list_T *qfl, char *fname, buf_T *buf, char *sp
           size_t literal_line_start = line_start;
           size_t literal_line_len = 0;
           colnr_T literal_col = 0;
-          char *literal_line = NULL;
           const bool has_literal =
-            ml_get_buf_mmap_literal_match_at(buf, &literal_offset, &literal_lnum,
-                                             &literal_line_start, mmap_required_literal,
-                                             mmap_required_literal_len, &literal_line,
-                                             &literal_line_len, &literal_col);
-          xfree(literal_line);
+            ml_get_buf_mmap_literal_match_at_pos(buf, &literal_offset, &literal_lnum,
+                                                 &literal_line_start, mmap_required_literal,
+                                                 mmap_required_literal_len, &literal_line_len,
+                                                 &literal_col);
           if (!has_literal) {
             break;
           }

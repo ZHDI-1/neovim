@@ -3768,12 +3768,11 @@ char *ml_get_buf_mmap_literal_match_line(buf_T *buf, mmap_literal_match_T match)
   return xmemdupz(buf->b_ml.ml_mmap_base + match.line_start, match.line_len);
 }
 
-bool ml_get_buf_mmap_literal_match_at(buf_T *buf, size_t *start_offsetp, linenr_T *lnump,
-                                      size_t *line_startp, const char *pat, size_t pat_len,
-                                      char **linep, size_t *line_lenp, colnr_T *colp)
+bool ml_get_buf_mmap_literal_match_at_pos(buf_T *buf, size_t *start_offsetp, linenr_T *lnump,
+                                          size_t *line_startp, const char *pat, size_t pat_len,
+                                          size_t *line_lenp, colnr_T *colp)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
 {
-  *linep = NULL;
   *line_lenp = 0;
   if (!ml_mmap_is_active(buf) || pat_len == 0
       || *lnump < 1 || *lnump > buf->b_ml.ml_line_count) {
@@ -3805,15 +3804,7 @@ bool ml_get_buf_mmap_literal_match_at(buf_T *buf, size_t *start_offsetp, linenr_
       return false;
     }
 
-    const size_t line_len = line_end - line_start;
-    char *line = xmallocz(line_len);
-    if (piece_tree_read(tree, line_start, line, line_len) != line_len) {
-      xfree(line);
-      return false;
-    }
-
-    *linep = line;
-    *line_lenp = line_len;
+    *line_lenp = line_end - line_start;
     *colp = (colnr_T)(match_offset - line_start);
     *lnump = (linenr_T)lnum;
     *line_startp = line_start;
@@ -3852,7 +3843,6 @@ bool ml_get_buf_mmap_literal_match_at(buf_T *buf, size_t *start_offsetp, linenr_
   }
 
   const size_t line_len = line_end - line_start;
-  *linep = xmemdupz(base + line_start, line_len);
   *line_lenp = line_len;
   *colp = (colnr_T)(match_offset - line_start);
   *lnump = lnum;
@@ -3861,12 +3851,35 @@ bool ml_get_buf_mmap_literal_match_at(buf_T *buf, size_t *start_offsetp, linenr_
   return true;
 }
 
-bool ml_get_buf_mmap_literal_match_before(buf_T *buf, size_t *end_offsetp, linenr_T *lnump,
-                                          size_t *line_startp, const char *pat, size_t pat_len,
-                                          char **linep, size_t *line_lenp, colnr_T *colp)
+bool ml_get_buf_mmap_literal_match_at(buf_T *buf, size_t *start_offsetp, linenr_T *lnump,
+                                      size_t *line_startp, const char *pat, size_t pat_len,
+                                      char **linep, size_t *line_lenp, colnr_T *colp)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
 {
   *linep = NULL;
+  if (!ml_get_buf_mmap_literal_match_at_pos(buf, start_offsetp, lnump, line_startp, pat,
+                                            pat_len, line_lenp, colp)) {
+    return false;
+  }
+
+  if (buf->b_ml.ml_piece_tree != NULL) {
+    *linep = xmallocz(*line_lenp);
+    if (piece_tree_read(buf->b_ml.ml_piece_tree, *line_startp, *linep, *line_lenp)
+        != *line_lenp) {
+      XFREE_CLEAR(*linep);
+      return false;
+    }
+  } else {
+    *linep = xmemdupz(buf->b_ml.ml_mmap_base + *line_startp, *line_lenp);
+  }
+  return true;
+}
+
+bool ml_get_buf_mmap_literal_match_before_pos(buf_T *buf, size_t *end_offsetp, linenr_T *lnump,
+                                              size_t *line_startp, const char *pat,
+                                              size_t pat_len, size_t *line_lenp, colnr_T *colp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
   *line_lenp = 0;
   if (!ml_mmap_is_active(buf) || pat_len == 0 || *lnump < 1
       || *lnump > buf->b_ml.ml_line_count) {
@@ -3915,24 +3928,35 @@ bool ml_get_buf_mmap_literal_match_before(buf_T *buf, size_t *end_offsetp, linen
     return false;
   }
 
-  const size_t line_len = line_end - line_start;
-  char *line = NULL;
-  if (buf->b_ml.ml_piece_tree != NULL) {
-    line = xmallocz(line_len);
-    if (piece_tree_read(buf->b_ml.ml_piece_tree, line_start, line, line_len) != line_len) {
-      xfree(line);
-      return false;
-    }
-  } else {
-    line = xmemdupz(buf->b_ml.ml_mmap_base + line_start, line_len);
-  }
-
-  *linep = line;
-  *line_lenp = line_len;
+  *line_lenp = line_end - line_start;
   *colp = (colnr_T)(match_offset - line_start);
   *lnump = found_lnum;
   *line_startp = line_start;
   *end_offsetp = match_offset;
+  return true;
+}
+
+bool ml_get_buf_mmap_literal_match_before(buf_T *buf, size_t *end_offsetp, linenr_T *lnump,
+                                          size_t *line_startp, const char *pat, size_t pat_len,
+                                          char **linep, size_t *line_lenp, colnr_T *colp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  *linep = NULL;
+  if (!ml_get_buf_mmap_literal_match_before_pos(buf, end_offsetp, lnump, line_startp, pat,
+                                                pat_len, line_lenp, colp)) {
+    return false;
+  }
+
+  if (buf->b_ml.ml_piece_tree != NULL) {
+    *linep = xmallocz(*line_lenp);
+    if (piece_tree_read(buf->b_ml.ml_piece_tree, *line_startp, *linep, *line_lenp)
+        != *line_lenp) {
+      XFREE_CLEAR(*linep);
+      return false;
+    }
+  } else {
+    *linep = xmemdupz(buf->b_ml.ml_mmap_base + *line_startp, *line_lenp);
+  }
   return true;
 }
 
