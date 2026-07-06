@@ -410,9 +410,7 @@ static bool ml_mmap_can_edit_tree(const buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
   return ml_mmap_is_active(buf)
-         && buf->b_ml.ml_piece_tree != NULL
-         && buf->b_ml.ml_mfp != NULL
-         && buf->b_ml.ml_mfp->mf_fd < 0;
+         && buf->b_ml.ml_piece_tree != NULL;
 }
 
 enum {
@@ -919,6 +917,15 @@ static void ml_mmap_clear_cache(buf_T *buf)
   buf->b_ml.ml_line_offset = 0;
 }
 
+static void ml_mmap_disable_legacy_swap(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (buf->b_ml.ml_mfp != NULL && buf->b_ml.ml_mfp->mf_fd >= 0) {
+    mf_close_file(buf, false);
+  }
+  buf->b_may_swap = false;
+}
+
 static void ml_mmap_clear_piece_tree(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
@@ -1364,8 +1371,8 @@ static bool ml_mmap_flush_dirty_line(buf_T *buf, bool noalloc)
 ///
 /// Ownership of "base" and "line_starts" transfers to memline on success.
 /// Callers must keep the normal memline tree in its initial empty-buffer state.
-/// A swapfile may already be open; it then represents an unchanged buffer until
-/// the mmap lines are materialized on the first mutation.
+/// A legacy memfile swapfile may already be open; it is closed here because
+/// mmap piece-tree buffers must not materialize just to satisfy memline swap.
 int ml_set_mmap_lines(buf_T *buf, char *base, size_t size, size_t *line_starts,
                       size_t index_count, linenr_T line_count, bool noeol)
   FUNC_ATTR_NONNULL_ALL
@@ -1383,6 +1390,7 @@ int ml_set_mmap_lines(buf_T *buf, char *base, size_t size, size_t *line_starts,
   }
 
   ml_flush_line(buf, false);
+  ml_mmap_disable_legacy_swap(buf);
   ml_mmap_line_index_T *line_index = ml_mmap_line_index_new(line_starts, index_count);
   ml_mmap_storage_T *mmap_storage = ml_mmap_storage_new(base, size, line_index);
   const size_t newline_count = (size_t)line_count - (noeol ? 1 : 0);
@@ -3166,6 +3174,10 @@ void ml_open_file(buf_T *buf)
       || (cmdmod.cmod_flags & CMOD_NOSWAPFILE)
       || buf->terminal) {
     return;  // nothing to do
+  }
+  if (ml_mmap_is_active(buf) && buf->b_ml.ml_piece_tree != NULL) {
+    ml_mmap_disable_legacy_swap(buf);
+    return;
   }
   if (ml_mmap_materialize(buf) == FAIL) {
     return;
