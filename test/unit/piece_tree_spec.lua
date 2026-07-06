@@ -230,6 +230,15 @@ local function find_literal(tree, offset, len, pat)
   return tonumber(offp[0])
 end
 
+local function find_literal_before(tree, offset, pat)
+  local offp = ffi.new('size_t[1]')
+  local found = lib.piece_tree_find_literal_before(tree, offset, pat, #pat, offp)
+  if not found then
+    return nil
+  end
+  return tonumber(offp[0])
+end
+
 local function find_shadow(s, offset, len, pat)
   if #pat == 0 or offset > #s or len > #s - offset or #pat > len then
     return nil
@@ -979,6 +988,40 @@ describe('piece tree', function()
     repeated_shadow = insert_shadow(repeated_shadow, 4, 'aca')
     check_tree(repeated.tree, repeated_shadow)
     eq(0, find_literal(repeated.tree, 0, #repeated_shadow, 'ababaca'))
+  end)
+
+  itp('finds the last literal before offsets across piece boundaries', function()
+    local w = new_tree('abcdijabcdij')
+    local shadow = 'abcdijabcdij'
+
+    ok(lib.piece_tree_insert(w.tree, 4, 'efgh', 4))
+    shadow = insert_shadow(shadow, 4, 'efgh')
+    ok(lib.piece_tree_insert(w.tree, 14, 'efgh', 4))
+    shadow = insert_shadow(shadow, 14, 'efgh')
+    check_tree(w.tree, shadow)
+
+    eq(12, find_literal_before(w.tree, #shadow, 'cdef'))
+    eq(12, find_literal_before(w.tree, 16, 'cdef'))
+    eq(2, find_literal_before(w.tree, 15, 'cdef'))
+    eq(13, find_literal_before(w.tree, #shadow, 'defghi'))
+    eq(17, find_literal_before(w.tree, #shadow, 'h'))
+    eq(10, find_literal_before(w.tree, #shadow + 100, 'a'))
+    eq(nil, find_literal_before(w.tree, 3, 'cdef'))
+    eq(nil, find_literal_before(w.tree, #shadow, 'xyz'))
+    eq(nil, find_literal_before(w.tree, #shadow, ''))
+
+    local multi = new_tree('aceg')
+    local multi_shadow = 'aceg'
+    ok(lib.piece_tree_insert(multi.tree, 1, 'b', 1))
+    multi_shadow = insert_shadow(multi_shadow, 1, 'b')
+    ok(lib.piece_tree_insert(multi.tree, 3, 'd', 1))
+    multi_shadow = insert_shadow(multi_shadow, 3, 'd')
+    ok(lib.piece_tree_insert(multi.tree, 5, 'f', 1))
+    multi_shadow = insert_shadow(multi_shadow, 5, 'f')
+    check_tree(multi.tree, multi_shadow)
+
+    eq(0, find_literal_before(multi.tree, #multi_shadow, 'abcdefg'))
+    eq(nil, find_literal_before(multi.tree, #multi_shadow - 1, 'abcdefg'))
   end)
 
   itp('collects non-overlapping literal matches across pieces', function()

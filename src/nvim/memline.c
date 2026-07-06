@@ -2443,6 +2443,42 @@ static const char *ml_mmap_find_literal(const char *text, size_t text_len, const
 #endif
 }
 
+static const char *ml_mmap_find_byte_last(const char *text, size_t text_len, uint8_t byte)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  for (size_t i = text_len; i > 0; i--) {
+    if ((uint8_t)text[i - 1] == byte) {
+      return text + i - 1;
+    }
+  }
+  return NULL;
+}
+
+static const char *ml_mmap_find_literal_before(const char *text, size_t text_len,
+                                               const char *pat, size_t pat_len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (text_len < pat_len) {
+    return NULL;
+  }
+  if (pat_len == 1) {
+    return ml_mmap_find_byte_last(text, text_len, (uint8_t)pat[0]);
+  }
+
+  size_t search_len = text_len - pat_len + 1;
+  while (search_len > 0) {
+    const char *candidate = ml_mmap_find_byte_last(text, search_len, (uint8_t)pat[0]);
+    if (candidate == NULL) {
+      return NULL;
+    }
+    if (memcmp(candidate, pat, pat_len) == 0) {
+      return candidate;
+    }
+    search_len = (size_t)(candidate - text);
+  }
+  return NULL;
+}
+
 static bool ml_mmap_can_use_avx2(void)
 {
 #ifdef NVIM_MEMLINE_AVX2
@@ -3588,19 +3624,6 @@ bool ml_get_buf_mmap_literal_match_at(buf_T *buf, size_t *start_offsetp, linenr_
   return true;
 }
 
-typedef struct {
-  size_t last_offset;
-  bool found;
-} ml_mmap_piece_last_literal_match_T;
-
-static bool ml_mmap_piece_last_literal_match(size_t offset, void *ctx)
-{
-  ml_mmap_piece_last_literal_match_T *match = ctx;
-  match->last_offset = offset;
-  match->found = true;
-  return true;
-}
-
 bool ml_get_buf_mmap_literal_match_before(buf_T *buf, size_t *end_offsetp, linenr_T *lnump,
                                           size_t *line_startp, const char *pat, size_t pat_len,
                                           char **linep, size_t *line_lenp, colnr_T *colp)
@@ -3623,13 +3646,9 @@ bool ml_get_buf_mmap_literal_match_before(buf_T *buf, size_t *end_offsetp, linen
       return false;
     }
 
-    ml_mmap_piece_last_literal_match_T ctx = { 0 };
-    if (!piece_tree_find_literals(tree, 0, end_offset, pat, pat_len,
-                                  ml_mmap_piece_last_literal_match, &ctx)
-        || !ctx.found) {
+    if (!piece_tree_find_literal_before(tree, end_offset, pat, pat_len, &match_offset)) {
       return false;
     }
-    match_offset = ctx.last_offset;
     found = true;
   } else {
     const size_t end_offset = MIN(*end_offsetp, buf->b_ml.ml_mmap_size);
@@ -3637,16 +3656,11 @@ bool ml_get_buf_mmap_literal_match_before(buf_T *buf, size_t *end_offsetp, linen
       return false;
     }
 
-    size_t offset = 0;
-    while (offset < end_offset) {
-      const char *match = ml_mmap_find_literal(buf->b_ml.ml_mmap_base + offset,
-                                               end_offset - offset, pat, pat_len);
-      if (match == NULL) {
-        break;
-      }
+    const char *match = ml_mmap_find_literal_before(buf->b_ml.ml_mmap_base, end_offset,
+                                                    pat, pat_len);
+    if (match != NULL) {
       match_offset = (size_t)(match - buf->b_ml.ml_mmap_base);
       found = true;
-      offset = match_offset + 1;
     }
   }
   if (!found) {

@@ -1903,6 +1903,42 @@ static const char *pt_find_literal_bytes(const char *data, size_t len, const cha
 #endif
 }
 
+static const char *pt_find_byte_last(const char *data, size_t len, uint8_t byte)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  for (size_t i = len; i > 0; i--) {
+    if ((uint8_t)data[i - 1] == byte) {
+      return data + i - 1;
+    }
+  }
+  return NULL;
+}
+
+static const char *pt_find_literal_bytes_last(const char *data, size_t len, const char *pat,
+                                              size_t pat_len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (len < pat_len) {
+    return NULL;
+  }
+  if (pat_len == 1) {
+    return pt_find_byte_last(data, len, (uint8_t)pat[0]);
+  }
+
+  size_t search_len = len - pat_len + 1;
+  while (search_len > 0) {
+    const char *candidate = pt_find_byte_last(data, search_len, (uint8_t)pat[0]);
+    if (candidate == NULL) {
+      return NULL;
+    }
+    if (memcmp(candidate, pat, pat_len) == 0) {
+      return candidate;
+    }
+    search_len = (size_t)(candidate - data);
+  }
+  return NULL;
+}
+
 static bool pt_literal_kmp_advance(const char *pat, const size_t *prefix, size_t pat_len,
                                    size_t *matchedp, char c)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
@@ -2084,6 +2120,101 @@ bool piece_tree_find_literal(PieceTree *tree, size_t offset, size_t len,
   }
   *match_offsetp = ctx.found_offset;
   return true;
+}
+
+static bool pt_find_literal_before_boundary(const PieceTreeSpanVec *vec, size_t boundary,
+                                            const char *pat, size_t pat_len,
+                                            char *window, size_t *match_offsetp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (pat_len <= 1 || vec->byte_len > SIZE_MAX - vec->logical_start) {
+    return false;
+  }
+
+  const size_t vec_end = vec->logical_start + vec->byte_len;
+  if (boundary < vec->logical_start || boundary > vec_end) {
+    return false;
+  }
+
+  const size_t left_len = MIN(boundary - vec->logical_start, pat_len - 1);
+  const size_t right_len = MIN(vec_end - boundary, pat_len - 1);
+  const size_t window_len = left_len + right_len;
+  if (window_len < pat_len) {
+    return false;
+  }
+
+  const size_t window_start = boundary - left_len;
+  if (piece_tree_span_vec_read(vec, window_start, window, window_len) != window_len) {
+    return false;
+  }
+
+  bool found = false;
+  size_t search_len = window_len;
+  while (search_len >= pat_len) {
+    const char *match = pt_find_literal_bytes_last(window, search_len, pat, pat_len);
+    if (match == NULL) {
+      break;
+    }
+
+    const size_t match_offset = window_start + (size_t)(match - window);
+    if (match_offset < boundary && match_offset <= SIZE_MAX - pat_len
+        && match_offset + pat_len > boundary) {
+      *match_offsetp = match_offset;
+      found = true;
+      break;
+    }
+
+    search_len = (size_t)(match - window);
+  }
+
+  return found;
+}
+
+bool piece_tree_find_literal_before(PieceTree *tree, size_t offset, const char *pat,
+                                    size_t pat_len, size_t *match_offsetp)
+{
+  if (tree == NULL || pat == NULL || match_offsetp == NULL || pat_len == 0) {
+    return false;
+  }
+
+  const size_t total = piece_tree_byte_len(tree);
+  offset = MIN(offset, total);
+  if (pat_len > offset) {
+    return false;
+  }
+
+  PieceTreeSpanVec vec = { 0 };
+  if (!piece_tree_collect_span_vec(tree, 0, offset, &vec)) {
+    return false;
+  }
+
+  if (pat_len > 1 && pat_len - 1 > SIZE_MAX / 2) {
+    piece_tree_span_vec_clear(&vec);
+    return false;
+  }
+
+  char *boundary_window = pat_len > 1 ? xmalloc((pat_len - 1) * 2) : NULL;
+  bool found = false;
+  for (size_t i = vec.count; i > 0; i--) {
+    const PieceTreeSpan *span = &vec.items[i - 1];
+    const char *match = pt_find_literal_bytes_last(span->data, span->len, pat, pat_len);
+    if (match != NULL) {
+      *match_offsetp = span->offset + (size_t)(match - span->data);
+      found = true;
+      break;
+    }
+
+    if (i > 1
+        && pt_find_literal_before_boundary(&vec, span->offset, pat, pat_len, boundary_window,
+                                           match_offsetp)) {
+      found = true;
+      break;
+    }
+  }
+
+  xfree(boundary_window);
+  piece_tree_span_vec_clear(&vec);
+  return found;
 }
 
 bool piece_tree_find_literals(PieceTree *tree, size_t offset, size_t len,
