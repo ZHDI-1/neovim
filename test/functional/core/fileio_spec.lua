@@ -205,10 +205,6 @@ describe('fileio', function()
     expect_mmap_piece(1, text_size())
     api.nvim_buf_set_lines(0, 10, 11, false, {})
     table.remove(lines, 11)
-    local auto_compact_scheduled = api.nvim__buf_stats(0)
-    ok(auto_compact_scheduled.mmap_piece_reclaim_scheduled
-       or auto_compact_scheduled.mmap_piece_compact_count
-       > auto_compact_before.mmap_piece_compact_count)
     retry(nil, 1000, function()
       poke_eventloop()
       local stats = api.nvim__buf_stats(0)

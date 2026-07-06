@@ -348,6 +348,15 @@ typedef struct {
   bool ok;
 } ml_mmap_piece_literal_match_job_T;
 
+typedef struct {
+  bufref_T bufref;
+  PieceTree *source_tree;
+  ml_mmap_storage_T *mmap_storage;
+  PieceTreeSpanVec span_vec;
+  PieceTree *new_tree;
+  bool ok;
+} ml_mmap_piece_compact_job_T;
+
 typedef struct ml_mmap_line_index ml_mmap_line_index_T;
 typedef struct ml_mmap_retired_piece_storage ml_mmap_retired_piece_storage_T;
 
@@ -434,6 +443,7 @@ struct ml_mmap_retired_piece_storage {
 };
 
 static bool ml_mmap_piece_reclaim_scheduled = false;
+static bool ml_mmap_piece_compact_worker_active = false;
 static ml_mmap_retired_piece_storage_T *ml_mmap_retired_piece_storage = NULL;
 
 static void ml_mmap_piece_reclaim_schedule(void);
@@ -712,6 +722,108 @@ static bool ml_mmap_should_compact_piece_tree(buf_T *buf)
   return add_len > live_add_len && add_len - live_add_len >= dead_add_min;
 }
 
+static void ml_mmap_piece_compact_job_dispose_tree(PieceTree *tree)
+{
+  if (tree == NULL) {
+    return;
+  }
+
+  size_t budget = SIZE_MAX;
+  (void)piece_tree_dispose_budget(tree, &budget);
+  xfree(tree);
+}
+
+static void ml_mmap_piece_compact_job_free(ml_mmap_piece_compact_job_T *job)
+{
+  if (job == NULL) {
+    return;
+  }
+
+  ml_mmap_piece_compact_job_dispose_tree(job->new_tree);
+  piece_tree_span_vec_clear(&job->span_vec);
+  ml_mmap_storage_unref(job->mmap_storage);
+  xfree(job);
+}
+
+static void ml_mmap_piece_compact_finish_event(void **argv)
+{
+  ml_mmap_piece_compact_job_T *job = argv[0];
+  ml_mmap_piece_compact_worker_active = false;
+
+  if (job->ok && bufref_valid(&job->bufref)) {
+    buf_T *buf = job->bufref.br_buf;
+    if (ml_mmap_is_active(buf)
+        && buf->b_ml.ml_piece_tree == job->source_tree
+        && buf->b_ml.ml_mmap_storage == job->mmap_storage
+        && job->source_tree->revision == job->span_vec.revision) {
+      buf->b_ml.ml_piece_tree = job->new_tree;
+      job->new_tree = NULL;
+      buf->b_ml.ml_mmap_piece_compact_count++;
+      ml_mmap_clear_cache(buf);
+      ml_mmap_retire_piece_storage(job->source_tree,
+                                   ml_mmap_storage_ref(buf->b_ml.ml_mmap_storage));
+    }
+  }
+
+  ml_mmap_piece_compact_job_free(job);
+  ml_mmap_piece_reclaim_schedule();
+}
+
+static void ml_mmap_piece_compact_worker(void *arg)
+{
+  ml_mmap_piece_compact_job_T *job = arg;
+  job->ok = piece_tree_clone_compact_from_span_vec(job->new_tree, job->source_tree,
+                                                   &job->span_vec);
+  loop_schedule_deferred(&main_loop, event_create(ml_mmap_piece_compact_finish_event, job));
+}
+
+static bool ml_mmap_start_piece_compact(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (ml_mmap_piece_compact_worker_active
+      || !ml_mmap_is_active(buf)
+      || buf->b_ml.ml_piece_tree == NULL
+      || buf->b_ml.ml_mmap_storage == NULL) {
+    return false;
+  }
+
+  ml_flush_line(buf, false);
+  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL
+      || buf->b_ml.ml_mmap_storage == NULL) {
+    return false;
+  }
+
+  PieceTree *source_tree = buf->b_ml.ml_piece_tree;
+  PieceTreeSnapshot snapshot = { 0 };
+  if (!piece_tree_snapshot(source_tree, &snapshot)) {
+    return false;
+  }
+
+  PieceTreeSpanVec span_vec = { 0 };
+  if (!piece_tree_collect_span_vec_at_revision(source_tree, 0, snapshot.byte_len,
+                                               snapshot.revision, &span_vec)) {
+    return false;
+  }
+
+  ml_mmap_piece_compact_job_T *job = xcalloc(1, sizeof *job);
+  set_bufref(&job->bufref, buf);
+  job->source_tree = source_tree;
+  job->mmap_storage = ml_mmap_storage_ref(buf->b_ml.ml_mmap_storage);
+  job->span_vec = span_vec;
+  job->new_tree = xcalloc(1, sizeof *job->new_tree);
+
+  ml_mmap_piece_compact_worker_active = true;
+  uv_thread_t thread;
+  if (uv_thread_create(&thread, ml_mmap_piece_compact_worker, job) != 0) {
+    ml_mmap_piece_compact_worker_active = false;
+    ml_mmap_piece_compact_job_free(job);
+    return ml_buf_mmap_compact_piece_tree(buf);
+  }
+
+  uv_thread_detach(&thread);
+  return true;
+}
+
 static void ml_mmap_piece_reclaim_schedule(void);
 
 static void ml_mmap_piece_reclaim_event(void **argv)
@@ -724,7 +836,7 @@ static void ml_mmap_piece_reclaim_event(void **argv)
   bool compacted = false;
   FOR_ALL_BUFFERS(buf) {
     if (!compacted && ml_mmap_should_compact_piece_tree(buf)) {
-      compacted = ml_buf_mmap_compact_piece_tree(buf);
+      compacted = ml_mmap_start_piece_compact(buf);
       has_more |= compacted;
     }
     has_more |= ml_mmap_piece_reclaim_one(buf, &budget);
