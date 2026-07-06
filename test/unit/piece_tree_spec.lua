@@ -604,26 +604,30 @@ describe('piece tree', function()
 
     local spans = {}
     local cb = ffi.cast('PieceTreeSpanCallback', function(data, len, _)
-      eq(1, tonumber(w.tree[0].reader_count))
+      eq(0, tonumber(w.tree[0].reader_count))
+      eq(1, tonumber(w.tree[0].span_ref_count))
       spans[#spans + 1] = ffi.string(data, len)
       return true
     end)
     ok(lib.piece_tree_for_each_span(w.tree, 1, #shadow - 2, cb, nil))
     cb:free()
     eq(0, tonumber(w.tree[0].reader_count))
+    eq(0, tonumber(w.tree[0].span_ref_count))
 
     eq(shadow:sub(2, #shadow - 1), table.concat(spans))
     ok(#spans > 1)
 
     local calls = 0
     local stop_cb = ffi.cast('PieceTreeSpanCallback', function(_, _, _)
-      eq(1, tonumber(w.tree[0].reader_count))
+      eq(0, tonumber(w.tree[0].reader_count))
+      eq(1, tonumber(w.tree[0].span_ref_count))
       calls = calls + 1
       return false
     end)
     eq(false, lib.piece_tree_for_each_span(w.tree, 0, #shadow, stop_cb, nil))
     stop_cb:free()
     eq(0, tonumber(w.tree[0].reader_count))
+    eq(0, tonumber(w.tree[0].span_ref_count))
     eq(1, calls)
 
     calls = 0
@@ -636,6 +640,36 @@ describe('piece tree', function()
     eq(0, calls)
     eq(false, lib.piece_tree_for_each_span(w.tree, #shadow + 1, 0, count_cb, nil))
     count_cb:free()
+  end)
+
+  itp('allows mutation while public span callbacks consume leased spans', function()
+    local w = new_tree('abcdef')
+    local shadow = 'abcdef'
+
+    ok(lib.piece_tree_insert(w.tree, 3, 'XYZ', 3))
+    shadow = insert_shadow(shadow, 3, 'XYZ')
+    check_tree(w.tree, shadow)
+
+    local captured = {}
+    local mutated = false
+    local cb = ffi.cast('PieceTreeSpanCallback', function(data, len, _)
+      eq(0, tonumber(w.tree[0].reader_count))
+      eq(1, tonumber(w.tree[0].span_ref_count))
+      if not mutated then
+        mutated = true
+        ok(lib.piece_tree_insert(w.tree, 0, '>', 1))
+      end
+      captured[#captured + 1] = ffi.string(data, len)
+      return true
+    end)
+    ok(lib.piece_tree_for_each_span(w.tree, 0, #shadow, cb, nil))
+    cb:free()
+
+    eq(shadow, table.concat(captured))
+    shadow = insert_shadow(shadow, 0, '>')
+    check_tree(w.tree, shadow)
+    eq(0, tonumber(w.tree[0].reader_count))
+    eq(0, tonumber(w.tree[0].span_ref_count))
   end)
 
   itp('collects stable span vectors for later processing', function()

@@ -1579,7 +1579,22 @@ bool piece_tree_for_each_span(PieceTree *tree, size_t offset, size_t len,
     return false;
   }
 
-  return pt_for_each_span_guarded(tree, offset, len, callback, ctx);
+  PieceTreeSpanVec vec = { 0 };
+  if (!piece_tree_collect_span_vec(tree, offset, len, &vec)) {
+    return false;
+  }
+
+  bool ok = true;
+  for (size_t i = 0; i < vec.count; i++) {
+    const PieceTreeSpan *span = &vec.items[i];
+    if (span->len > 0 && !callback(span->data, span->len, ctx)) {
+      ok = false;
+      break;
+    }
+  }
+
+  piece_tree_span_vec_clear(&vec);
+  return ok;
 }
 
 typedef struct {
