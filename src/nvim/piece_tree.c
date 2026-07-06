@@ -46,6 +46,9 @@ typedef struct {
   size_t node_count;
 } PieceTreeCheckResult;
 
+typedef bool (*PieceTreeSpanNodeCallback)(const PieceTreeNode *node, size_t local, size_t len,
+                                          void *ctx);
+
 enum {
   PT_NODE_BLOCK_CAPACITY = 256,
   PT_ADD_CHUNK_MIN_CAPACITY = 4096,
@@ -1078,21 +1081,14 @@ bool piece_tree_rebase_original(PieceTree *tree, const char *original, size_t or
 static bool pt_span_original_start(const PieceTree *tree, const PieceTreeSpan *span,
                                    size_t *startp)
 {
-  if (tree->original == NULL || span->data == NULL) {
+  if (span->source != kPieceTreeSourceOriginal) {
     return false;
   }
 
-  const uintptr_t original = (uintptr_t)tree->original;
-  const uintptr_t data = (uintptr_t)span->data;
-  if (data < original) {
-    return false;
-  }
-
-  const size_t start = (size_t)(data - original);
+  const size_t start = span->source_start;
   if (start > tree->original_len || span->len > tree->original_len - start) {
     return false;
   }
-
   *startp = start;
   return true;
 }
@@ -1171,6 +1167,7 @@ bool piece_tree_clone_compact_from_span_vec(PieceTree *dst, const PieceTree *src
     const PieceTreeSpan *span = &vec->items[i];
     if (span->offset != logical_offset
         || span->len > vec->byte_len - logical_offset
+        || (span->source != kPieceTreeSourceOriginal && span->source != kPieceTreeSourceAdd)
         || (span->len > 0 && span->data == NULL)) {
       ok = false;
       break;
@@ -1533,8 +1530,8 @@ bool piece_tree_line_bounds(PieceTree *tree, size_t lnum, size_t *startp, size_t
   return ok;
 }
 
-static bool pt_for_each_span(const PieceTree *tree, size_t offset, size_t len,
-                             PieceTreeSpanCallback callback, void *ctx)
+static bool pt_for_each_span_node(const PieceTree *tree, size_t offset, size_t len,
+                                  PieceTreeSpanNodeCallback callback, void *ctx)
 {
   if (callback == NULL) {
     return false;
@@ -1553,7 +1550,7 @@ static bool pt_for_each_span(const PieceTree *tree, size_t offset, size_t len,
   size_t done = 0;
   while (node != NULL && done < len) {
     const size_t todo = MIN(node->len - local, len - done);
-    if (todo > 0 && !callback(pt_node_data(tree, node) + local, todo, ctx)) {
+    if (todo > 0 && !callback(node, local, todo, ctx)) {
       return false;
     }
     done += todo;
@@ -1561,6 +1558,34 @@ static bool pt_for_each_span(const PieceTree *tree, size_t offset, size_t len,
     local = 0;
   }
   return done == len;
+}
+
+typedef struct {
+  const PieceTree *tree;
+  PieceTreeSpanCallback callback;
+  void *ctx;
+} PieceTreeSpanCallbackCtx;
+
+static bool pt_span_node_callback(const PieceTreeNode *node, size_t local, size_t len, void *ctx)
+{
+  PieceTreeSpanCallbackCtx *callback_ctx = ctx;
+  return callback_ctx->callback(pt_node_data(callback_ctx->tree, node) + local, len,
+                                callback_ctx->ctx);
+}
+
+static bool pt_for_each_span(const PieceTree *tree, size_t offset, size_t len,
+                             PieceTreeSpanCallback callback, void *ctx)
+{
+  if (callback == NULL) {
+    return false;
+  }
+
+  PieceTreeSpanCallbackCtx callback_ctx = {
+    .tree = tree,
+    .callback = callback,
+    .ctx = ctx,
+  };
+  return pt_for_each_span_node(tree, offset, len, pt_span_node_callback, &callback_ctx);
 }
 
 static bool pt_for_each_span_guarded(PieceTree *tree, size_t offset, size_t len,
@@ -1598,13 +1623,14 @@ bool piece_tree_for_each_span(PieceTree *tree, size_t offset, size_t len,
 }
 
 typedef struct {
+  const PieceTree *tree;
   PieceTreeSpan *spans;
   size_t count;
   size_t capacity;
   size_t logical_offset;
 } PieceTreeSpanCollectCtx;
 
-static bool pt_collect_span(const char *data, size_t len, void *ctx)
+static bool pt_collect_span(const PieceTreeNode *node, size_t local, size_t len, void *ctx)
 {
   PieceTreeSpanCollectCtx *collect_ctx = ctx;
   if (collect_ctx->count == collect_ctx->capacity) {
@@ -1619,9 +1645,11 @@ static bool pt_collect_span(const char *data, size_t len, void *ctx)
   }
 
   collect_ctx->spans[collect_ctx->count++] = (PieceTreeSpan){
-    .data = data,
+    .data = pt_node_data(collect_ctx->tree, node) + local,
     .len = len,
     .offset = collect_ctx->logical_offset,
+    .source = node->source,
+    .source_start = node->start + local,
   };
   collect_ctx->logical_offset += len;
   return true;
@@ -1636,11 +1664,14 @@ static bool pt_collect_span_vec(PieceTree *tree, size_t offset, size_t len,
   }
   *vec = (PieceTreeSpanVec){ 0 };
 
-  PieceTreeSpanCollectCtx ctx = { .logical_offset = offset };
+  PieceTreeSpanCollectCtx ctx = {
+    .tree = tree,
+    .logical_offset = offset,
+  };
   piece_tree_reader_enter(tree);
   const uint64_t actual_revision = tree->revision;
   const bool ok = (!check_revision || actual_revision == revision)
-                  && pt_for_each_span(tree, offset, len, pt_collect_span, &ctx)
+                  && pt_for_each_span_node(tree, offset, len, pt_collect_span, &ctx)
                   && (!check_revision || tree->revision == revision);
   if (ok && lease_storage) {
     pt_span_ref_count_increment(tree);
@@ -1698,14 +1729,17 @@ static bool pt_collect_read_span_vec(PieceTree *tree, size_t offset, size_t len,
     return true;
   }
 
-  PieceTreeSpanCollectCtx ctx = { .logical_offset = offset };
+  PieceTreeSpanCollectCtx ctx = {
+    .tree = tree,
+    .logical_offset = offset,
+  };
   piece_tree_reader_enter(tree);
   const uint64_t revision = tree->revision;
   const size_t total = piece_tree_byte_len(tree);
   bool ok = true;
   if (offset < total) {
     len = MIN(len, total - offset);
-    ok = pt_for_each_span(tree, offset, len, pt_collect_span, &ctx);
+    ok = pt_for_each_span_node(tree, offset, len, pt_collect_span, &ctx);
     if (ok) {
       pt_span_ref_count_increment(tree);
     }

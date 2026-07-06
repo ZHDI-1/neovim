@@ -20,6 +20,8 @@ typedef struct {
   const char *data;
   size_t len;
   size_t offset;
+  PieceTreeSource source;
+  size_t source_start;
 } PieceTreeSpan;
 typedef struct {
   PieceTree *owner;

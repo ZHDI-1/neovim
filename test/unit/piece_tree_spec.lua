@@ -34,6 +34,8 @@ typedef struct {
   const char *data;
   size_t len;
   size_t offset;
+  int source;
+  size_t source_start;
 } PieceTreeSpan;
 typedef struct {
   PieceTree *owner;
@@ -712,11 +714,29 @@ describe('piece tree', function()
     eq(shadow:sub(start + 1, start + len), read_span_vec(span_vec))
 
     local offset = start
+    local original = ffi.cast('const char *', w.original)
+    local saw_original_span = false
+    local saw_add_span = false
     for i = 0, count - 1 do
-      eq(offset, tonumber(span_vec[0].items[i].offset))
-      offset = offset + tonumber(span_vec[0].items[i].len)
+      local span = span_vec[0].items[i]
+      local span_len = tonumber(span.len)
+      local source = tonumber(span.source)
+      local source_start = tonumber(span.source_start)
+      eq(offset, tonumber(span.offset))
+      if source == 0 then
+        saw_original_span = true
+        eq(ffi.string(original + source_start, span_len), ffi.string(span.data, span_len))
+      elseif source == 1 then
+        saw_add_span = true
+        ok(source_start + span_len <= tonumber(w.tree[0].add_len))
+      else
+        ok(false)
+      end
+      offset = offset + span_len
     end
     eq(start + len, offset)
+    eq(true, saw_original_span)
+    eq(true, saw_add_span)
 
     ok(lib.piece_tree_delete(w.tree, 0, #shadow))
     ok(lib.piece_tree_insert(w.tree, 0, 'replacement', 11))
