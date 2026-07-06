@@ -54,6 +54,9 @@ enum {
 
 #include "piece_tree.c.generated.h"
 
+static size_t pt_reader_count_load(const PieceTree *tree);
+static void pt_reclaim_retired_nodes(PieceTree *tree);
+
 static size_t pt_count_lfs(const char *data, size_t len)
 {
   if (len == 0) {
@@ -280,6 +283,11 @@ static void pt_add_node_block(PieceTree *tree)
 
 static PieceTreeNode *pt_alloc_node(PieceTree *tree)
 {
+  if (tree->free_nodes == NULL && tree->retired_nodes != NULL
+      && pt_reader_count_load(tree) == 0) {
+    pt_reclaim_retired_nodes(tree);
+  }
+
   if (tree->free_nodes != NULL) {
     PieceTreeNode *node = tree->free_nodes;
     tree->free_nodes = node->next_free;
@@ -1004,9 +1012,17 @@ void piece_tree_reader_enter(PieceTree *tree)
 
 void piece_tree_reader_leave(PieceTree *tree)
 {
-  if (pt_reader_count_decrement(tree) == 0) {
-    pt_reclaim_retired_nodes(tree);
+  (void)pt_reader_count_decrement(tree);
+}
+
+bool piece_tree_reclaim_retired(PieceTree *tree)
+{
+  if (pt_reader_count_load(tree) != 0) {
+    return false;
   }
+
+  pt_reclaim_retired_nodes(tree);
+  return true;
 }
 
 static bool pt_byte_at(const PieceTree *tree, size_t offset, char *chp)

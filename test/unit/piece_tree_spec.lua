@@ -392,12 +392,18 @@ describe('piece tree', function()
 
     lib.piece_tree_reader_leave(w.tree)
     eq(1, tonumber(w.tree[0].reader_count))
+    eq(false, lib.piece_tree_reclaim_retired(w.tree))
     eq(retired_count, tonumber(lib.piece_tree_retired_node_count(w.tree)))
     ok(w.tree[0].retired_nodes ~= null)
     ok(w.tree[0].free_nodes == null)
 
     lib.piece_tree_reader_leave(w.tree)
     eq(0, tonumber(w.tree[0].reader_count))
+    eq(retired_count, tonumber(lib.piece_tree_retired_node_count(w.tree)))
+    ok(w.tree[0].retired_nodes ~= null)
+    ok(w.tree[0].free_nodes == null)
+
+    ok(lib.piece_tree_reclaim_retired(w.tree))
     eq(0, tonumber(lib.piece_tree_retired_node_count(w.tree)))
     ok(w.tree[0].retired_nodes == null)
     ok(w.tree[0].free_nodes ~= null)
