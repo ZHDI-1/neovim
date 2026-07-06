@@ -1711,38 +1711,104 @@ void piece_tree_free_spans(PieceTreeSpan *spans)
   xfree(spans);
 }
 
-typedef struct {
-  char *dst;
-  size_t copied;
-} PieceTreeReadCtx;
-
-static bool pt_read_span(const char *data, size_t len, void *ctx)
+static bool pt_collect_read_span_vec(PieceTree *tree, size_t offset, size_t len,
+                                     PieceTreeSpanVec *vec)
 {
-  PieceTreeReadCtx *read_ctx = ctx;
-  memcpy(read_ctx->dst + read_ctx->copied, data, len);
-  read_ctx->copied += len;
-  return true;
-}
-
-size_t piece_tree_read(PieceTree *tree, size_t offset, char *dst, size_t len)
-{
+  if (vec == NULL) {
+    return false;
+  }
+  *vec = (PieceTreeSpanVec){ 0 };
   if (len == 0) {
-    return 0;
+    return true;
   }
 
-  PieceTreeReadCtx ctx = { .dst = dst };
+  PieceTreeSpanCollectCtx ctx = { .logical_offset = offset };
   piece_tree_reader_enter(tree);
+  const uint64_t revision = tree->revision;
   const size_t total = piece_tree_byte_len(tree);
   bool ok = true;
   if (offset < total) {
     len = MIN(len, total - offset);
-    ok = pt_for_each_span(tree, offset, len, pt_read_span, &ctx);
+    ok = pt_for_each_span(tree, offset, len, pt_collect_span, &ctx);
+    if (ok) {
+      pt_span_ref_count_increment(tree);
+    }
+  } else {
+    len = 0;
   }
   piece_tree_reader_leave(tree);
   if (!ok) {
+    xfree(ctx.spans);
+    return false;
+  }
+
+  *vec = (PieceTreeSpanVec){
+    .owner = len > 0 ? tree : NULL,
+    .items = ctx.spans,
+    .count = ctx.count,
+    .logical_start = offset,
+    .byte_len = len,
+    .revision = revision,
+  };
+  return true;
+}
+
+size_t piece_tree_span_vec_read(const PieceTreeSpanVec *vec, size_t offset, char *dst, size_t len)
+{
+  if (vec == NULL || dst == NULL || len == 0
+      || offset < vec->logical_start
+      || vec->byte_len > SIZE_MAX - vec->logical_start) {
     return 0;
   }
-  return ctx.copied;
+
+  const size_t end_offset = vec->logical_start + vec->byte_len;
+  if (offset > end_offset) {
+    return 0;
+  }
+  if (len > end_offset - offset) {
+    len = end_offset - offset;
+  }
+
+  const size_t read_end = offset + len;
+  size_t copied = 0;
+  for (size_t i = 0; i < vec->count && copied < len; i++) {
+    const PieceTreeSpan *span = &vec->items[i];
+    if (span->len > SIZE_MAX - span->offset) {
+      return 0;
+    }
+
+    const size_t span_end = span->offset + span->len;
+    if (span_end <= offset) {
+      continue;
+    }
+    if (span->offset >= read_end) {
+      break;
+    }
+
+    const size_t span_offset = offset > span->offset ? offset - span->offset : 0;
+    const size_t todo = MIN(span->len - span_offset, len - copied);
+    if (todo > 0) {
+      memcpy(dst + copied, span->data + span_offset, todo);
+      copied += todo;
+    }
+  }
+  return copied;
+}
+
+size_t piece_tree_read(PieceTree *tree, size_t offset, char *dst, size_t len)
+{
+  if (dst == NULL || len == 0) {
+    return 0;
+  }
+
+  PieceTreeSpanVec vec = { 0 };
+  if (!pt_collect_read_span_vec(tree, offset, len, &vec)) {
+    return 0;
+  }
+
+  const size_t copied = piece_tree_span_vec_read(&vec, offset, dst, vec.byte_len);
+  piece_tree_span_vec_clear(&vec);
+  return copied;
 }
 
 typedef struct {
@@ -1955,13 +2021,10 @@ bool piece_tree_find_literals(PieceTree *tree, size_t offset, size_t len,
 
 char *piece_tree_to_string(PieceTree *tree, size_t *lenp)
 {
-  piece_tree_reader_enter(tree);
-  const size_t len = piece_tree_byte_len(tree);
+  PieceTreeSnapshot snapshot = { 0 };
+  const size_t len = piece_tree_snapshot(tree, &snapshot) ? snapshot.byte_len : 0;
   char *ret = xmalloc(len + 1);
-  PieceTreeReadCtx ctx = { .dst = ret };
-  const bool ok = len == 0 || pt_for_each_span(tree, 0, len, pt_read_span, &ctx);
-  const size_t copied = ok ? ctx.copied : 0;
-  piece_tree_reader_leave(tree);
+  const size_t copied = piece_tree_read(tree, 0, ret, len);
   ret[copied] = '\0';
   if (lenp != NULL) {
     *lenp = copied;

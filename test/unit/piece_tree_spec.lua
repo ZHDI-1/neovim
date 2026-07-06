@@ -591,7 +591,31 @@ describe('piece tree', function()
     eq(0, tonumber(w.tree[0].reader_count))
     eq(5, tonumber(lib.piece_tree_read(w.tree, 2, buf, 5)))
     eq(0, tonumber(w.tree[0].reader_count))
+    eq(0, tonumber(w.tree[0].span_ref_count))
     eq('cXYZd', ffi.string(buf, 5))
+  end)
+
+  itp('reads from leased span vectors after source mutation', function()
+    local w = new_tree('abcdef')
+    local shadow = 'abcdef'
+
+    ok(lib.piece_tree_insert(w.tree, 3, 'XYZ', 3))
+    shadow = insert_shadow(shadow, 3, 'XYZ')
+    check_tree(w.tree, shadow)
+
+    local vec = collect_span_vec(w.tree, 1, #shadow - 2)
+    eq(1, tonumber(w.tree[0].span_ref_count))
+
+    ok(lib.piece_tree_insert(w.tree, 0, '>', 1))
+    shadow = insert_shadow(shadow, 0, '>')
+    check_tree(w.tree, shadow)
+
+    local buf = ffi.new('char[?]', 5)
+    eq(5, tonumber(lib.piece_tree_span_vec_read(vec, 2, buf, 5)))
+    eq('cXYZd', ffi.string(buf, 5))
+
+    lib.piece_tree_span_vec_clear(vec)
+    eq(0, tonumber(w.tree[0].span_ref_count))
   end)
 
   itp('iterates byte spans across pieces', function()
