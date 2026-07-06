@@ -8,6 +8,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef __linux__
+# include <linux/fs.h>
+# include <sys/ioctl.h>
+#endif
 #include <uv.h>
 
 #include "auto/config.h"
@@ -374,6 +378,49 @@ static int buf_write_copy_file_range_bytes(int source_fd, int dest_fd, size_t so
 #endif
 }
 
+static int buf_write_clone_file_range_bytes(int source_fd, int dest_fd, size_t source_start,
+                                            size_t len, off_T *ncharsp)
+  FUNC_ATTR_NONNULL_ALL
+{
+#ifdef FICLONERANGE
+  if (*ncharsp < 0 || len > (size_t)(INT64_MAX - *ncharsp)) {
+    return NOTDONE;
+  }
+
+  const off_T dest_start = *ncharsp;
+  struct file_clone_range range = {
+    .src_fd = source_fd,
+    .src_offset = (uint64_t)source_start,
+    .src_length = (uint64_t)len,
+    .dest_offset = (uint64_t)dest_start,
+  };
+
+  int ret;
+  do {
+    ret = ioctl(dest_fd, FICLONERANGE, &range);
+  } while (ret < 0 && errno == EINTR);
+  if (ret < 0) {
+    return NOTDONE;
+  }
+
+  const off_T dest_end = dest_start + (off_T)len;
+  if (vim_lseek(dest_fd, dest_end, SEEK_SET) != dest_end) {
+    return FAIL;
+  }
+
+  *ncharsp = dest_end;
+  os_breakcheck();
+  return got_int ? FAIL : OK;
+#else
+  (void)source_fd;
+  (void)dest_fd;
+  (void)source_start;
+  (void)len;
+  (void)ncharsp;
+  return NOTDONE;
+#endif
+}
+
 static bool buf_write_span_vec_ends_in_nl(const PieceTreeSpanVec *span_vec)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
@@ -441,6 +488,18 @@ static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, const char *
       continue;
     }
     if (source_fd >= 0 && span->source == kPieceTreeSourceOriginal) {
+      const int clone_ret = buf_write_clone_file_range_bytes(source_fd, ip->bw_fd,
+                                                            span->source_start, span->len,
+                                                            ncharsp);
+      if (clone_ret == OK) {
+        ml_buf_mmap_piece_write_clone_range_record(buf);
+        continue;
+      }
+      if (clone_ret == FAIL) {
+        ret = FAIL;
+        break;
+      }
+
       const int copy_ret = buf_write_copy_file_range_bytes(source_fd, ip->bw_fd,
                                                            span->source_start, span->len,
                                                            ncharsp);

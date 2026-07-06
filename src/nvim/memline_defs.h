@@ -93,6 +93,7 @@ typedef struct {
   uint64_t ml_mmap_piece_journal_bytes;  // bytes written to piece journal
   bool ml_mmap_piece_journal_failed;  // journal disabled after append/open failure
   uint64_t ml_mmap_piece_write_fast_count;  // successful direct piece-span writes
+  uint64_t ml_mmap_piece_write_clone_range_count;  // original spans reflink-cloned by kernel
   uint64_t ml_mmap_piece_write_copy_range_count;  // original spans copied by kernel
   uint64_t ml_mmap_piece_compact_count;  // successful compact tree flips
 

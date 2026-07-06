@@ -1286,6 +1286,8 @@ Dict nvim__buf_stats(Buffer buf, Arena *arena, Error *err)
   PUT_C(rv, "mmap_piece_revision", INTEGER_OBJ((Integer)ml_buf_mmap_piece_revision(b)));
   PUT_C(rv, "mmap_piece_write_fast_count",
         INTEGER_OBJ((Integer)ml_buf_mmap_piece_write_fast_count(b)));
+  PUT_C(rv, "mmap_piece_write_clone_range_count",
+        INTEGER_OBJ((Integer)ml_buf_mmap_piece_write_clone_range_count(b)));
   PUT_C(rv, "mmap_piece_write_copy_range_count",
         INTEGER_OBJ((Integer)ml_buf_mmap_piece_write_copy_range_count(b)));
   PUT_C(rv, "mmap_piece_compact_count",
