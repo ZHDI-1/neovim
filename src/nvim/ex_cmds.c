@@ -928,14 +928,23 @@ int do_move(linenr_T line1, linenr_T line2, linenr_T dest)
     return FAIL;
   }
 
-  linenr_T l;
   linenr_T extra;      // Num lines added before line1
-  for (extra = 0, l = line1; l <= line2; l++) {
-    char *str = xstrnsave(ml_get(l + extra), (size_t)ml_get_len(l + extra));
-    ml_append(dest + l - line1, str, 0, false);
-    xfree(str);
-    if (dest < line1) {
-      extra++;
+  const int mmap_copy_ret = ml_buf_mmap_copy_lines(curbuf, line1, line2, dest);
+  if (mmap_copy_ret == OK) {
+    extra = dest < line1 ? num_lines : 0;
+  } else {
+    if (mmap_copy_ret == FAIL) {
+      return FAIL;
+    }
+
+    linenr_T l;
+    for (extra = 0, l = line1; l <= line2; l++) {
+      char *str = xstrnsave(ml_get(l + extra), (size_t)ml_get_len(l + extra));
+      ml_append(dest + l - line1, str, 0, false);
+      xfree(str);
+      if (dest < line1) {
+        extra++;
+      }
     }
   }
 
@@ -1004,7 +1013,7 @@ int do_move(linenr_T line1, linenr_T line2, linenr_T dest)
     return FAIL;
   }
 
-  for (l = line1; l <= line2; l++) {
+  for (linenr_T l = line1; l <= line2; l++) {
     ml_delete_flags(line1 + extra, ML_DEL_MESSAGE);
   }
   if (!global_busy && num_lines > p_report) {

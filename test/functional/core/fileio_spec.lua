@@ -911,6 +911,68 @@ describe('fileio', function()
     eq(text_size, stats.mmap_text_size)
   end)
 
+  it('keeps mmap piece tree active for line move commands', function()
+    local lines = {}
+    for i = 1, 42000 do
+      lines[i] = ('move mmap row %05d plain ascii'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    local text_size = #table.concat(lines, '\n') + 1
+    eq(text_size, stats.mmap_text_size)
+
+    command('10,20move 30000')
+    local moved_down = {}
+    for i = 10, 20 do
+      table.insert(moved_down, lines[i])
+    end
+    for _ = 10, 20 do
+      table.remove(lines, 10)
+    end
+    for i, line in ipairs(moved_down) do
+      table.insert(lines, 29989 + i, line)
+    end
+    eq(42000, fn.line('$'))
+    for _, lnum in ipairs({ 10, 20, 29990, 30000 }) do
+      eq(lines[lnum], fn.getline(lnum))
+    end
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    ok(stats.mmap_piece_revision > 0)
+    ok(stats.mmap_piece_add_len > 0)
+    eq(text_size, stats.mmap_text_size)
+
+    command('30000,30010move 5')
+    local moved_up = {}
+    for i = 30000, 30010 do
+      table.insert(moved_up, lines[i])
+    end
+    for _ = 30000, 30010 do
+      table.remove(lines, 30000)
+    end
+    for i, line in ipairs(moved_up) do
+      table.insert(lines, 5 + i, line)
+    end
+    eq(42000, fn.line('$'))
+    for _, lnum in ipairs({ 6, 16, 29989, 30000 }) do
+      eq(lines[lnum], fn.getline(lnum))
+    end
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(text_size, stats.mmap_text_size)
+  end)
+
   it('keeps mmap piece tree active for same-file copy-backup writes', function()
     local lines = {}
     for i = 1, 40000 do
