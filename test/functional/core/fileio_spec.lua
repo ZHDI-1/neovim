@@ -494,6 +494,58 @@ describe('fileio', function()
     eq(table.concat(lines, '\n') .. '\n', read_file('Xtest_mmap_written'))
   end)
 
+  it('keeps mmap piece tree active for UTF-8 multiline regex search', function()
+    local lines = {}
+    for i = 1, 42000 do
+      lines[i] = ('regex mmap row %05d plain ascii'):format(i)
+    end
+
+    local function text_size()
+      return #table.concat(lines, '\n') + 1
+    end
+
+    local function expect_mmap_regex(min_revision)
+      local stats = api.nvim__buf_stats(0)
+      eq(true, stats.mmap_active)
+      eq(true, stats.mmap_piece_tree)
+      ok(stats.mmap_piece_revision >= min_revision)
+      eq(text_size(), stats.mmap_text_size)
+      eq(0, stats.virt_blocks)
+      return stats
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    expect_mmap_regex(0)
+
+    api.nvim_buf_set_lines(0, 20999, 21002, false, {
+      'αβγ piece-start',
+      'piece-tail Ω regex',
+      'piece suffix line',
+    })
+    lines[21000] = 'αβγ piece-start'
+    lines[21001] = 'piece-tail Ω regex'
+    lines[21002] = 'piece suffix line'
+
+    local edit_stats = expect_mmap_regex(1)
+    local pattern = [[αβγ piece-start\_s\+piece-tail Ω regex]]
+    for _, engine in ipairs({ 1, 2 }) do
+      command('set regexpengine=' .. engine)
+      command('normal! gg0')
+      eq(21000, fn.search(pattern, 'W'))
+      local forward_stats = expect_mmap_regex(1)
+      eq(edit_stats.mmap_piece_revision, forward_stats.mmap_piece_revision)
+
+      command('normal! G$')
+      eq(21000, fn.search(pattern, 'bW'))
+      local backward_stats = expect_mmap_regex(1)
+      eq(edit_stats.mmap_piece_revision, backward_stats.mmap_piece_revision)
+    end
+    command('set regexpengine&')
+  end)
+
   it('keeps mmap piece tree active for same-file copy-backup writes', function()
     local lines = {}
     for i = 1, 40000 do
