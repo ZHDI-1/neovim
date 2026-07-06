@@ -85,17 +85,6 @@ local function read_tree(tree)
   return ffi.string(buf, len)
 end
 
-local function collect_spans(tree, offset, len)
-  local spansp = ffi.new('PieceTreeSpan *[1]')
-  local countp = ffi.new('size_t[1]')
-  ok(lib.piece_tree_collect_spans(tree, offset, len, spansp, countp))
-  local spans = spansp[0]
-  if spans ~= ffi.cast('PieceTreeSpan *', 0) then
-    spans = ffi.gc(spans, lib.piece_tree_free_spans)
-  end
-  return spans, tonumber(countp[0])
-end
-
 local function collect_span_vec(tree, offset, len)
   local vec = ffi.gc(ffi.new('PieceTreeSpanVec[1]'), function(ptr)
     lib.piece_tree_span_vec_clear(ptr)
@@ -711,15 +700,12 @@ describe('piece tree', function()
     local start = 1
     local len = #shadow - 2
     eq(0, tonumber(w.tree[0].span_ref_count))
-    local spans, count = collect_spans(w.tree, start, len)
-    eq(0, tonumber(w.tree[0].span_ref_count))
     local snapshot_revision = tonumber(w.tree[0].revision)
     local span_vec = collect_span_vec(w.tree, start, len)
+    local count = tonumber(span_vec[0].count)
     eq(1, tonumber(w.tree[0].span_ref_count))
     ok(span_vec[0].owner == w.tree)
     ok(count > 1)
-    eq(shadow:sub(start + 1, start + len), read_spans(spans, count))
-    eq(count, tonumber(span_vec[0].count))
     eq(start, tonumber(span_vec[0].logical_start))
     eq(len, tonumber(span_vec[0].byte_len))
     eq(snapshot_revision, tonumber(span_vec[0].revision))
@@ -727,9 +713,8 @@ describe('piece tree', function()
 
     local offset = start
     for i = 0, count - 1 do
-      eq(offset, tonumber(spans[i].offset))
       eq(offset, tonumber(span_vec[0].items[i].offset))
-      offset = offset + tonumber(spans[i].len)
+      offset = offset + tonumber(span_vec[0].items[i].len)
     end
     eq(start + len, offset)
 
@@ -737,15 +722,11 @@ describe('piece tree', function()
     ok(lib.piece_tree_insert(w.tree, 0, 'replacement', 11))
     check_tree(w.tree, 'replacement')
     ok(tonumber(w.tree[0].revision) > snapshot_revision)
-    eq(shadow:sub(start + 1, start + len), read_spans(spans, count))
     eq(shadow:sub(start + 1, start + len), read_span_vec(span_vec))
 
-    local empty_spans, empty_count = collect_spans(w.tree, 0, 0)
     local empty_vec = collect_span_vec(w.tree, 0, 0)
     eq(2, tonumber(w.tree[0].span_ref_count))
     ok(empty_vec[0].owner == w.tree)
-    eq(0, empty_count)
-    eq('', read_spans(empty_spans, empty_count))
     eq(0, tonumber(empty_vec[0].count))
     eq(0, tonumber(empty_vec[0].logical_start))
     eq(0, tonumber(empty_vec[0].byte_len))
@@ -761,11 +742,6 @@ describe('piece tree', function()
     eq(0, tonumber(clear_vec[0].logical_start))
     eq(0, tonumber(clear_vec[0].byte_len))
     ok(clear_vec[0].items == ffi.cast('PieceTreeSpan *', 0))
-
-    local spansp = ffi.new('PieceTreeSpan *[1]')
-    local countp = ffi.new('size_t[1]')
-    eq(false, lib.piece_tree_collect_spans(w.tree, 100, 0, spansp, countp))
-    eq(0, tonumber(countp[0]))
 
     local bad_vec = ffi.new('PieceTreeSpanVec[1]')
     eq(false, lib.piece_tree_collect_span_vec(w.tree, 100, 0, bad_vec))

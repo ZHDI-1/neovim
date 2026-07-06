@@ -1687,30 +1687,6 @@ void piece_tree_span_vec_clear(PieceTreeSpanVec *vec)
   *vec = (PieceTreeSpanVec){ 0 };
 }
 
-bool piece_tree_collect_spans(PieceTree *tree, size_t offset, size_t len,
-                              PieceTreeSpan **spansp, size_t *countp)
-{
-  if (spansp == NULL || countp == NULL) {
-    return false;
-  }
-  *spansp = NULL;
-  *countp = 0;
-
-  PieceTreeSpanVec vec = { 0 };
-  if (!pt_collect_span_vec(tree, offset, len, 0, false, false, &vec)) {
-    return false;
-  }
-
-  *spansp = vec.items;
-  *countp = vec.count;
-  return true;
-}
-
-void piece_tree_free_spans(PieceTreeSpan *spans)
-{
-  xfree(spans);
-}
-
 static bool pt_collect_read_span_vec(PieceTree *tree, size_t offset, size_t len,
                                      PieceTreeSpanVec *vec)
 {
