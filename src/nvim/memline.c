@@ -1597,6 +1597,12 @@ static bool ml_recover_mmap_piece_journal(const char *fname, bool called_from_ma
       semsg(_("E308: Cannot recover %s without an empty mmap buffer"), fname);
       return false;
     }
+    FileInfo original_info;
+    if (!os_fileinfo(curbuf->b_ffname, &original_info)
+        || !S_ISREG(original_info.stat.st_mode)) {
+      semsg(_("E308: Cannot read original file for %s"), fname);
+      return false;
+    }
     if (readfile(curbuf->b_ffname, NULL, 0, 0, MAXLNUM, NULL, READ_NEW, false) != OK) {
       semsg(_("E308: Cannot read original file for %s"), fname);
       return false;
