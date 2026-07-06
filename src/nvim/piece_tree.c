@@ -1066,7 +1066,8 @@ bool piece_tree_rebase_original(PieceTree *tree, const char *original, size_t or
 {
   if (tree == NULL || original_len != tree->original_len
       || (original == NULL && original_len != 0)
-      || pt_reader_count_load(tree) != 0) {
+      || pt_reader_count_load(tree) != 0
+      || pt_span_ref_count_load(tree) != 0) {
     return false;
   }
 
