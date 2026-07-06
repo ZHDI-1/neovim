@@ -336,14 +336,16 @@ static int buf_write_raw_bytes(int fd, const char *data, size_t len, off_T *ncha
 }
 
 static int buf_write_copy_file_range_bytes(int source_fd, int dest_fd, size_t source_start,
-                                           size_t len, off_T *ncharsp)
-  FUNC_ATTR_NONNULL_ALL
+                                           const char *fallback_data, size_t len,
+                                           off_T *ncharsp)
+  FUNC_ATTR_NONNULL_ARG(4, 6)
 {
 #ifdef __linux__
   enum { kCopyFileRangeChunk = 1024 * 1024 * 1024 };
 
   off_t source_offset = (off_t)source_start;
   bool copied_any = false;
+  const char *fallback = fallback_data;
   while (len > 0) {
     const size_t todo = MIN(len, (size_t)kCopyFileRangeChunk);
     ssize_t copied;
@@ -352,15 +354,17 @@ static int buf_write_copy_file_range_bytes(int source_fd, int dest_fd, size_t so
     } while (copied < 0 && errno == EINTR);
 
     if (copied < 0) {
-      return copied_any ? FAIL : NOTDONE;
+      return copied_any ? buf_write_raw_bytes(dest_fd, fallback, len, ncharsp) : NOTDONE;
     }
     if (copied == 0) {
-      return FAIL;
+      return copied_any ? buf_write_raw_bytes(dest_fd, fallback, len, ncharsp) : NOTDONE;
     }
 
     copied_any = true;
     *ncharsp += (off_T)copied;
-    len -= (size_t)copied;
+    const size_t copied_len = (size_t)copied;
+    len -= copied_len;
+    fallback += copied_len;
 
     os_breakcheck();
     if (got_int) {
@@ -372,6 +376,7 @@ static int buf_write_copy_file_range_bytes(int source_fd, int dest_fd, size_t so
   (void)source_fd;
   (void)dest_fd;
   (void)source_start;
+  (void)fallback_data;
   (void)len;
   (void)ncharsp;
   return NOTDONE;
@@ -530,8 +535,8 @@ static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, const char *
       }
 
       const int copy_ret = buf_write_copy_file_range_bytes(source_fd, ip->bw_fd,
-                                                           span->source_start, span->len,
-                                                           ncharsp);
+                                                           span->source_start, span->data,
+                                                           span->len, ncharsp);
       if (copy_ret == OK) {
         ml_buf_mmap_piece_write_copy_range_record(buf);
         continue;
