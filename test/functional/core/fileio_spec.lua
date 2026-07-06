@@ -1538,6 +1538,111 @@ describe('fileio', function()
     eq(nil, uv.fs_stat(journal_path))
   end)
 
+  it('recovers mmap journals after fast tail writes reset the source', function()
+    local function recover_saved_journal(journal_path)
+      eq(true, uv.fs_copyfile(journal_path, 'Xtest_mmap_saved_journal'))
+      command('bwipe!')
+      eq(nil, uv.fs_stat(journal_path))
+      eq(true, uv.fs_copyfile('Xtest_mmap_saved_journal', journal_path))
+
+      command('enew')
+      command('recover! ' .. fn.fnameescape(journal_path))
+      local stats = api.nvim__buf_stats(0)
+      eq(true, stats.mmap_active)
+      eq(true, stats.mmap_piece_tree)
+      eq(true, stats.mmap_piece_journal_active)
+      eq(false, stats.mmap_piece_journal_failed)
+      eq(1, stats.mmap_piece_journal_record_count)
+      eq(1, fn.getbufvar('%', '&modified'))
+      return stats
+    end
+
+    local append_lines = {}
+    for i = 1, 40000 do
+      append_lines[i] = ('line%d ascii text for post-append journal'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(append_lines, '\n') .. '\n', false)
+
+    clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir// swapfile' } })
+    command('set nowritebackup nobackup backupcopy=yes backupskip=')
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    local fast_before = stats.mmap_piece_write_fast_count
+
+    local appended = 'post-append saved tail before journal edit'
+    command("call append('$', '" .. appended .. "')")
+    append_lines[#append_lines + 1] = appended
+    command('write')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_source_is_buffer_file)
+    eq(fast_before + 1, stats.mmap_piece_write_fast_count)
+    eq(0, stats.mmap_piece_revision)
+    eq(0, stats.mmap_piece_add_len)
+    eq(0, stats.mmap_piece_journal_record_count)
+    eq(false, stats.mmap_piece_journal_dirty)
+    eq(#append_lines, fn.line('$'))
+    eq(appended, fn.getline('$'))
+
+    append_lines[2] = 'post-append recovered journal edit'
+    command("call setline(2, 'post-append recovered journal edit')")
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(true, stats.mmap_piece_journal_dirty)
+    eq(1, stats.mmap_piece_journal_record_count)
+    local journal_path = stats.mmap_piece_journal_path
+
+    recover_saved_journal(journal_path)
+    eq(#append_lines, fn.line('$'))
+    eq(append_lines[2], fn.getline(2))
+    eq(appended, fn.getline('$'))
+    command('bwipe!')
+    eq(nil, uv.fs_stat(journal_path))
+
+    local truncate_lines = {}
+    for i = 1, 40000 do
+      truncate_lines[i] = ('line%d ascii text for post-truncate journal'):format(i)
+    end
+    truncate_lines[#truncate_lines + 1] = 'post-truncate removable source tail'
+    write_file('Xtest_mmap_readfile', table.concat(truncate_lines, '\n') .. '\n', false)
+
+    command('edit Xtest_mmap_readfile')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    fast_before = stats.mmap_piece_write_fast_count
+
+    command('$delete _')
+    table.remove(truncate_lines)
+    command('write')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_source_is_buffer_file)
+    eq(fast_before + 1, stats.mmap_piece_write_fast_count)
+    eq(0, stats.mmap_piece_revision)
+    eq(0, stats.mmap_piece_add_len)
+    eq(0, stats.mmap_piece_journal_record_count)
+    eq(false, stats.mmap_piece_journal_dirty)
+    eq(#truncate_lines, fn.line('$'))
+    eq(truncate_lines[#truncate_lines], fn.getline('$'))
+
+    truncate_lines[2] = 'post-truncate recovered journal edit'
+    command("call setline(2, 'post-truncate recovered journal edit')")
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(true, stats.mmap_piece_journal_dirty)
+    eq(1, stats.mmap_piece_journal_record_count)
+    journal_path = stats.mmap_piece_journal_path
+
+    recover_saved_journal(journal_path)
+    eq(#truncate_lines, fn.line('$'))
+    eq(truncate_lines[2], fn.getline(2))
+    eq(truncate_lines[#truncate_lines], fn.getline('$'))
+  end)
+
   it('recovers mmap piece-tree edits from a piece journal', function()
     local lines = {}
     for i = 1, 40000 do
