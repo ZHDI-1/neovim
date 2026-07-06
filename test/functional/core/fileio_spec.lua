@@ -1933,6 +1933,44 @@ describe('fileio', function()
     eq(2, stats.mmap_piece_journal_record_count)
   end)
 
+  it('refuses mmap piece-journal recovery when the journal cannot be reopened', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for mmap reopen recovery refusal'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir// swapfile' } })
+    command('edit Xtest_mmap_readfile')
+    command("call setline(2, 'cannot reopen journal change')")
+
+    local stats = api.nvim__buf_stats(0)
+    local journal_path = stats.mmap_piece_journal_path
+    neq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile(journal_path, 'Xtest_mmap_saved_journal'))
+
+    command('bwipe!')
+    eq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile('Xtest_mmap_saved_journal', journal_path))
+    assert(uv.fs_chmod(journal_path, 256))
+
+    command('enew')
+    matches('E308: Original file changed; mmap piece%-journal recovery unsafe',
+      pcall_err(command, 'recover! ' .. fn.fnameescape(journal_path)))
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(false, stats.mmap_piece_journal_active)
+    eq(true, stats.mmap_piece_journal_failed)
+    eq(lines[2], fn.getline(2))
+    eq(0, fn.getbufvar('%', '&modified'))
+
+    assert(uv.fs_chmod(journal_path, 384))
+    os.remove(journal_path)
+  end)
+
   it('refuses mmap piece-journal recovery when the original file changed', function()
     local lines = {}
     for i = 1, 40000 do

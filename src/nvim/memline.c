@@ -1545,10 +1545,6 @@ static bool ml_mmap_piece_journal_reopen_after_replay(buf_T *buf, size_t consume
                                                       uint64_t record_count)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
 {
-  buf->b_ml.ml_mmap_piece_journal_record_count = record_count;
-  buf->b_ml.ml_mmap_piece_journal_bytes = (uint64_t)consumed;
-  buf->b_ml.ml_mmap_piece_journal_dirty = false;
-
   const int fd = os_open(buf->b_ml.ml_mmap_piece_journal_fname, O_WRONLY | O_APPEND, 0);
   if (fd < 0) {
     buf->b_ml.ml_mmap_piece_journal_failed = true;
@@ -1571,6 +1567,9 @@ static bool ml_mmap_piece_journal_reopen_after_replay(buf_T *buf, size_t consume
     }
   }
 
+  buf->b_ml.ml_mmap_piece_journal_record_count = record_count;
+  buf->b_ml.ml_mmap_piece_journal_bytes = (uint64_t)consumed;
+  buf->b_ml.ml_mmap_piece_journal_dirty = false;
   buf->b_ml.ml_mmap_piece_journal_fd = fd;
   buf->b_ml.ml_mmap_piece_journal_failed = false;
   return true;
@@ -3155,6 +3154,11 @@ bool ml_buf_mmap_piece_journal_recover(buf_T *buf)
     buf->b_ml.ml_mmap_piece_journal_failed = true;
     return false;
   }
+  if (!ml_mmap_piece_journal_reopen_after_replay(buf, consumed, journal_len, record_count)) {
+    piece_tree_clear(tree);
+    xfree(tree);
+    return false;
+  }
 
   PieceTree *old_tree = buf->b_ml.ml_piece_tree;
   buf->b_ml.ml_piece_tree = tree;
@@ -3167,7 +3171,6 @@ bool ml_buf_mmap_piece_journal_recover(buf_T *buf)
   }
   ml_mmap_clear_cache(buf);
   ml_mmap_retire_piece_storage(old_tree, ml_mmap_storage_ref(buf->b_ml.ml_mmap_storage));
-  ml_mmap_piece_journal_reopen_after_replay(buf, consumed, journal_len, record_count);
   buf->b_flags |= BF_RECOVERED;
   changed_internal(buf);
   buf_inc_changedtick(buf);
