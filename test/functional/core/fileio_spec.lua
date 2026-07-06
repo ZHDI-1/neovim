@@ -599,6 +599,7 @@ describe('fileio', function()
     end
     lines[200] = 'global-change alpha'
     lines[202] = 'global-change beta'
+    lines[300] = 'global-insert anchor'
     lines[1000] = 'global-delete one'
     lines[1001] = 'global-delete two'
     lines[39950] = 'global-regex-12345 target'
@@ -630,8 +631,12 @@ describe('fileio', function()
     eq(0, stats.virt_blocks)
     ok(stats.mmap_search_prefilter_count > prefilter_count)
 
+    command([[call setreg('a', 'inserted-by-global', 'l')]])
+    command('g/global-insert/put a')
+    eq('inserted-by-global', fn.getline(301))
+
     command('g/global-delete/d')
-    eq(41997, fn.line('$'))
+    eq(41998, fn.line('$'))
     command('normal! gg0')
     eq(0, fn.search('global-delete', 'nw'))
 
@@ -639,7 +644,7 @@ describe('fileio', function()
     eq(true, stats.mmap_active)
     eq(true, stats.mmap_piece_tree)
     eq(0, stats.virt_blocks)
-    ok(stats.mmap_piece_revision >= 5)
+    ok(stats.mmap_piece_revision >= 6)
   end)
 
   it('keeps mmap piece tree active for same-file copy-backup writes', function()
