@@ -591,6 +591,45 @@ static void ml_mmap_marked_delete(buf_T *buf, linenr_T lnum)
   ml_mmap_marked_update_lowest(buf);
 }
 
+static void ml_mmap_marked_delete_range(buf_T *buf, linenr_T lnum, linenr_T count)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (!ml_mmap_marked_has(buf) || count <= 0) {
+    return;
+  }
+
+  ml_mmap_marked_drop_consumed(buf);
+  const linenr_T end = lnum + count - 1;
+  mmap_marked_range_T *ranges = buf->b_ml.ml_mmap_marked_ranges;
+  size_t out = 0;
+  for (size_t i = 0; i < buf->b_ml.ml_mmap_marked_count; i++) {
+    mmap_marked_range_T range = ranges[i];
+    if (range.end < lnum) {
+      ranges[out++] = range;
+    } else if (range.start > end) {
+      range.start -= count;
+      range.end -= count;
+      ranges[out++] = range;
+    } else {
+      if (range.start < lnum) {
+        ranges[out++] = (mmap_marked_range_T){
+          .start = range.start,
+          .end = lnum - 1,
+        };
+      }
+      if (range.end > end) {
+        ranges[out++] = (mmap_marked_range_T){
+          .start = lnum,
+          .end = range.end - count,
+        };
+      }
+    }
+  }
+  buf->b_ml.ml_mmap_marked_count = out;
+  ml_mmap_marked_merge(buf);
+  ml_mmap_marked_update_lowest(buf);
+}
+
 enum {
   ML_MMAP_PIECE_RECLAIM_EVENT_BUDGET = 256,
   ML_MMAP_PIECE_COMPACT_DEAD_ADD_MIN = 16 * 1024 * 1024,
@@ -1647,6 +1686,40 @@ static void ml_mmap_piece_journal_append_replace(buf_T *buf, size_t offset, size
   }
 }
 
+static bool ml_mmap_add_deleted_range(buf_T *buf, size_t offset, size_t len, bool add_final_nl)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (inhibit_delete_count) {
+    return true;
+  }
+
+  const size_t deleted_len = len + (add_final_nl ? 1 : 0);
+  buf->deleted_bytes += deleted_len;
+  buf->deleted_bytes2 += deleted_len;
+
+  if (!buf->update_need_codepoints) {
+    return true;
+  }
+
+  PieceTreeSpanVec spans = { 0 };
+  if (len > 0
+      && !piece_tree_collect_span_vec(buf->b_ml.ml_piece_tree, offset, len, &spans)) {
+    return false;
+  }
+  for (size_t i = 0; i < spans.count; i++) {
+    const PieceTreeSpan *span = &spans.items[i];
+    mb_utflen(span->data, span->len, &buf->deleted_codepoints,
+              &buf->deleted_codeunits);
+  }
+  piece_tree_span_vec_clear(&spans);
+
+  if (add_final_nl) {
+    buf->deleted_codepoints++;
+    buf->deleted_codeunits++;
+  }
+  return true;
+}
+
 static void ml_mmap_clear_piece_tree(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
@@ -2346,6 +2419,123 @@ int ml_buf_mmap_copy_lines(buf_T *buf, linenr_T line1, linenr_T line2, linenr_T 
   ml_mmap_maybe_schedule_piece_reclaim(buf);
   buf->b_ml.ml_flags &= ~ML_EMPTY;
   ml_upd_lastbuf = NULL;
+  return OK;
+}
+
+int ml_buf_mmap_delete_lines(buf_T *buf, linenr_T lnum, linenr_T count, bool message,
+                             linenr_T *deletedp)
+  FUNC_ATTR_NONNULL_ARG(1, 5)
+{
+  *deletedp = 0;
+  if (!ml_buf_flush_mmap_piece_tree(buf)) {
+    return NOTDONE;
+  }
+
+  PieceTree *tree = buf->b_ml.ml_piece_tree;
+  const linenr_T line_count = buf->b_ml.ml_line_count;
+  if (lnum < 1 || lnum > line_count || count <= 0) {
+    return NOTDONE;
+  }
+
+  linenr_T delete_count = MIN(count, line_count - lnum + 1);
+  if (delete_count <= 0) {
+    return OK;
+  }
+
+  PieceTreeSnapshot snapshot = { 0 };
+  if (!piece_tree_snapshot(tree, &snapshot) || snapshot.line_count != (size_t)line_count) {
+    return NOTDONE;
+  }
+
+  const size_t total = snapshot.byte_len;
+  char last = NUL;
+  const bool has_last = total > 0 && piece_tree_byte_at(tree, total - 1, &last);
+  if (total > 0 && !has_last) {
+    return FAIL;
+  }
+  const bool last_has_nl = total == 0 || last == NL;
+  const bool delete_to_eof = lnum + delete_count - 1 == line_count;
+  const bool delete_all = lnum == 1 && delete_to_eof;
+
+  size_t delete_start = 0;
+  size_t delete_len = 0;
+  bool add_deleted_final_nl = false;
+  if (delete_all) {
+    delete_start = 0;
+    delete_len = total;
+    add_deleted_final_nl = total > 0 && !last_has_nl;
+  } else if (!delete_to_eof) {
+    size_t start = 0;
+    size_t end = 0;
+    if (!piece_tree_line_start_at_revision(tree, (size_t)lnum, snapshot.revision, &start)
+        || !piece_tree_line_start_at_revision(tree, (size_t)(lnum + delete_count),
+                                              snapshot.revision, &end)) {
+      return FAIL;
+    }
+    delete_start = start;
+    delete_len = end - start;
+  } else if (last_has_nl) {
+    size_t start = 0;
+    if (!piece_tree_line_start_at_revision(tree, (size_t)lnum, snapshot.revision, &start)) {
+      return FAIL;
+    }
+    delete_start = start;
+    delete_len = total - start;
+  } else {
+    size_t prev_start = 0;
+    size_t prev_end = 0;
+    if (!piece_tree_line_bounds(tree, (size_t)lnum - 1, &prev_start, &prev_end)) {
+      return FAIL;
+    }
+    delete_start = prev_end;
+    delete_len = total - prev_end;
+  }
+
+  if (!ml_mmap_add_deleted_range(buf, delete_start, delete_len, add_deleted_final_nl)) {
+    return FAIL;
+  }
+
+  if (delete_all) {
+    if (!piece_tree_replace(tree, 0, total, "", 0)) {
+      ml_mmap_clear_cache(buf);
+      return FAIL;
+    }
+    if (message) {
+      set_keep_msg(_(no_lines_msg), 0);
+    }
+    if (buf->b_prev_line_count == 0) {
+      buf->b_prev_line_count = buf->b_ml.ml_line_count;
+    }
+    buf->b_ml.ml_line_count = 1;
+    ml_mmap_marked_clear(buf);
+    ml_mmap_update_noeol(buf);
+    if (total > 0) {
+      ml_mmap_piece_journal_append(buf, kPieceJournalOpDelete, 0, total, NULL, 0);
+    }
+    ml_mmap_clear_cache(buf);
+    ml_mmap_maybe_schedule_piece_reclaim(buf);
+    buf->b_ml.ml_flags |= ML_EMPTY;
+    ml_upd_lastbuf = NULL;
+    *deletedp = delete_count;
+    return OK;
+  }
+
+  if (!piece_tree_delete(tree, delete_start, delete_len)) {
+    ml_mmap_clear_cache(buf);
+    return FAIL;
+  }
+
+  if (buf->b_prev_line_count == 0) {
+    buf->b_prev_line_count = buf->b_ml.ml_line_count;
+  }
+  buf->b_ml.ml_line_count -= delete_count;
+  ml_mmap_marked_delete_range(buf, lnum, delete_count);
+  ml_mmap_update_noeol(buf);
+  ml_mmap_piece_journal_append(buf, kPieceJournalOpDelete, delete_start, delete_len, NULL, 0);
+  ml_mmap_clear_cache(buf);
+  ml_mmap_maybe_schedule_piece_reclaim(buf);
+  ml_upd_lastbuf = NULL;
+  *deletedp = delete_count;
   return OK;
 }
 

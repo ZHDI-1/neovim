@@ -1894,17 +1894,28 @@ void del_lines(linenr_T nlines, bool undo)
     return;
   }
 
-  for (n = 0; n < nlines;) {
-    if (curbuf->b_ml.ml_flags & ML_EMPTY) {  // nothing to delete
-      break;
+  linenr_T mmap_deleted = 0;
+  const int mmap_delete_ret =
+    ml_buf_mmap_delete_lines(curbuf, first, nlines, true, &mmap_deleted);
+  if (mmap_delete_ret == OK) {
+    n = (int)mmap_deleted;
+  } else {
+    if (mmap_delete_ret == FAIL) {
+      return;
     }
 
-    ml_delete_flags(first, ML_DEL_MESSAGE);
-    n++;
+    for (n = 0; n < nlines;) {
+      if (curbuf->b_ml.ml_flags & ML_EMPTY) {  // nothing to delete
+        break;
+      }
 
-    // If we delete the last line in the file, stop
-    if (first > curbuf->b_ml.ml_line_count) {
-      break;
+      ml_delete_flags(first, ML_DEL_MESSAGE);
+      n++;
+
+      // If we delete the last line in the file, stop
+      if (first > curbuf->b_ml.ml_line_count) {
+        break;
+      }
     }
   }
 

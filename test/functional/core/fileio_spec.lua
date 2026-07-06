@@ -973,6 +973,41 @@ describe('fileio', function()
     eq(text_size, stats.mmap_text_size)
   end)
 
+  it('batches mmap piece tree line deletes', function()
+    local lines = {}
+    for i = 1, 42000 do
+      lines[i] = ('delete mmap row %05d plain ascii'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    local text_size = #table.concat(lines, '\n') + 1
+    eq(text_size, stats.mmap_text_size)
+
+    command('10,20join')
+    eq(41990, fn.line('$'))
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(2, stats.mmap_piece_revision)
+    eq(text_size, stats.mmap_text_size)
+
+    command([[normal! 1000G"_1000dd]])
+    eq(40990, fn.line('$'))
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(3, stats.mmap_piece_revision)
+  end)
+
   it('keeps mmap piece tree active for same-file copy-backup writes', function()
     local lines = {}
     for i = 1, 40000 do
