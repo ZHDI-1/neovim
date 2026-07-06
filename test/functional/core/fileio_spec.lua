@@ -1207,6 +1207,21 @@ describe('fileio', function()
     local written = read_file('Xtest_mmap_written')
     eq(lines[1] .. '\n', written:sub(1, #lines[1] + 1))
     neq(nil, written:find(lines[20000], 1, true))
+
+    fast_before = stats.mmap_piece_write_fast_count
+    original_before = original_after
+    command('19999,20001write Xtest_mmap_range_written')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(fast_before + 1, stats.mmap_piece_write_fast_count)
+    original_after = stats.mmap_piece_write_clone_range_count
+      + stats.mmap_piece_write_copy_range_count
+      + stats.mmap_piece_write_raw_original_count
+    ok(original_after > original_before)
+    eq(table.concat({ lines[19999], lines[20000], lines[20001] }, '\n') .. '\n',
+      read_file('Xtest_mmap_range_written'))
   end)
 
   it('keeps mmap piece tree editable while swapfile is enabled', function()
