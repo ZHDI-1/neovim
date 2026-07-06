@@ -634,6 +634,36 @@ describe('fileio', function()
     ok(stats.mmap_search_prefilter_count > prefilter_count)
   end)
 
+  it('keeps mmap piece tree active for literal substitute fast path', function()
+    local lines = {}
+    local payload = string.rep('x', 900)
+    for i = 1, 1600 do
+      lines[i] = ('zz row %05d a a %s'):format(i, payload)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    local literal_count = stats.mmap_substitute_literal_count
+
+    command([[%s/a/b/g]])
+    eq((lines[1]:gsub('a', 'b')), fn.getline(1))
+    eq((lines[800]:gsub('a', 'b')), fn.getline(800))
+    eq((lines[1600]:gsub('a', 'b')), fn.getline(1600))
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    ok(stats.mmap_piece_revision > 0)
+    eq(literal_count + 1, stats.mmap_substitute_literal_count)
+  end)
+
   it('keeps mmap piece tree active for :global mark execution', function()
     local lines = {}
     for i = 1, 42000 do

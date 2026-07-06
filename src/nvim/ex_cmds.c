@@ -127,6 +127,11 @@ typedef struct {
   linenr_T pre_match;  // where to begin showing lines before the match
 } SubResult;
 
+typedef struct {
+  colnr_T old_col;
+  colnr_T new_col;
+} SubLiteralMatch;
+
 // Collected results of a substitution for showing them in
 // the preview window
 typedef struct {
@@ -3430,6 +3435,243 @@ static void sub_grow_buf(String *new_start, size_t *new_start_size, size_t neede
   }
 }
 
+static bool sub_plain_literal_pattern(String pat)
+  FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (pat.data == NULL || pat.size == 0 || !utf_valid_string(pat.data, pat.data + pat.size)) {
+    return false;
+  }
+
+  for (size_t i = 0; i < pat.size; i++) {
+    switch ((uint8_t)pat.data[i]) {
+    case '\\':
+    case '.':
+    case '[':
+    case ']':
+    case '~':
+    case '^':
+    case '$':
+    case '*':
+    case '+':
+    case '?':
+    case '(':
+    case ')':
+    case '{':
+    case '}':
+    case '|':
+      return false;
+    default:
+      if ((uint8_t)pat.data[i] < 0x20) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+static bool sub_plain_literal_replacement(const char *sub, size_t *lenp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  const size_t len = strlen(sub);
+  if (!utf_valid_string(sub, sub + len)) {
+    return false;
+  }
+  for (size_t i = 0; i < len; i++) {
+    switch ((uint8_t)sub[i]) {
+    case '\\':
+    case '&':
+    case '~':
+      return false;
+    default:
+      if ((uint8_t)sub[i] < 0x20) {
+        return false;
+      }
+    }
+  }
+
+  *lenp = len;
+  return true;
+}
+
+static const char *sub_find_literal(const char *line, size_t line_len, size_t start_col,
+                                    const char *pat, size_t pat_len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (pat_len == 0 || start_col >= line_len || pat_len > line_len - start_col) {
+    return NULL;
+  }
+
+  const char *p = line + start_col;
+  const char *const end = line + line_len;
+  const uint8_t first = (uint8_t)pat[0];
+  while ((p = memchr(p, first, (size_t)(end - p))) != NULL) {
+    if ((size_t)(end - p) < pat_len) {
+      return NULL;
+    }
+    if (memcmp(p, pat, pat_len) == 0) {
+      return p;
+    }
+    p++;
+  }
+  return NULL;
+}
+
+static bool sub_mmap_literal_line(linenr_T lnum, const char *pat, size_t pat_len,
+                                  const char *sub, size_t sub_len, bool do_all,
+                                  bool *got_matchp, bool *did_savep, size_t *match_countp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  *match_countp = 0;
+  char *line = ml_get(lnum);
+  const size_t line_len = (size_t)ml_get_len(lnum);
+
+  kvec_t(SubLiteralMatch) matches = KV_INITIAL_VALUE;
+  size_t next_col = 0;
+  size_t new_len = line_len;
+  int64_t delta = 0;
+
+  while (true) {
+    const char *match = sub_find_literal(line, line_len, next_col, pat, pat_len);
+    if (match == NULL) {
+      break;
+    }
+
+    const size_t old_col = (size_t)(match - line);
+    const int64_t new_col_i64 = (int64_t)old_col + delta;
+    if (old_col > MAXCOL - 1 || new_col_i64 < 0 || new_col_i64 > MAXCOL - 1) {
+      kv_destroy(matches);
+      return false;
+    }
+
+    SubLiteralMatch *item = kv_pushp(matches);
+    item->old_col = (colnr_T)old_col;
+    item->new_col = (colnr_T)new_col_i64;
+
+    if (sub_len > pat_len) {
+      const size_t grow = sub_len - pat_len;
+      if (new_len > SIZE_MAX - grow) {
+        kv_destroy(matches);
+        return false;
+      }
+      new_len += grow;
+    } else {
+      new_len -= pat_len - sub_len;
+    }
+    delta += (int64_t)sub_len - (int64_t)pat_len;
+
+    next_col = old_col + pat_len;
+    if (!do_all || next_col >= line_len) {
+      break;
+    }
+  }
+
+  if (kv_size(matches) == 0) {
+    kv_destroy(matches);
+    return true;
+  }
+  if (new_len > MAXCOL - 1) {
+    kv_destroy(matches);
+    return false;
+  }
+
+  String new_line = {
+    .data = xmallocz(new_len),
+    .size = new_len,
+  };
+
+  size_t old_pos = 0;
+  size_t new_pos = 0;
+  for (size_t i = 0; i < kv_size(matches); i++) {
+    const size_t old_col = (size_t)kv_A(matches, i).old_col;
+    const size_t copy_len = old_col - old_pos;
+    memmove(new_line.data + new_pos, line + old_pos, copy_len);
+    new_pos += copy_len;
+    if (sub_len > 0) {
+      memmove(new_line.data + new_pos, sub, sub_len);
+      new_pos += sub_len;
+    }
+    old_pos = old_col + pat_len;
+  }
+  memmove(new_line.data + new_pos, line + old_pos, line_len - old_pos);
+  new_pos += line_len - old_pos;
+  assert(new_pos == new_len);
+
+  if (!*got_matchp) {
+    setpcmark();
+    *got_matchp = true;
+  }
+  curwin->w_cursor.lnum = lnum;
+  curwin->w_cursor.col = 0;
+
+  if (!*did_savep) {
+    u_save_cursor();
+    *did_savep = true;
+  }
+  if (u_savesub(lnum) != OK) {
+    xfree(new_line.data);
+    kv_destroy(matches);
+    return false;
+  }
+  if (ml_replace(lnum, new_line.data, true) != OK) {
+    xfree(new_line.data);
+    kv_destroy(matches);
+    return false;
+  }
+
+  for (size_t i = 0; i < kv_size(matches); i++) {
+    SubLiteralMatch *match = &kv_A(matches, i);
+    extmark_splice(curbuf, (int)lnum - 1, match->new_col, 0, (colnr_T)pat_len,
+                   (bcount_t)pat_len, 0, (colnr_T)sub_len, (bcount_t)sub_len,
+                   kExtmarkUndo);
+  }
+
+  xfree(new_line.data);
+  *match_countp = kv_size(matches);
+  kv_destroy(matches);
+  return true;
+}
+
+static bool sub_try_mmap_literal(exarg_T *eap, String pat, const char *sub,
+                                 const subflags_T *subflags, bool ignore_case, linenr_T line2,
+                                 bool *got_matchp, bool *got_quitp, bool *did_savep,
+                                 linenr_T *first_linep, linenr_T *last_linep)
+  FUNC_ATTR_NONNULL_ARG(1, 3, 4, 7, 8, 9, 10, 11) FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  size_t sub_len = 0;
+  if (global_busy || subflags->do_ask || subflags->do_count || ignore_case
+      || !ml_buf_has_mmap_piece_tree(curbuf)
+      || !sub_plain_literal_pattern(pat) || !sub_plain_literal_replacement(sub, &sub_len)) {
+    return false;
+  }
+  if (pat.size > MAXCOL - 1 || sub_len > MAXCOL - 1) {
+    return false;
+  }
+
+  ml_buf_mmap_substitute_literal_record(curbuf);
+  for (linenr_T lnum = eap->line1; lnum <= line2 && !got_int && !aborting(); lnum++) {
+    size_t match_count = 0;
+    if (!sub_mmap_literal_line(lnum, pat.data, pat.size, sub, sub_len, subflags->do_all,
+                               got_matchp, did_savep, &match_count)) {
+      *got_quitp = true;
+      return true;
+    }
+
+    if (match_count > 0) {
+      sub_nsubs += (int64_t)match_count;
+      sub_nlines++;
+      if (*first_linep == 0) {
+        *first_linep = lnum;
+      }
+      *last_linep = lnum + 1;
+    }
+
+    line_breakcheck();
+  }
+
+  return true;
+}
+
 /// Parse cmd string for :substitute's {flags} and update subflags accordingly
 ///
 /// @param[in]      cmd  command string
@@ -3753,9 +3995,15 @@ static int do_sub(exarg_T *eap, const proftime_T timeout, const int cmdpreview_n
     }
   }
 
+  linenr_T line2 = eap->line2;
+  if (cmdpreview_ns <= 0
+      && sub_try_mmap_literal(eap, pat, sub, &subflags, regmatch.rmm_ic, line2, &got_match,
+                              &got_quit, &did_save, &first_line, &last_line)) {
+    goto sub_done;
+  }
+
   // Check for a match on each line.
   // If preview: limit to max('cmdwinheight', viewport).
-  linenr_T line2 = eap->line2;
   const char *mmap_required_literal = NULL;
   size_t mmap_required_literal_len = 0;
   const bool mmap_regex_prefilter = cmdpreview_ns <= 0
@@ -4521,6 +4769,7 @@ skip:
     }
   }
 
+sub_done:
   curbuf->deleted_bytes2 = 0;
 
   if (first_line != 0) {

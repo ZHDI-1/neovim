@@ -103,6 +103,7 @@ typedef struct {
   uint64_t ml_mmap_piece_write_copy_range_count;  // original spans copied by kernel
   uint64_t ml_mmap_piece_compact_count;  // successful compact tree flips
   uint64_t ml_mmap_search_prefilter_count;  // regex searches skipped via mmap literal
+  uint64_t ml_mmap_substitute_literal_count;  // substitutes handled by mmap literal fast path
   mmap_marked_range_T *ml_mmap_marked_ranges;  // temporary :global marks
   size_t ml_mmap_marked_count;  // active entries in ml_mmap_marked_ranges
   size_t ml_mmap_marked_cap;  // allocated entries in ml_mmap_marked_ranges
