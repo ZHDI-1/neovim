@@ -1884,7 +1884,7 @@ bool piece_tree_find_literal(PieceTree *tree, size_t offset, size_t len,
       .pat = pat,
       .logical_offset = offset,
     };
-    (void)pt_for_each_span_guarded(tree, offset, len, pt_find_byte_span, &ctx);
+    (void)piece_tree_for_each_span(tree, offset, len, pt_find_byte_span, &ctx);
     if (!ctx.found) {
       return false;
     }
@@ -1903,7 +1903,7 @@ bool piece_tree_find_literal(PieceTree *tree, size_t offset, size_t len,
     .pat_len = pat_len,
     .logical_offset = offset,
   };
-  (void)pt_for_each_span_guarded(tree, offset, len, pt_find_literal_span, &ctx);
+  (void)piece_tree_for_each_span(tree, offset, len, pt_find_literal_span, &ctx);
   xfree(prefix);
   if (!ctx.found) {
     return false;
@@ -1929,7 +1929,7 @@ bool piece_tree_find_literals(PieceTree *tree, size_t offset, size_t len,
       .callback = callback,
       .callback_ctx = ctx,
     };
-    const bool ok = pt_for_each_span_guarded(tree, offset, len, pt_find_byte_matches_span,
+    const bool ok = piece_tree_for_each_span(tree, offset, len, pt_find_byte_matches_span,
                                              &find_ctx);
     return ok;
   }
@@ -1947,7 +1947,7 @@ bool piece_tree_find_literals(PieceTree *tree, size_t offset, size_t len,
     .callback = callback,
     .callback_ctx = ctx,
   };
-  const bool ok = pt_for_each_span_guarded(tree, offset, len, pt_find_literal_matches_span,
+  const bool ok = piece_tree_for_each_span(tree, offset, len, pt_find_literal_matches_span,
                                            &find_ctx);
   xfree(prefix);
   return ok;

@@ -273,7 +273,8 @@ local function find_literals(tree, offset, len, pat, stop_after, reader_tree)
   local matches = {}
   local cb = ffi.cast('PieceTreeMatchCallback', function(match_offset, _)
     if reader_tree ~= nil then
-      eq(1, tonumber(reader_tree[0].reader_count))
+      eq(0, tonumber(reader_tree[0].reader_count))
+      eq(1, tonumber(reader_tree[0].span_ref_count))
     end
     matches[#matches + 1] = tonumber(match_offset)
     return stop_after == nil or #matches < stop_after
@@ -282,6 +283,7 @@ local function find_literals(tree, offset, len, pat, stop_after, reader_tree)
   cb:free()
   if reader_tree ~= nil then
     eq(0, tonumber(reader_tree[0].reader_count))
+    eq(0, tonumber(reader_tree[0].span_ref_count))
   end
   return ok_, matches
 end
@@ -998,6 +1000,39 @@ describe('piece tree', function()
     ok_, matches_ = find_literals(w.tree, 0, #shadow, '')
     eq(false, ok_)
     eq({}, matches_)
+  end)
+
+  itp('allows mutation while literal match callbacks consume leased spans', function()
+    local w = new_tree('abefabef')
+    local shadow = 'abefabef'
+
+    ok(lib.piece_tree_insert(w.tree, 2, 'cd', 2))
+    shadow = insert_shadow(shadow, 2, 'cd')
+    ok(lib.piece_tree_insert(w.tree, 8, 'cd', 2))
+    shadow = insert_shadow(shadow, 8, 'cd')
+    check_tree(w.tree, shadow)
+
+    local captured = shadow
+    local matches = {}
+    local mutated = false
+    local cb = ffi.cast('PieceTreeMatchCallback', function(match_offset, _)
+      eq(0, tonumber(w.tree[0].reader_count))
+      eq(1, tonumber(w.tree[0].span_ref_count))
+      if not mutated then
+        mutated = true
+        ok(lib.piece_tree_insert(w.tree, 0, '>', 1))
+      end
+      matches[#matches + 1] = tonumber(match_offset)
+      return true
+    end)
+    ok(lib.piece_tree_find_literals(w.tree, 0, #captured, 'cdef', 4, cb, nil))
+    cb:free()
+
+    eq({ 2, 8 }, matches)
+    shadow = insert_shadow(shadow, 0, '>')
+    check_tree(w.tree, shadow)
+    eq(0, tonumber(w.tree[0].reader_count))
+    eq(0, tonumber(w.tree[0].span_ref_count))
   end)
 
   itp('uses a borrowed sparse original line index', function()
