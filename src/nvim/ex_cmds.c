@@ -3756,12 +3756,44 @@ static int do_sub(exarg_T *eap, const proftime_T timeout, const int cmdpreview_n
   // Check for a match on each line.
   // If preview: limit to max('cmdwinheight', viewport).
   linenr_T line2 = eap->line2;
+  const char *mmap_required_literal = NULL;
+  size_t mmap_required_literal_len = 0;
+  const bool mmap_regex_prefilter = cmdpreview_ns <= 0
+                                    && !subflags.do_ask
+                                    && ml_buf_has_mmap_lines(curbuf)
+                                    && !re_multiline(regmatch.regprog)
+                                    && vim_regprog_get_required_literal(regmatch.regprog,
+                                                                        regmatch.rmm_ic,
+                                                                        &mmap_required_literal,
+                                                                        &mmap_required_literal_len);
 
   for (linenr_T lnum = eap->line1;
        lnum <= line2 && !got_quit && !aborting()
        && (cmdpreview_ns <= 0 || preview_lines.lines_needed <= (linenr_T)p_cwh
            || lnum <= curwin->w_botline);
        lnum++) {
+    if (mmap_regex_prefilter) {
+      size_t line_start = 0;
+      if (ml_get_buf_mmap_line_start(curbuf, lnum, &line_start)) {
+        linenr_T literal_lnum = lnum;
+        size_t literal_offset = line_start;
+        size_t literal_line_start = line_start;
+        size_t literal_line_len = 0;
+        colnr_T literal_col = 0;
+        char *literal_line = NULL;
+        const bool has_literal =
+          ml_get_buf_mmap_literal_match_at(curbuf, &literal_offset, &literal_lnum,
+                                           &literal_line_start, mmap_required_literal,
+                                           mmap_required_literal_len, &literal_line,
+                                           &literal_line_len, &literal_col);
+        xfree(literal_line);
+        if (!has_literal || literal_lnum > line2) {
+          break;
+        }
+        ml_buf_mmap_search_prefilter_record(curbuf);
+        lnum = literal_lnum;
+      }
+    }
     int nmatch = vim_regexec_multi(&regmatch, curwin, curbuf, lnum,
                                    0, NULL, NULL);
     if (nmatch) {

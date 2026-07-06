@@ -579,6 +579,23 @@ describe('fileio', function()
     eq(0, stats.virt_blocks)
     ok(stats.mmap_search_prefilter_count > prefilter_count)
 
+    api.nvim_buf_set_lines(0, 39899, 39900, false, {
+      'substitute mmap-subregex-12345 suffix',
+    })
+    stats = api.nvim__buf_stats(0)
+    prefilter_count = stats.mmap_search_prefilter_count
+
+    command('set regexpengine=1')
+    command([[%s/.*mmap-subregex-\d\+/substitution hit/]])
+    command('set regexpengine&')
+    eq('substitution hit suffix', fn.getline(39900))
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    ok(stats.mmap_search_prefilter_count > prefilter_count)
+
     prefilter_count = stats.mmap_search_prefilter_count
     command('set regexpengine=1')
     command('normal! G$')
