@@ -313,6 +313,22 @@ it(':vimgrep searches edited mmap buffers through the piece tree', function()
   eq(25, #list)
   eq({ 1600, 1, 9 }, { list[1].lnum, list[1].col, list[1].end_col })
   eq({ 4000, 1, 9 }, { list[25].lnum, list[25].col, list[25].end_col })
+
+  command("call setline(39950, 'tail mmap-regex-12345 suffix')")
+  local stats = api.nvim__buf_stats(0)
+  local prefilter_count = stats.mmap_search_prefilter_count
+  command('set regexpengine=1')
+  command([[vimgrep /.*mmap-regex-\d\+/gj %]])
+  command('set regexpengine&')
+  list = fn.getqflist()
+  eq(1, #list)
+  eq({ 39950, 1, 22 }, { list[1].lnum, list[1].col, list[1].end_col })
+
+  stats = api.nvim__buf_stats(0)
+  eq(true, stats.mmap_active)
+  eq(true, stats.mmap_piece_tree)
+  eq(0, stats.virt_blocks)
+  eq(true, stats.mmap_search_prefilter_count > prefilter_count)
 end)
 
 it(':vimgrep can specify Unicode pattern without delimiters', function()

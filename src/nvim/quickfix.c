@@ -5616,6 +5616,16 @@ static bool vgr_match_buflines(qf_list_T *qfl, char *fname, buf_T *buf, char *sp
   const bool literal_utf8 = !(flags & VGR_FUZZY)
                             && !regmatch->rmm_ic
                             && vgr_is_literal_utf8(spat, &pat_len);
+  const char *mmap_required_literal = NULL;
+  size_t mmap_required_literal_len = 0;
+  const bool mmap_regex_prefilter = !(flags & VGR_FUZZY)
+                                    && !literal_utf8
+                                    && ml_buf_has_mmap_lines(buf)
+                                    && !re_multiline(regmatch->regprog)
+                                    && vim_regprog_get_required_literal(regmatch->regprog,
+                                                                        regmatch->rmm_ic,
+                                                                        &mmap_required_literal,
+                                                                        &mmap_required_literal_len);
   const size_t fuzzy_pat_len = MIN(strlen(spat), FUZZY_MATCH_MAX_LEN);
   linenr_T literal_block_high = 0;
   bool literal_block_contains = true;
@@ -5769,6 +5779,32 @@ static bool vgr_match_buflines(qf_list_T *qfl, char *fname, buf_T *buf, char *sp
       }
     } else if (!(flags & VGR_FUZZY)) {
       // Regular expression match
+      if (mmap_regex_prefilter) {
+        size_t line_start = 0;
+        if (ml_get_buf_mmap_line_start(buf, lnum, &line_start)) {
+          linenr_T literal_lnum = lnum;
+          size_t literal_offset = line_start + (size_t)col;
+          size_t literal_line_start = line_start;
+          size_t literal_line_len = 0;
+          colnr_T literal_col = 0;
+          char *literal_line = NULL;
+          const bool has_literal =
+            ml_get_buf_mmap_literal_match_at(buf, &literal_offset, &literal_lnum,
+                                             &literal_line_start, mmap_required_literal,
+                                             mmap_required_literal_len, &literal_line,
+                                             &literal_line_len, &literal_col);
+          xfree(literal_line);
+          if (!has_literal) {
+            break;
+          }
+          ml_buf_mmap_search_prefilter_record(buf);
+          if (literal_lnum != lnum) {
+            lnum = literal_lnum;
+            col = 0;
+          }
+        }
+      }
+
       while (vim_regexec_multi(regmatch, curwin, buf, lnum, col, NULL, NULL) > 0) {
         // Pass the buffer number so that it gets used even for a
         // dummy buffer, unless duplicate_name is set, then the
