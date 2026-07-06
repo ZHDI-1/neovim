@@ -1075,30 +1075,60 @@ bool piece_tree_rebase_original(PieceTree *tree, const char *original, size_t or
   return true;
 }
 
-static bool pt_clone_append_original(PieceTree *dst, const PieceTreeNode *src_node)
+static bool pt_span_original_start(const PieceTree *tree, const PieceTreeSpan *span,
+                                   size_t *startp)
 {
+  if (tree->original == NULL || span->data == NULL) {
+    return false;
+  }
+
+  const uintptr_t original = (uintptr_t)tree->original;
+  const uintptr_t data = (uintptr_t)span->data;
+  if (data < original) {
+    return false;
+  }
+
+  const size_t start = (size_t)(data - original);
+  if (start > tree->original_len || span->len > tree->original_len - start) {
+    return false;
+  }
+
+  *startp = start;
+  return true;
+}
+
+static bool pt_compact_append_original_span(PieceTree *dst, size_t start, size_t len)
+{
+  if (len == 0) {
+    return true;
+  }
+
+  const size_t lf_count = pt_range_lfs(dst, kPieceTreeSourceOriginal, NULL, start, len);
   PieceTreeNode *last = pt_maximum(dst->root);
   if (last != NULL
       && last->source == kPieceTreeSourceOriginal
-      && last->start + last->len == src_node->start) {
-    last->len += src_node->len;
-    last->lf_count += src_node->lf_count;
+      && last->start + last->len == start) {
+    last->len += len;
+    last->lf_count += lf_count;
     pt_update_upwards(last);
     return true;
   }
 
-  PieceTreeNode *node = pt_new_node(dst, kPieceTreeSourceOriginal, NULL, src_node->start,
-                                    src_node->len, src_node->lf_count);
+  PieceTreeNode *node = pt_new_node(dst, kPieceTreeSourceOriginal, NULL, start, len, lf_count);
   pt_insert_before(dst, NULL, node);
   return true;
 }
 
-static bool pt_clone_append_add(PieceTree *dst, const PieceTree *src,
-                                const PieceTreeNode *src_node)
+static bool pt_compact_append_add_span(PieceTree *dst, const PieceTreeSpan *span)
 {
+  if (span->len == 0) {
+    return true;
+  }
+
+  const size_t lf_count = pt_count_lfs(span->data, span->len);
   size_t add_start = 0;
   PieceTreeAddChunk *add_chunk = NULL;
-  if (!pt_append_add(dst, pt_node_data(src, src_node), src_node->len, &add_start, &add_chunk)) {
+  if (!pt_append_add(dst, span->data, span->len, &add_start, &add_chunk)) {
     return false;
   }
 
@@ -1107,21 +1137,24 @@ static bool pt_clone_append_add(PieceTree *dst, const PieceTree *src,
       && last->source == kPieceTreeSourceAdd
       && last->add_chunk == add_chunk
       && last->start + last->len == add_start) {
-    last->len += src_node->len;
-    last->lf_count += src_node->lf_count;
+    last->len += span->len;
+    last->lf_count += lf_count;
     pt_update_upwards(last);
     return true;
   }
 
-  PieceTreeNode *node = pt_new_node(dst, kPieceTreeSourceAdd, add_chunk, add_start,
-                                    src_node->len, src_node->lf_count);
+  PieceTreeNode *node = pt_new_node(dst, kPieceTreeSourceAdd, add_chunk, add_start, span->len,
+                                    lf_count);
   pt_insert_before(dst, NULL, node);
   return true;
 }
 
-bool piece_tree_clone_compact(PieceTree *dst, PieceTree *src)
+bool piece_tree_clone_compact_from_span_vec(PieceTree *dst, const PieceTree *src,
+                                            const PieceTreeSpanVec *vec)
 {
-  if (dst == NULL || src == NULL || dst == src) {
+  if (dst == NULL || src == NULL || vec == NULL || dst == src
+      || vec->owner != src || vec->logical_start != 0
+      || (vec->byte_len > 0 && vec->items == NULL)) {
     return false;
   }
 
@@ -1132,30 +1165,58 @@ bool piece_tree_clone_compact(PieceTree *dst, PieceTree *src)
   dst->original_index_count = src->original_index_count;
   dst->original_index_stride = src->original_index_stride;
 
-  piece_tree_reader_enter(src);
-  const uint64_t revision = src->revision;
   bool ok = true;
-  for (const PieceTreeNode *node = pt_minimum(src->root);
-       node != NULL;
-       node = pt_successor((PieceTreeNode *)node)) {
-    if (node->source == kPieceTreeSourceOriginal) {
-      ok = pt_clone_append_original(dst, node);
+  size_t logical_offset = 0;
+  for (size_t i = 0; i < vec->count; i++) {
+    const PieceTreeSpan *span = &vec->items[i];
+    if (span->offset != logical_offset
+        || span->len > vec->byte_len - logical_offset
+        || (span->len > 0 && span->data == NULL)) {
+      ok = false;
+      break;
+    }
+    logical_offset += span->len;
+
+    size_t original_start = 0;
+    if (pt_span_original_start(src, span, &original_start)) {
+      ok = pt_compact_append_original_span(dst, original_start, span->len);
     } else {
-      ok = pt_clone_append_add(dst, src, node);
+      ok = pt_compact_append_add_span(dst, span);
     }
     if (!ok) {
       break;
     }
   }
-  ok = ok && src->revision == revision;
-  piece_tree_reader_leave(src);
+  ok = ok && logical_offset == vec->byte_len;
 
   if (!ok) {
     piece_tree_clear(dst);
     return false;
   }
-  dst->revision = revision;
+  dst->revision = vec->revision;
   return true;
+}
+
+bool piece_tree_clone_compact(PieceTree *dst, PieceTree *src)
+{
+  if (dst == NULL || src == NULL || dst == src) {
+    return false;
+  }
+
+  PieceTreeSnapshot snapshot = { 0 };
+  if (!piece_tree_snapshot(src, &snapshot)) {
+    return false;
+  }
+
+  PieceTreeSpanVec vec = { 0 };
+  if (!piece_tree_collect_span_vec_at_revision(src, 0, snapshot.byte_len, snapshot.revision,
+                                               &vec)) {
+    return false;
+  }
+
+  const bool ok = piece_tree_clone_compact_from_span_vec(dst, src, &vec);
+  piece_tree_span_vec_clear(&vec);
+  return ok;
 }
 
 size_t piece_tree_byte_len(const PieceTree *tree)

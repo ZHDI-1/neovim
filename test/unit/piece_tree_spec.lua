@@ -810,6 +810,38 @@ describe('piece tree', function()
     check_tree(clone_with_reader, shadow)
   end)
 
+  itp('clones compact composition from a leased span vector', function()
+    local w = new_tree('alpha\nomega\n')
+    local shadow = 'alpha\nomega\n'
+
+    ok(lib.piece_tree_insert(w.tree, 6, 'beta\n', 5))
+    shadow = insert_shadow(shadow, 6, 'beta\n')
+    ok(lib.piece_tree_replace(w.tree, 0, 5, 'ALPHA', 5))
+    shadow = replace_shadow(shadow, 0, 5, 'ALPHA')
+    check_tree(w.tree, shadow)
+
+    local captured = shadow
+    local vec = collect_span_vec(w.tree, 0, #captured)
+    local captured_revision = tonumber(vec[0].revision)
+    eq(1, tonumber(w.tree[0].span_ref_count))
+
+    ok(lib.piece_tree_delete(w.tree, 0, 6))
+    shadow = delete_shadow(shadow, 0, 6)
+    ok(lib.piece_tree_insert(w.tree, 0, 'changed\n', 8))
+    shadow = insert_shadow(shadow, 0, 'changed\n')
+    check_tree(w.tree, shadow)
+
+    local clone = new_uninit_tree()
+    ok(lib.piece_tree_clone_compact_from_span_vec(clone, w.tree, vec))
+    check_tree(clone, captured)
+    eq(captured_revision, tonumber(clone[0].revision))
+    eq(tonumber(lib.piece_tree_add_live_len(clone)), tonumber(clone[0].add_len))
+
+    lib.piece_tree_span_vec_clear(vec)
+    eq(0, tonumber(w.tree[0].span_ref_count))
+    check_tree(clone, captured)
+  end)
+
   itp('stores appended text in multiple add chunks', function()
     local w = new_tree('start\nend')
     local first = string.rep('a', 5000) .. 'BOUNDARY-'
