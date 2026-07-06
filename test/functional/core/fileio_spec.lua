@@ -1171,6 +1171,47 @@ describe('fileio', function()
     eq(prefix, read_file('Xtest_mmap_readfile'):sub(1, #prefix))
   end)
 
+  it('appends mmap piece tails without rewriting original spans', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('tail-write mmap line %05d plain ascii'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    command('set nowritebackup nobackup backupcopy=yes backupskip=')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_source_is_buffer_file)
+    eq(0, stats.virt_blocks)
+    local fast_before = stats.mmap_piece_write_fast_count
+    local original_before = stats.mmap_piece_write_clone_range_count
+      + stats.mmap_piece_write_copy_range_count
+      + stats.mmap_piece_write_raw_original_count
+
+    local appended = 'tail-write mmap appended without prefix rewrite'
+    command("call append('$', '" .. appended .. "')")
+    lines[#lines + 1] = appended
+    command('write')
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(false, stats.mmap_source_is_buffer_file)
+    eq(0, stats.virt_blocks)
+    eq(fast_before + 1, stats.mmap_piece_write_fast_count)
+    local original_after = stats.mmap_piece_write_clone_range_count
+      + stats.mmap_piece_write_copy_range_count
+      + stats.mmap_piece_write_raw_original_count
+    eq(original_before, original_after)
+    eq(#lines, fn.line('$'))
+    eq(appended, fn.getline('$'))
+    eq(table.concat(lines, '\n') .. '\n', read_file('Xtest_mmap_readfile'))
+  end)
+
   it('streams mmap piece writes from original and add spans', function()
     local lines = {}
     for i = 1, 40000 do

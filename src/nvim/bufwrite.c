@@ -571,6 +571,116 @@ static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, const char *
   return ret;
 }
 
+static bool buf_write_mmap_piece_can_append_tail(buf_T *buf, const FileInfo *file_info_old,
+                                                 size_t *tail_startp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (!ml_buf_flush_mmap_piece_tree(buf) || buf->b_ml.ml_piece_tree == NULL) {
+    return false;
+  }
+
+  PieceTree *tree = buf->b_ml.ml_piece_tree;
+  const size_t original_len = tree->original_len;
+  if (os_fileinfo_size(file_info_old) != (uint64_t)original_len) {
+    return false;
+  }
+
+  PieceTreeSnapshot snapshot = { 0 };
+  if (!piece_tree_snapshot(tree, &snapshot) || snapshot.byte_len <= original_len) {
+    return false;
+  }
+
+  PieceTreeSpanVec span_vec = { 0 };
+  if (!piece_tree_collect_span_vec_at_revision(tree, 0, snapshot.byte_len,
+                                               snapshot.revision, &span_vec)) {
+    return false;
+  }
+
+  bool ok = true;
+  size_t original_pos = 0;
+  size_t tail_len = 0;
+  for (size_t i = 0; i < span_vec.count; i++) {
+    const PieceTreeSpan *span = &span_vec.items[i];
+    if (span->len == 0) {
+      continue;
+    }
+    if (original_pos < original_len) {
+      if (span->source != kPieceTreeSourceOriginal
+          || span->source_start != original_pos
+          || span->len > original_len - original_pos) {
+        ok = false;
+        break;
+      }
+      original_pos += span->len;
+    } else if (span->source == kPieceTreeSourceAdd) {
+      tail_len += span->len;
+    } else {
+      ok = false;
+      break;
+    }
+  }
+
+  piece_tree_span_vec_clear(&span_vec);
+  if (!ok || original_pos != original_len || tail_len == 0) {
+    return false;
+  }
+
+  *tail_startp = original_len;
+  return true;
+}
+
+static int buf_write_mmap_piece_append_tail_raw(buf_T *buf, struct bw_info *ip,
+                                                size_t tail_start, bool write_final_eol,
+                                                bool *no_eolp, off_T *ncharsp)
+  FUNC_ATTR_NONNULL_ARG(1, 2, 5, 6)
+{
+  if (ip->bw_fd < 0 || ip->bw_len != 0 || buf->b_ml.ml_piece_tree == NULL) {
+    return NOTDONE;
+  }
+  if (!ml_buf_flush_mmap_piece_tree(buf) || buf->b_ml.ml_piece_tree == NULL) {
+    return NOTDONE;
+  }
+
+  PieceTree *tree = buf->b_ml.ml_piece_tree;
+  PieceTreeSnapshot snapshot = { 0 };
+  if (!piece_tree_snapshot(tree, &snapshot) || tail_start > snapshot.byte_len) {
+    return NOTDONE;
+  }
+
+  PieceTreeSpanVec span_vec = { 0 };
+  if (!piece_tree_collect_span_vec_at_revision(tree, tail_start, snapshot.byte_len - tail_start,
+                                               snapshot.revision, &span_vec)) {
+    return NOTDONE;
+  }
+
+  int ret = OK;
+  for (size_t i = 0; i < span_vec.count; i++) {
+    const PieceTreeSpan *span = &span_vec.items[i];
+    if (span->len == 0) {
+      continue;
+    }
+    if (span->source != kPieceTreeSourceAdd
+        || buf_write_raw_bytes(ip->bw_fd, span->data, span->len, ncharsp) == FAIL) {
+      ret = FAIL;
+      break;
+    }
+  }
+
+  if (ret == OK && !buf_write_span_vec_ends_in_nl(&span_vec)) {
+    if (write_final_eol) {
+      ret = buf_write_raw_bytes(ip->bw_fd, "\n", 1, ncharsp);
+    } else {
+      *no_eolp = true;
+    }
+  }
+
+  piece_tree_span_vec_clear(&span_vec);
+  if (ret == OK) {
+    ml_buf_mmap_piece_write_fast_record(buf);
+  }
+  return ret;
+}
+
 static bool buf_write_mmap_source_can_stream(buf_T *buf, bool newfile, bool device,
                                              bool backup_copy, const char *backup,
                                              const FileInfo *file_info_old)
@@ -1463,6 +1573,8 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
   const bool mmap_source_was_output = ml_buf_has_mmap_storage(buf)
                                       && buf_write_mmap_source_is_output(buf, newfile, device,
                                                                         &file_info_old);
+  bool mmap_tail_append_candidate = false;
+  size_t mmap_tail_append_start = 0;
 
   // For systems that support ACL: get the ACL from the original file.
   if (!newfile) {
@@ -1486,6 +1598,33 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
   // Mark the buffer as 'being saved' to prevent changed buffer warnings
   buf->b_saving = true;
 
+  if (eap == NULL || eap->force_enc == 0) {
+    int write_bin = buf->b_p_bin;
+    if (eap != NULL && eap->force_bin != 0) {
+      write_bin = eap->force_bin == FORCE_BIN;
+    }
+    mmap_tail_append_candidate =
+      !append
+      && !filtering
+      && !forceit
+      && !newfile
+      && !device
+      && !dobackup
+      && reset_changed
+      && whole
+      && overwriting
+      && !write_bin
+      && !need_conversion(buf->b_p_fenc)
+      && !buf->b_p_bomb
+      && !buf->b_p_eof
+      && get_fileformat_force(buf, eap) == EOL_UNIX
+      && !buf->b_p_udf
+      && mmap_source_was_output
+      && ml_buf_mmap_source_is_buffer_file(buf)
+      && ml_buf_has_mmap_piece_tree(buf)
+      && buf_write_mmap_piece_can_append_tail(buf, &file_info_old, &mmap_tail_append_start);
+  }
+
   // If we are not appending or filtering, the file exists, and the
   // 'writebackup', 'backup' or 'patchmode' option is set, need a backup.
   // When 'patchmode' is set also make a backup when appending.
@@ -1506,6 +1645,7 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
       && !filtering
       && perm >= 0
       && ml_buf_has_mmap_storage(buf)
+      && !mmap_tail_append_candidate
       && buf_write_mmap_source_is_output(buf, newfile, device, &file_info_old)
       && !buf_write_mmap_source_can_stream(buf, newfile, device, backup_copy, backup,
                                            &file_info_old)) {
@@ -1661,6 +1801,7 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
   linenr_T lnum;
   int fileformat;
   bool checking_conversion;
+  bool mmap_tail_append_did_write = false;
 
   int fd;
 
@@ -1675,6 +1816,42 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
     if (!converted || dobackup) {
       checking_conversion = false;
     }
+
+    // use "++bin", "++nobin" or 'binary'
+    int write_bin;
+    if (eap != NULL && eap->force_bin != 0) {
+      write_bin = (eap->force_bin == FORCE_BIN);
+    } else {
+      write_bin = buf->b_p_bin;
+    }
+    fileformat = get_fileformat_force(buf, eap);
+
+    const size_t mmap_tail_start = mmap_tail_append_start;
+    const bool mmap_tail_append_write =
+      mmap_tail_append_candidate
+      && end > 0
+      && !checking_conversion
+      && !append
+      && !filtering
+      && !forceit
+      && !newfile
+      && !device
+      && !dobackup
+      && backup == NULL
+      && reset_changed
+      && whole
+      && overwriting
+      && !write_bin
+      && !converted
+      && !buf->b_p_bomb
+      && !buf->b_p_eof
+      && wb_flags == 0
+      && write_info.bw_iconv_fd == (iconv_t)-1
+      && fileformat == EOL_UNIX
+      && !buf->b_p_udf
+      && mmap_source_was_output
+      && ml_buf_mmap_source_is_buffer_file(buf)
+      && ml_buf_has_mmap_piece_tree(buf);
 
     if (checking_conversion) {
       // Make sure we don't write anything.
@@ -1691,7 +1868,7 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
       // false.
       const int fflags = O_WRONLY | (append
                                      ? (forceit ? (O_APPEND | O_CREAT) : O_APPEND)
-                                     : (O_CREAT | O_TRUNC));
+                                     : (mmap_tail_append_write ? 0 : (O_CREAT | O_TRUNC)));
       const int mode = perm < 0 ? 0666 : (perm & 0777);
 
       while ((fd = os_open(wfname, fflags, mode)) < 0) {
@@ -1780,14 +1957,6 @@ restore_backup:
     write_info.bw_buf = buffer;
     nchars = 0;
 
-    // use "++bin", "++nobin" or 'binary'
-    int write_bin;
-    if (eap != NULL && eap->force_bin != 0) {
-      write_bin = (eap->force_bin == FORCE_BIN);
-    } else {
-      write_bin = buf->b_p_bin;
-    }
-
     // Skip the BOM when appending and the file already existed, the BOM
     // only makes sense at the start of the file.
     if (buf->b_p_bomb && !write_bin && (!append || perm < 0)) {
@@ -1813,9 +1982,27 @@ restore_backup:
 
     write_info.bw_len = 0;
     write_info.bw_flags = wb_flags;
-    fileformat = get_fileformat_force(buf, eap);
 
-    if (end > 0
+    if (end > 0 && mmap_tail_append_write) {
+      const bool write_final_eol = buf->b_p_fixeol || buf->b_p_eol;
+      if (mmap_tail_start > (size_t)INT64_MAX
+          || vim_lseek(write_info.bw_fd, (off_T)mmap_tail_start, SEEK_SET)
+             != (off_T)mmap_tail_start) {
+        end = 0;
+        goto write_loop_done;
+      }
+      nchars = (off_T)mmap_tail_start;
+      const int mmap_write_ret =
+        buf_write_mmap_piece_append_tail_raw(buf, &write_info, mmap_tail_start,
+                                             write_final_eol, &no_eol, &nchars);
+      if (mmap_write_ret == OK) {
+        mmap_tail_append_did_write = true;
+        lnum = end + 1;
+        goto write_loop_done;
+      }
+      end = 0;
+      goto write_loop_done;
+    } else if (end > 0
         && !checking_conversion
         && !append
         && !filtering
@@ -2149,6 +2336,9 @@ write_loop_done:
     } else {
       buf->b_flags &= ~BF_WRITE_MASK;
     }
+  }
+  if (mmap_tail_append_did_write) {
+    ml_buf_mmap_source_detach_buffer_file(buf);
   }
   if (reset_changed && whole && !append && overwriting && !write_info.bw_conv_error) {
     ml_buf_mmap_piece_journal_reset(buf);
