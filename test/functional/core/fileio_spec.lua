@@ -1458,6 +1458,61 @@ describe('fileio', function()
     eq(1, fn.getbufvar('%', '&modified'))
   end)
 
+  it('recovers mmap literal substitute edits from a piece journal', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for mmap substitute recovery'):format(i)
+    end
+    lines[1111] = 'journal substitute needle one'
+    lines[2222] = 'journal substitute needle two needle'
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir// swapfile' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    local literal_count = stats.mmap_substitute_literal_count
+
+    command([[%s/needle/restored/g]])
+    lines[1111] = 'journal substitute restored one'
+    lines[2222] = 'journal substitute restored two restored'
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(2, stats.mmap_piece_journal_record_count)
+    eq(literal_count + 1, stats.mmap_substitute_literal_count)
+    eq(lines[1111], fn.getline(1111))
+    eq(lines[2222], fn.getline(2222))
+    local journal_path = stats.mmap_piece_journal_path
+    neq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile(journal_path, 'Xtest_mmap_saved_journal'))
+
+    command('bwipe!')
+    eq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile('Xtest_mmap_saved_journal', journal_path))
+
+    command('edit Xtest_mmap_readfile')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(false, stats.mmap_piece_journal_active)
+    eq(true, stats.mmap_piece_journal_failed)
+
+    command('recover')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(2, stats.mmap_piece_journal_record_count)
+    eq(lines[1111], fn.getline(1111))
+    eq(lines[2222], fn.getline(2222))
+    eq(1, fn.getbufvar('%', '&modified'))
+  end)
+
   it('recovers committed mmap piece-journal records with a torn tail', function()
     local lines = {}
     for i = 1, 40000 do
