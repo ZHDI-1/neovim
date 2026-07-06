@@ -13,6 +13,7 @@ local ok = t.ok
 local feed = n.feed
 local fn = n.fn
 local nvim_prog = n.nvim_prog
+local poke_eventloop = n.poke_eventloop
 local request = n.request
 local retry = t.retry
 local rmdir = n.rmdir
@@ -92,6 +93,10 @@ describe('fileio', function()
       return line:sub(1, start_col) .. replacement .. line:sub(end_col + 1)
     end
 
+    local function text_size()
+      return #table.concat(lines, '\n') + 1
+    end
+
     local function expect_mmap_piece(min_revision, text_size)
       local stats = api.nvim__buf_stats(0)
       eq(true, stats.mmap_active)
@@ -100,6 +105,7 @@ describe('fileio', function()
       eq(true, stats.mmap_piece_tree)
       ok(stats.mmap_piece_revision >= min_revision)
       ok(stats.mmap_piece_write_fast_count >= 0)
+      ok(stats.mmap_piece_compact_count >= 0)
       ok(stats.mmap_piece_node_capacity >= stats.mmap_piece_nodes)
       ok(stats.mmap_piece_node_capacity
          >= stats.mmap_piece_nodes + stats.mmap_piece_free_nodes
@@ -174,6 +180,23 @@ describe('fileio', function()
     expect_mmap_piece(1)
     eq(40000, fn.line('$'))
     eq(line2byte(4), fn.line2byte(4))
+
+    local before_compact = api.nvim__buf_stats(0)
+    ok(before_compact.mmap_piece_add_len > 0)
+    eq(true, api.nvim__buf_compact_mmap_piece_tree(0))
+    local compact_stats = api.nvim__buf_stats(0)
+    eq(before_compact.mmap_piece_compact_count + 1, compact_stats.mmap_piece_compact_count)
+    eq(text_size(), compact_stats.mmap_text_size)
+    eq(lines[1], fn.getline(1))
+    eq(lines[40000], fn.getline(40000))
+    poke_eventloop()
+    retry(nil, 1000, function()
+      local stats = api.nvim__buf_stats(0)
+      eq(1, stats.mmap_storage_refs)
+      eq(1, stats.mmap_line_index_refs)
+      eq(false, stats.mmap_piece_reclaim_scheduled)
+    end)
+    expect_mmap_piece(1, text_size())
 
     api.nvim_buf_set_text(0, 4, 4, 4, 9, { 'TEXT' })
     lines[5] = replace_slice(lines[5], 4, 9, 'TEXT')
@@ -391,6 +414,7 @@ describe('fileio', function()
       eq(true, stats.mmap_piece_tree)
       ok(stats.mmap_piece_revision >= min_revision)
       ok(stats.mmap_piece_write_fast_count >= 0)
+      ok(stats.mmap_piece_compact_count >= 0)
       eq(false, stats.mmap_piece_reclaim_scheduled)
       eq(text_size(), stats.mmap_text_size)
       eq(#lines, fn.line('$'))

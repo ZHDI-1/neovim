@@ -1233,6 +1233,17 @@ Object nvim_buf_call(Buffer buf, LuaRef fn, lua_State *lstate, Error *err)
 }
 
 /// @nodoc
+Boolean nvim__buf_compact_mmap_piece_tree(Buffer buf, Error *err)
+{
+  buf_T *b = find_buffer_by_handle(buf, err);
+  if (!b) {
+    return false;
+  }
+
+  return ml_buf_mmap_compact_piece_tree(b);
+}
+
+/// @nodoc
 Dict nvim__buf_stats(Buffer buf, Arena *arena, Error *err)
 {
   buf_T *b = find_buffer_by_handle(buf, err);
@@ -1240,7 +1251,7 @@ Dict nvim__buf_stats(Buffer buf, Arena *arena, Error *err)
     return (Dict)ARRAY_DICT_INIT;
   }
 
-  Dict rv = arena_dict(arena, 22);
+  Dict rv = arena_dict(arena, 23);
   // Number of times the cached line was flushed.
   // This should generally not increase while editing the same
   // line in the same mode.
@@ -1264,6 +1275,8 @@ Dict nvim__buf_stats(Buffer buf, Arena *arena, Error *err)
   PUT_C(rv, "mmap_piece_revision", INTEGER_OBJ((Integer)ml_buf_mmap_piece_revision(b)));
   PUT_C(rv, "mmap_piece_write_fast_count",
         INTEGER_OBJ((Integer)ml_buf_mmap_piece_write_fast_count(b)));
+  PUT_C(rv, "mmap_piece_compact_count",
+        INTEGER_OBJ((Integer)ml_buf_mmap_piece_compact_count(b)));
   PUT_C(rv, "mmap_text_size", INTEGER_OBJ((Integer)ml_buf_mmap_text_size(b)));
   PUT_C(rv, "mmap_piece_nodes", INTEGER_OBJ((Integer)ml_buf_mmap_piece_node_count(b)));
   PUT_C(rv, "mmap_piece_node_capacity",
