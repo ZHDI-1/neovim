@@ -944,6 +944,12 @@ bool ml_buf_flush_mmap_piece_tree(buf_T *buf)
   return ml_mmap_is_active(buf) && buf->b_ml.ml_piece_tree != NULL;
 }
 
+int ml_buf_mmap_materialize(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  return ml_mmap_is_active(buf) ? ml_mmap_materialize(buf) : OK;
+}
+
 void ml_buf_mmap_piece_write_fast_record(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {

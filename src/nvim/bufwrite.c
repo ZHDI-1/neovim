@@ -419,6 +419,28 @@ static bool buf_write_mmap_source_can_stream(buf_T *buf, bool newfile, bool devi
   return backup != NULL && !backup_copy;
 }
 
+static bool buf_write_mmap_source_is_output(buf_T *buf, bool newfile, bool device,
+                                            const FileInfo *file_info_old)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (newfile || device || !buf->file_id_valid) {
+    return false;
+  }
+
+  FileID output_file_id;
+  os_fileinfo_id(file_info_old, &output_file_id);
+  return os_fileid_equal(&buf->file_id, &output_file_id);
+}
+
+static bool buf_write_mmap_source_can_rename(char *fname, const FileInfo *file_info_old)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  FileInfo file_info;
+  return os_fileinfo_hardlinks(file_info_old) <= 1
+         && os_fileinfo_link(fname, &file_info)
+         && os_fileinfo_id_equal(&file_info, file_info_old);
+}
+
 /// Check modification time of file, before writing to it.
 /// The size isn't checked, because using a tool like "gzip" takes care of
 /// using the same timestamp but can't set the size.
@@ -1267,6 +1289,28 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
   if (!(append && *p_pm == NUL) && !filtering && perm >= 0 && dobackup) {
     if (buf_write_make_backup(fname, append, &file_info_old, acl, perm, bkc, file_readonly, forceit,
                               &backup_copy, &backup, &err) == FAIL) {
+      retval = FAIL;
+      goto fail;
+    }
+  }
+  if (!append
+      && !filtering
+      && perm >= 0
+      && ml_buf_has_mmap_storage(buf)
+      && buf_write_mmap_source_is_output(buf, newfile, device, &file_info_old)
+      && !buf_write_mmap_source_can_stream(buf, newfile, device, backup_copy, backup,
+                                           &file_info_old)) {
+    if (backup == NULL && buf_write_mmap_source_can_rename(fname, &file_info_old)) {
+      const unsigned rename_bkc = kOptBkcFlagNo;
+      if (buf_write_make_backup(fname, append, &file_info_old, acl, perm, rename_bkc,
+                                file_readonly, forceit, &backup_copy, &backup, &err) == FAIL) {
+        retval = FAIL;
+        goto fail;
+      }
+    }
+    if (!buf_write_mmap_source_can_stream(buf, newfile, device, backup_copy, backup,
+                                          &file_info_old)
+        && ml_buf_mmap_materialize(buf) == FAIL) {
       retval = FAIL;
       goto fail;
     }

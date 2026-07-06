@@ -42,6 +42,7 @@ describe('fileio', function()
     os.remove('Xtest_startup_file2')
     os.remove('Xtest_startup_file2~')
     os.remove('Xtest_mmap_readfile')
+    os.remove('Xtest_mmap_readfile~')
     os.remove('Xtest_mmap_noeol')
     os.remove('Xtest_mmap_empty_delete_written')
     os.remove('Xtest_mmap_noeol_written')
@@ -237,6 +238,19 @@ describe('fileio', function()
       written_stats.mmap_piece_write_fast_count)
     matches('^line1 ascii text for mmap smoke\nZhanged\nline3 ascii text for mmap smoke',
       read_file('Xtest_mmap_written'))
+
+    command("call setline(3, 'nowritebackup mmap write')")
+    lines[3] = 'nowritebackup mmap write'
+    command('set nowritebackup nobackup backupcopy=yes')
+    write_stats = expect_mmap_piece(1)
+    command('write')
+    written_stats = expect_mmap_piece(1)
+    eq(write_stats.mmap_piece_write_fast_count + 1,
+      written_stats.mmap_piece_write_fast_count)
+    eq(nil, uv.fs_stat('Xtest_mmap_readfile~'))
+    matches('^line1 ascii text for mmap smoke\nZhanged\nnowritebackup mmap write',
+      read_file('Xtest_mmap_readfile'))
+    command('set writebackup backupcopy& backup&')
 
     command('edit! Xtest_mmap_noeol')
     expect_mmap_piece(0)
