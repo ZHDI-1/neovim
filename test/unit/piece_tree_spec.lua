@@ -71,6 +71,12 @@ local function new_tree(original)
   return { tree = tree, original = original_buf }
 end
 
+local function new_uninit_tree()
+  return ffi.gc(ffi.new('PieceTree[1]'), function(ptr)
+    lib.piece_tree_clear(ptr)
+  end)
+end
+
 local function read_tree(tree)
   local len = tonumber(lib.piece_tree_byte_len(tree))
   local buf = ffi.new('char[?]', math.max(len, 1))
@@ -746,6 +752,48 @@ describe('piece tree', function()
     eq(0, tonumber(w.tree[0].node_capacity))
     ok(w.tree[0].node_blocks == null)
     ok(w.tree[0].add_chunks == null)
+  end)
+
+  itp('clones compact composition with independent add storage', function()
+    local w = new_tree('alpha\nomega\n')
+    local shadow = 'alpha\nomega\n'
+    local null = ffi.cast('void *', 0)
+
+    ok(lib.piece_tree_insert(w.tree, 6, 'beta\n', 5))
+    shadow = insert_shadow(shadow, 6, 'beta\n')
+    ok(lib.piece_tree_insert(w.tree, #shadow, 'tail\n', 5))
+    shadow = insert_shadow(shadow, #shadow, 'tail\n')
+    ok(lib.piece_tree_replace(w.tree, 0, 5, 'ALPHA', 5))
+    shadow = replace_shadow(shadow, 0, 5, 'ALPHA')
+    ok(lib.piece_tree_delete(w.tree, 11, 6))
+    shadow = delete_shadow(shadow, 11, 6)
+    check_tree(w.tree, shadow)
+
+    local source_add_chunks = w.tree[0].add_chunks
+    ok(source_add_chunks ~= null)
+
+    local clone = new_uninit_tree()
+    ok(lib.piece_tree_clone_compact(clone, w.tree))
+    check_tree(clone, shadow)
+    eq(tonumber(w.tree[0].revision), tonumber(clone[0].revision))
+    eq(0, tonumber(lib.piece_tree_free_node_count(clone)))
+    eq(0, tonumber(clone[0].retired_node_count))
+    ok(clone[0].free_nodes == null)
+    ok(clone[0].retired_nodes == null)
+    ok(clone[0].add_chunks ~= null)
+    ok(clone[0].add_chunks ~= source_add_chunks)
+    ok(tonumber(lib.piece_tree_node_count(clone)) <= tonumber(lib.piece_tree_node_count(w.tree)))
+
+    local clone_with_reader = new_uninit_tree()
+    lib.piece_tree_reader_enter(w.tree)
+    ok(lib.piece_tree_clone_compact(clone_with_reader, w.tree))
+    eq(1, tonumber(w.tree[0].reader_count))
+    lib.piece_tree_reader_leave(w.tree)
+    check_tree(clone_with_reader, shadow)
+
+    lib.piece_tree_clear(w.tree)
+    check_tree(clone, shadow)
+    check_tree(clone_with_reader, shadow)
   end)
 
   itp('stores appended text in multiple add chunks', function()

@@ -1074,6 +1074,89 @@ bool piece_tree_rebase_original(PieceTree *tree, const char *original, size_t or
   return true;
 }
 
+static bool pt_clone_append_original(PieceTree *dst, const PieceTreeNode *src_node)
+{
+  PieceTreeNode *last = pt_maximum(dst->root);
+  if (last != NULL
+      && last->source == kPieceTreeSourceOriginal
+      && last->start + last->len == src_node->start) {
+    last->len += src_node->len;
+    last->lf_count += src_node->lf_count;
+    pt_update_upwards(last);
+    return true;
+  }
+
+  PieceTreeNode *node = pt_new_node(dst, kPieceTreeSourceOriginal, NULL, src_node->start,
+                                    src_node->len, src_node->lf_count);
+  pt_insert_before(dst, NULL, node);
+  return true;
+}
+
+static bool pt_clone_append_add(PieceTree *dst, const PieceTree *src,
+                                const PieceTreeNode *src_node)
+{
+  size_t add_start = 0;
+  PieceTreeAddChunk *add_chunk = NULL;
+  if (!pt_append_add(dst, pt_node_data(src, src_node), src_node->len, &add_start, &add_chunk)) {
+    return false;
+  }
+
+  PieceTreeNode *last = pt_maximum(dst->root);
+  if (last != NULL
+      && last->source == kPieceTreeSourceAdd
+      && last->add_chunk == add_chunk
+      && last->start + last->len == add_start) {
+    last->len += src_node->len;
+    last->lf_count += src_node->lf_count;
+    pt_update_upwards(last);
+    return true;
+  }
+
+  PieceTreeNode *node = pt_new_node(dst, kPieceTreeSourceAdd, add_chunk, add_start,
+                                    src_node->len, src_node->lf_count);
+  pt_insert_before(dst, NULL, node);
+  return true;
+}
+
+bool piece_tree_clone_compact(PieceTree *dst, PieceTree *src)
+{
+  if (dst == NULL || src == NULL || dst == src) {
+    return false;
+  }
+
+  memset(dst, 0, sizeof *dst);
+  dst->original = src->original;
+  dst->original_len = src->original_len;
+  dst->original_line_starts = src->original_line_starts;
+  dst->original_index_count = src->original_index_count;
+  dst->original_index_stride = src->original_index_stride;
+
+  piece_tree_reader_enter(src);
+  const uint64_t revision = src->revision;
+  bool ok = true;
+  for (const PieceTreeNode *node = pt_minimum(src->root);
+       node != NULL;
+       node = pt_successor((PieceTreeNode *)node)) {
+    if (node->source == kPieceTreeSourceOriginal) {
+      ok = pt_clone_append_original(dst, node);
+    } else {
+      ok = pt_clone_append_add(dst, src, node);
+    }
+    if (!ok) {
+      break;
+    }
+  }
+  ok = ok && src->revision == revision;
+  piece_tree_reader_leave(src);
+
+  if (!ok) {
+    piece_tree_clear(dst);
+    return false;
+  }
+  dst->revision = revision;
+  return true;
+}
+
 size_t piece_tree_byte_len(const PieceTree *tree)
 {
   return pt_bytes(tree->root);
