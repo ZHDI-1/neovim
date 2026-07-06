@@ -2375,6 +2375,14 @@ uint64_t ml_buf_mmap_piece_journal_bytes(buf_T *buf)
   return ml_mmap_is_active(buf) ? buf->b_ml.ml_mmap_piece_journal_bytes : 0;
 }
 
+void ml_buf_mmap_piece_journal_stop(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (ml_mmap_is_active(buf)) {
+    ml_mmap_piece_journal_close(buf, true);
+  }
+}
+
 const char *ml_buf_mmap_piece_journal_path(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {

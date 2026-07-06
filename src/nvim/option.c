@@ -2762,6 +2762,7 @@ static const char *did_set_swapfile(optset_T *args)
   if (buf->b_p_swf && p_uc) {
     ml_open_file(buf);                     // create the swap file
   } else {
+    ml_buf_mmap_piece_journal_stop(buf);
     // no need to reset buf->b_may_swap, ml_open_file() will check buf->b_p_swf
     mf_close_file(buf, true);              // remove the swap file
   }
