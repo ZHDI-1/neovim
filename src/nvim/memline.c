@@ -1461,15 +1461,27 @@ static bool ml_mmap_piece_journal_reopen_after_replay(buf_T *buf, size_t consume
   buf->b_ml.ml_mmap_piece_journal_record_count = record_count;
   buf->b_ml.ml_mmap_piece_journal_bytes = (uint64_t)consumed;
   buf->b_ml.ml_mmap_piece_journal_dirty = false;
-  if (consumed != journal_len) {
-    buf->b_ml.ml_mmap_piece_journal_failed = true;
-    return false;
-  }
 
   const int fd = os_open(buf->b_ml.ml_mmap_piece_journal_fname, O_WRONLY | O_APPEND, 0);
   if (fd < 0) {
     buf->b_ml.ml_mmap_piece_journal_failed = true;
     return false;
+  }
+  if (consumed != journal_len) {
+    if (consumed > (size_t)INT64_MAX) {
+      close(fd);
+      buf->b_ml.ml_mmap_piece_journal_failed = true;
+      return false;
+    }
+
+    uv_fs_t req;
+    const int ret = uv_fs_ftruncate(NULL, &req, fd, (int64_t)consumed, NULL);
+    uv_fs_req_cleanup(&req);
+    if (ret != 0) {
+      close(fd);
+      buf->b_ml.ml_mmap_piece_journal_failed = true;
+      return false;
+    }
   }
 
   buf->b_ml.ml_mmap_piece_journal_fd = fd;

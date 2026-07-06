@@ -870,6 +870,71 @@ describe('fileio', function()
     eq(1, fn.getbufvar('%', '&modified'))
   end)
 
+  it('recovers committed mmap piece-journal records with a torn tail', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for mmap torn journal'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir// swapfile' } })
+    command('edit Xtest_mmap_readfile')
+    command("call setline(2, 'committed before torn tail')")
+
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(1, stats.mmap_piece_journal_record_count)
+    local journal_path = stats.mmap_piece_journal_path
+    local committed_bytes = stats.mmap_piece_journal_bytes
+
+    command("call setline(3, 'ignored torn tail')")
+    stats = api.nvim__buf_stats(0)
+    eq(2, stats.mmap_piece_journal_record_count)
+    ok(stats.mmap_piece_journal_bytes > committed_bytes)
+    local full_bytes = stats.mmap_piece_journal_bytes
+    eq(true, uv.fs_copyfile(journal_path, 'Xtest_mmap_saved_journal'))
+
+    local fd = assert(uv.fs_open('Xtest_mmap_saved_journal', 'r+', 384))
+    assert(uv.fs_ftruncate(fd, committed_bytes + 8))
+    assert(uv.fs_close(fd))
+    local torn_stat = assert(uv.fs_stat('Xtest_mmap_saved_journal'))
+    eq(committed_bytes + 8, torn_stat.size)
+    ok(torn_stat.size < full_bytes)
+
+    command('bwipe!')
+    eq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile('Xtest_mmap_saved_journal', journal_path))
+
+    command('edit Xtest_mmap_readfile')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(false, stats.mmap_piece_journal_active)
+    eq(true, stats.mmap_piece_journal_failed)
+
+    command('recover')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(false, stats.mmap_piece_journal_dirty)
+    eq(1, stats.mmap_piece_journal_record_count)
+    eq(committed_bytes, stats.mmap_piece_journal_bytes)
+    eq(committed_bytes, assert(uv.fs_stat(journal_path)).size)
+    eq('committed before torn tail', fn.getline(2))
+    eq(lines[3], fn.getline(3))
+    eq(1, fn.getbufvar('%', '&modified'))
+
+    command("call setline(4, 'post-recovery journal append')")
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(true, stats.mmap_piece_journal_dirty)
+    eq(2, stats.mmap_piece_journal_record_count)
+  end)
+
   it('refuses mmap piece-journal recovery when the original file changed', function()
     local lines = {}
     for i = 1, 40000 do
