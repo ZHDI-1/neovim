@@ -576,6 +576,31 @@ static bool ml_mmap_retired_piece_storage_try_dispose(ml_mmap_retired_piece_stor
   return true;
 }
 
+static void ml_mmap_retired_piece_storage_dispose_all(ml_mmap_retired_piece_storage_T *storage)
+  FUNC_ATTR_NONNULL_ALL
+{
+  size_t budget = SIZE_MAX;
+  const bool done = ml_mmap_retired_piece_storage_try_dispose(storage, &budget);
+  assert(done);
+  ml_mmap_retired_piece_storage_free(storage);
+}
+
+static void ml_mmap_retired_piece_storage_dispose_worker(void *arg)
+{
+  ml_mmap_retired_piece_storage_dispose_all(arg);
+}
+
+static bool ml_mmap_retired_piece_storage_start_dispose(ml_mmap_retired_piece_storage_T *storage)
+  FUNC_ATTR_NONNULL_ALL
+{
+  uv_thread_t thread;
+  if (uv_thread_create(&thread, ml_mmap_retired_piece_storage_dispose_worker, storage) != 0) {
+    return false;
+  }
+  uv_thread_detach(&thread);
+  return true;
+}
+
 static void ml_mmap_retire_piece_storage(PieceTree *tree, ml_mmap_storage_T *mmap_storage)
 {
   if (tree == NULL && mmap_storage == NULL) {
@@ -613,13 +638,25 @@ static bool ml_mmap_retired_piece_storage_reclaim(size_t *budgetp)
       has_more = true;
       break;
     }
-    if (!ml_mmap_retired_piece_storage_try_dispose(storage, budgetp)) {
+    if (piece_tree_storage_ref_count(storage->tree) != 0) {
       has_more = true;
       storagep = &storage->next;
       continue;
     }
 
     *storagep = storage->next;
+    storage->next = NULL;
+    (*budgetp)--;
+    if (ml_mmap_retired_piece_storage_start_dispose(storage)) {
+      continue;
+    }
+
+    if (!ml_mmap_retired_piece_storage_try_dispose(storage, budgetp)) {
+      storage->next = *storagep;
+      *storagep = storage;
+      has_more = true;
+      continue;
+    }
     ml_mmap_retired_piece_storage_free(storage);
   }
 
