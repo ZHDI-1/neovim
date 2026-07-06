@@ -1189,6 +1189,7 @@ static void ml_mmap_piece_journal_close(buf_T *buf, bool delete_file)
   buf->b_ml.ml_mmap_piece_journal_record_count = 0;
   buf->b_ml.ml_mmap_piece_journal_bytes = 0;
   buf->b_ml.ml_mmap_piece_journal_failed = false;
+  buf->b_ml.ml_mmap_piece_journal_dirty = false;
 }
 
 static void ml_mmap_piece_journal_fail(buf_T *buf)
@@ -1199,6 +1200,25 @@ static void ml_mmap_piece_journal_fail(buf_T *buf)
     buf->b_ml.ml_mmap_piece_journal_fd = -1;
   }
   buf->b_ml.ml_mmap_piece_journal_failed = true;
+  buf->b_ml.ml_mmap_piece_journal_dirty = false;
+}
+
+static int ml_mmap_piece_journal_sync(buf_T *buf, bool do_fsync)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (buf->b_ml.ml_mmap_piece_journal_fd < 0 || buf->b_ml.ml_mmap_piece_journal_failed) {
+    return NOTDONE;
+  }
+  if (!buf->b_ml.ml_mmap_piece_journal_dirty || !do_fsync) {
+    return OK;
+  }
+  if (os_fsync(buf->b_ml.ml_mmap_piece_journal_fd) != 0) {
+    ml_mmap_piece_journal_fail(buf);
+    return FAIL;
+  }
+
+  buf->b_ml.ml_mmap_piece_journal_dirty = false;
+  return OK;
 }
 
 static void ml_mmap_piece_journal_open(buf_T *buf)
@@ -1267,6 +1287,7 @@ static void ml_mmap_piece_journal_open(buf_T *buf)
   buf->b_ml.ml_mmap_piece_journal_record_count = 0;
   buf->b_ml.ml_mmap_piece_journal_bytes = (uint64_t)size;
   buf->b_ml.ml_mmap_piece_journal_failed = false;
+  buf->b_ml.ml_mmap_piece_journal_dirty = false;
 }
 
 static char *ml_mmap_piece_journal_read_file(const char *fname, size_t *lenp)
@@ -1439,6 +1460,7 @@ static bool ml_mmap_piece_journal_reopen_after_replay(buf_T *buf, size_t consume
 {
   buf->b_ml.ml_mmap_piece_journal_record_count = record_count;
   buf->b_ml.ml_mmap_piece_journal_bytes = (uint64_t)consumed;
+  buf->b_ml.ml_mmap_piece_journal_dirty = false;
   if (consumed != journal_len) {
     buf->b_ml.ml_mmap_piece_journal_failed = true;
     return false;
@@ -1558,6 +1580,7 @@ static void ml_mmap_piece_journal_append(buf_T *buf, PieceJournalOp op, size_t o
 
   buf->b_ml.ml_mmap_piece_journal_record_count++;
   buf->b_ml.ml_mmap_piece_journal_bytes += (uint64_t)size;
+  buf->b_ml.ml_mmap_piece_journal_dirty = true;
 }
 
 static void ml_mmap_piece_journal_append_replace(buf_T *buf, size_t offset, size_t delete_len,
@@ -2320,6 +2343,12 @@ bool ml_buf_mmap_piece_journal_failed(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
   return ml_mmap_is_active(buf) && buf->b_ml.ml_mmap_piece_journal_failed;
+}
+
+bool ml_buf_mmap_piece_journal_dirty(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) && buf->b_ml.ml_mmap_piece_journal_dirty;
 }
 
 uint64_t ml_buf_mmap_piece_journal_record_count(buf_T *buf)
@@ -3900,6 +3929,7 @@ int ml_open(buf_T *buf)
   buf->b_ml.ml_mmap_piece_journal_record_count = 0;
   buf->b_ml.ml_mmap_piece_journal_bytes = 0;
   buf->b_ml.ml_mmap_piece_journal_failed = false;
+  buf->b_ml.ml_mmap_piece_journal_dirty = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_mmap_piece_write_clone_range_count = 0;
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
@@ -4474,6 +4504,7 @@ void ml_recover(bool checkext)
   buf->b_ml.ml_mmap_piece_journal_record_count = 0;
   buf->b_ml.ml_mmap_piece_journal_bytes = 0;
   buf->b_ml.ml_mmap_piece_journal_failed = false;
+  buf->b_ml.ml_mmap_piece_journal_dirty = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_mmap_piece_write_clone_range_count = 0;
   buf->b_ml.ml_mmap_piece_write_copy_range_count = 0;
@@ -5399,6 +5430,11 @@ static int recov_file_names(char **names, char *path, bool prepend_dot)
 void ml_sync_all(int check_file, int check_char, bool do_fsync)
 {
   FOR_ALL_BUFFERS(buf) {
+    const int journal_status =
+      ml_mmap_piece_journal_sync(buf, do_fsync && bufIsChanged(buf));
+    if (journal_status != NOTDONE && check_char && os_char_avail()) {
+      break;
+    }
     if (buf->b_ml.ml_mfp == NULL || buf->b_ml.ml_mfp->mf_fname == NULL) {
       continue;                             // no file
     }
@@ -5439,6 +5475,18 @@ void ml_sync_all(int check_file, int check_char, bool do_fsync)
 /// @param message  if true, the success of preserving is reported.
 void ml_preserve(buf_T *buf, bool message, bool do_fsync)
 {
+  const int journal_status = ml_mmap_piece_journal_sync(buf, do_fsync);
+  if (journal_status != NOTDONE) {
+    if (message) {
+      if (journal_status == OK) {
+        msg(_("File preserved"), 0);
+      } else {
+        emsg(_("E314: Preserve failed"));
+      }
+    }
+    return;
+  }
+
   memfile_T *mfp = buf->b_ml.ml_mfp;
   int got_int_save = got_int;
 
