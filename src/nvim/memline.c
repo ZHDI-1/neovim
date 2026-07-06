@@ -2435,6 +2435,17 @@ bool ml_buf_mmap_piece_journal_recover(buf_T *buf)
   return true;
 }
 
+void ml_buf_mmap_piece_journal_reset(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL) {
+    return;
+  }
+
+  ml_mmap_piece_journal_close(buf, true);
+  ml_mmap_piece_journal_open(buf);
+}
+
 uint64_t ml_buf_mmap_piece_revision(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {

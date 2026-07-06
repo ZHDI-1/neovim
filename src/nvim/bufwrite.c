@@ -2115,6 +2115,9 @@ write_loop_done:
       buf->b_flags &= ~BF_WRITE_MASK;
     }
   }
+  if (reset_changed && whole && !append && overwriting && !write_info.bw_conv_error) {
+    ml_buf_mmap_piece_journal_reset(buf);
+  }
 
   // If we kept a backup until now, and we are in patch mode, then we make
   // the backup file our 'original' file.
