@@ -1528,6 +1528,51 @@ describe('fileio', function()
     eq(1, fn.getbufvar('%', '&modified'))
   end)
 
+  it('recovers mmap line copy edits from a piece journal', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for mmap copy recovery'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir// swapfile' } })
+    command('edit Xtest_mmap_readfile')
+    command('10,12copy 20')
+
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    ok(stats.mmap_piece_journal_record_count >= 1)
+    eq(40003, fn.line('$'))
+    eq(lines[10], fn.getline(21))
+    eq(lines[11], fn.getline(22))
+    eq(lines[12], fn.getline(23))
+    local journal_path = stats.mmap_piece_journal_path
+    neq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile(journal_path, 'Xtest_mmap_saved_journal'))
+
+    command('bwipe!')
+    eq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile('Xtest_mmap_saved_journal', journal_path))
+
+    command('enew')
+    command('recover! ' .. fn.fnameescape(journal_path))
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(40003, fn.line('$'))
+    eq(lines[10], fn.getline(21))
+    eq(lines[11], fn.getline(22))
+    eq(lines[12], fn.getline(23))
+    eq(lines[21], fn.getline(24))
+    eq(1, fn.getbufvar('%', '&modified'))
+  end)
+
   it('recovers committed mmap piece-journal records with a torn tail', function()
     local lines = {}
     for i = 1, 40000 do
