@@ -89,6 +89,8 @@ typedef struct {
   size_t *ml_mmap_line_starts;  // byte offsets for sparse line-index blocks
   size_t ml_mmap_index_count;   // number of sparse line-index blocks
   ml_mmap_storage_T *ml_mmap_storage;  // shared owner for mmap/index storage
+  char *ml_mmap_line_buf;       // reusable NUL-terminated mmap line scratch
+  size_t ml_mmap_line_buf_cap;  // bytes allocated for ml_mmap_line_buf
   bool ml_mmap_noeol;           // last line has no final EOL
   bool ml_mmap_source_is_buffer_file;  // mmap source still aliases buffer file
   PieceTree *ml_piece_tree;     // tree index/composition for mmap-backed text

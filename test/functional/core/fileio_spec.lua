@@ -707,6 +707,46 @@ describe('fileio', function()
     eq(literal_count + 1, stats.mmap_substitute_literal_count)
   end)
 
+  it('keeps mmap piece tree active for complex regex substitute', function()
+    local lines = {}
+    for i = 1, 42000 do
+      lines[i] = ('complex regex row %05d plain ascii'):format(i)
+    end
+    lines[31000] = 'complex-sub αβ 12345 left right'
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    local literal_count = stats.mmap_substitute_literal_count
+    local line_buf_cap = stats.mmap_line_buf_cap
+
+    command('set regexpengine=1')
+    command([[%s/\v(complex-sub) (αβ) ([0-9]+) (left) (right)/\1 \3 \5 \4 \2/]])
+    command('set regexpengine&')
+    lines[31000] = 'complex-sub 12345 right left αβ'
+    eq(lines[31000], fn.getline(31000))
+
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    ok(stats.mmap_piece_revision > 0)
+    eq(literal_count, stats.mmap_substitute_literal_count)
+    ok(stats.mmap_line_buf_cap >= line_buf_cap)
+    ok(stats.mmap_line_buf_cap >= #lines[31000] + 1)
+
+    local write_stats = stats
+    command('write Xtest_mmap_written')
+    stats = api.nvim__buf_stats(0)
+    eq(write_stats.mmap_piece_write_fast_count + 1, stats.mmap_piece_write_fast_count)
+    neq(nil, read_file('Xtest_mmap_written'):find(lines[31000], 1, true))
+  end)
+
   it('skips nonmatching mmap lines for sparse literal substitute', function()
     local lines = {}
     local payload = string.rep('x', 900)

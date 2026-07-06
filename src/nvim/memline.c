@@ -1086,12 +1086,48 @@ static void ml_mmap_clear_cache(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
   if (buf->b_ml.ml_line_lnum != 0
-      && (buf->b_ml.ml_flags & (ML_LINE_DIRTY | ML_ALLOCATED))) {
+      && (buf->b_ml.ml_flags & (ML_LINE_DIRTY | ML_ALLOCATED))
+      && buf->b_ml.ml_line_ptr != buf->b_ml.ml_mmap_line_buf) {
     xfree(buf->b_ml.ml_line_ptr);
   }
   buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
   buf->b_ml.ml_line_lnum = 0;
   buf->b_ml.ml_line_offset = 0;
+}
+
+static void ml_mmap_free_line_buf(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (buf->b_ml.ml_line_ptr == buf->b_ml.ml_mmap_line_buf) {
+    buf->b_ml.ml_line_ptr = NULL;
+  }
+  XFREE_CLEAR(buf->b_ml.ml_mmap_line_buf);
+  buf->b_ml.ml_mmap_line_buf_cap = 0;
+}
+
+static char *ml_mmap_ensure_line_buf(buf_T *buf, size_t len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (len > (size_t)MAXCOL - 1 || len == SIZE_MAX) {
+    return NULL;
+  }
+
+  const size_t needed = len + 1;
+  if (buf->b_ml.ml_mmap_line_buf_cap < needed) {
+    size_t new_cap = buf->b_ml.ml_mmap_line_buf_cap == 0
+                     ? 256
+                     : buf->b_ml.ml_mmap_line_buf_cap;
+    while (new_cap < needed) {
+      if (new_cap > SIZE_MAX / 2) {
+        new_cap = needed;
+        break;
+      }
+      new_cap *= 2;
+    }
+    buf->b_ml.ml_mmap_line_buf = xrealloc(buf->b_ml.ml_mmap_line_buf, new_cap);
+    buf->b_ml.ml_mmap_line_buf_cap = new_cap;
+  }
+  return buf->b_ml.ml_mmap_line_buf;
 }
 
 static void ml_mmap_disable_legacy_swap(buf_T *buf)
@@ -1627,6 +1663,7 @@ static void ml_mmap_close(buf_T *buf)
 {
   ml_mmap_piece_journal_close(buf, true);
   ml_mmap_clear_piece_tree(buf);
+  ml_mmap_free_line_buf(buf);
   buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_mmap_source_is_buffer_file = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
@@ -1768,6 +1805,7 @@ static int ml_mmap_materialize(buf_T *buf)
   buf->b_ml.ml_mmap_substitute_literal_count = 0;
   buf->b_ml.ml_mmap_substitute_literal_line_count = 0;
   buf->b_ml.ml_piece_tree = NULL;
+  ml_mmap_free_line_buf(buf);
 
   XFREE_CLEAR(buf->b_ml.ml_chunksize);
   buf->b_ml.ml_numchunks = 0;
@@ -2066,7 +2104,9 @@ static bool ml_mmap_flush_dirty_line(buf_T *buf, bool noalloc)
   ml_mmap_update_noeol(buf);
   ml_mmap_piece_journal_append_replace(buf, start, end - start, line, len);
   if (!noalloc) {
-    xfree(line);
+    if (line != buf->b_ml.ml_mmap_line_buf) {
+      xfree(line);
+    }
   }
   buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
   buf->b_ml.ml_line_lnum = 0;
@@ -2394,6 +2434,12 @@ uint64_t ml_buf_mmap_substitute_literal_line_count(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
   return ml_mmap_is_active(buf) ? buf->b_ml.ml_mmap_substitute_literal_line_count : 0;
+}
+
+size_t ml_buf_mmap_line_buf_cap(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) ? buf->b_ml.ml_mmap_line_buf_cap : 0;
 }
 
 bool ml_buf_mmap_piece_journal_active(buf_T *buf)
@@ -4057,6 +4103,8 @@ int ml_open(buf_T *buf)
   buf->b_ml.ml_mmap_line_starts = NULL;
   buf->b_ml.ml_mmap_index_count = 0;
   buf->b_ml.ml_mmap_storage = NULL;
+  buf->b_ml.ml_mmap_line_buf = NULL;
+  buf->b_ml.ml_mmap_line_buf_cap = 0;
   buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_mmap_source_is_buffer_file = false;
   buf->b_ml.ml_mmap_piece_journal_fname = NULL;
@@ -4636,6 +4684,8 @@ void ml_recover(bool checkext)
   buf->b_ml.ml_mmap_line_starts = NULL;
   buf->b_ml.ml_mmap_index_count = 0;
   buf->b_ml.ml_mmap_storage = NULL;
+  buf->b_ml.ml_mmap_line_buf = NULL;
+  buf->b_ml.ml_mmap_line_buf_cap = 0;
   buf->b_ml.ml_mmap_noeol = false;
   buf->b_ml.ml_mmap_source_is_buffer_file = false;
   buf->b_ml.ml_mmap_piece_journal_fname = NULL;
@@ -5834,7 +5884,23 @@ errorret:
       size_t end;
       ml_mmap_line_bounds(buf, lnum, &start, &end);
       const size_t len = end - start;
-      if (buf->b_ml.ml_piece_tree != NULL) {
+      if (!will_change) {
+        char *line_buf = ml_mmap_ensure_line_buf(buf, len);
+        if (line_buf == NULL) {
+          goto errorret;
+        }
+        if (buf->b_ml.ml_piece_tree != NULL) {
+          size_t copied = piece_tree_read(buf->b_ml.ml_piece_tree, start, line_buf, len);
+          if (copied != len) {
+            goto errorret;
+          }
+        } else {
+          memmove(line_buf, buf->b_ml.ml_mmap_base + start, len);
+        }
+        line_buf[len] = NUL;
+        buf->b_ml.ml_line_ptr = line_buf;
+        buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
+      } else if (buf->b_ml.ml_piece_tree != NULL) {
         buf->b_ml.ml_line_ptr = xmallocz(len);
         size_t copied = piece_tree_read(buf->b_ml.ml_piece_tree, start, buf->b_ml.ml_line_ptr, len);
         if (copied != len) {
@@ -5846,9 +5912,16 @@ errorret:
       }
       buf->b_ml.ml_line_textlen = (colnr_T)(len + 1);
       buf->b_ml.ml_line_lnum = lnum;
-      buf->b_ml.ml_flags = (buf->b_ml.ml_flags & ~ML_LINE_DIRTY) | ML_ALLOCATED;
+      if (will_change) {
+        buf->b_ml.ml_flags = (buf->b_ml.ml_flags & ~ML_LINE_DIRTY) | ML_ALLOCATED;
+      }
     }
     if (will_change) {
+      if (!(buf->b_ml.ml_flags & ML_ALLOCATED)) {
+        buf->b_ml.ml_line_ptr = xmemdup(buf->b_ml.ml_line_ptr,
+                                        (size_t)buf->b_ml.ml_line_textlen);
+        buf->b_ml.ml_flags |= ML_ALLOCATED;
+      }
       buf->b_ml.ml_flags = (buf->b_ml.ml_flags | ML_LINE_DIRTY | ML_ALLOCATED) & ~ML_EMPTY;
       ml_add_deleted_len_buf(buf, buf->b_ml.ml_line_ptr, -1);
     }
@@ -7311,7 +7384,9 @@ static void ml_flush_line(buf_T *buf, bool noalloc)
     }
     if (buf->b_ml.ml_flags & ML_ALLOCATED) {
       assert(!noalloc);
-      xfree(buf->b_ml.ml_line_ptr);
+      if (buf->b_ml.ml_line_ptr != buf->b_ml.ml_mmap_line_buf) {
+        xfree(buf->b_ml.ml_line_ptr);
+      }
     }
     buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
     buf->b_ml.ml_line_lnum = 0;
