@@ -55,7 +55,7 @@ enum {
 #include "piece_tree.c.generated.h"
 
 static size_t pt_reader_count_load(const PieceTree *tree);
-static void pt_reclaim_retired_nodes(PieceTree *tree);
+static size_t pt_reclaim_retired_nodes(PieceTree *tree, size_t budget);
 
 static size_t pt_count_lfs(const char *data, size_t len)
 {
@@ -283,9 +283,11 @@ static void pt_add_node_block(PieceTree *tree)
 
 static PieceTreeNode *pt_alloc_node(PieceTree *tree)
 {
+  enum { kReclaimBudget = 64 };
+
   if (tree->free_nodes == NULL && tree->retired_nodes != NULL
       && pt_reader_count_load(tree) == 0) {
-    pt_reclaim_retired_nodes(tree);
+    (void)pt_reclaim_retired_nodes(tree, kReclaimBudget);
   }
 
   if (tree->free_nodes != NULL) {
@@ -344,15 +346,18 @@ static void pt_recycle_node(PieceTree *tree, PieceTreeNode *node)
   tree->free_nodes = node;
 }
 
-static void pt_reclaim_retired_nodes(PieceTree *tree)
+static size_t pt_reclaim_retired_nodes(PieceTree *tree, size_t budget)
 {
-  while (tree->retired_nodes != NULL) {
+  size_t reclaimed = 0;
+  while (tree->retired_nodes != NULL && reclaimed < budget) {
     PieceTreeNode *node = tree->retired_nodes;
     tree->retired_nodes = node->next_free;
     assert(tree->retired_node_count > 0);
     tree->retired_node_count--;
     pt_recycle_node(tree, node);
+    reclaimed++;
   }
+  return reclaimed;
 }
 
 static void pt_retire_node(PieceTree *tree, PieceTreeNode *node)
@@ -1033,8 +1038,19 @@ bool piece_tree_reclaim_retired(PieceTree *tree)
     return false;
   }
 
-  pt_reclaim_retired_nodes(tree);
+  while (tree->retired_nodes != NULL) {
+    (void)pt_reclaim_retired_nodes(tree, SIZE_MAX);
+  }
   return true;
+}
+
+size_t piece_tree_reclaim_retired_budget(PieceTree *tree, size_t budget)
+{
+  if (tree == NULL || budget == 0 || pt_reader_count_load(tree) != 0) {
+    return 0;
+  }
+
+  return pt_reclaim_retired_nodes(tree, budget);
 }
 
 static bool pt_byte_at(const PieceTree *tree, size_t offset, char *chp)

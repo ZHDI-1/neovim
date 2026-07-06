@@ -424,11 +424,16 @@ describe('piece tree', function()
 
     lib.piece_tree_reader_enter(w.tree)
     eq(false, lib.piece_tree_reclaim_retired(w.tree))
+    eq(0, tonumber(lib.piece_tree_reclaim_retired_budget(w.tree, 1)))
     eq(retired_count, tonumber(lib.piece_tree_retired_node_count(w.tree)))
     ok(w.tree[0].retired_nodes ~= null)
     ok(w.tree[0].free_nodes == null)
 
     lib.piece_tree_reader_leave(w.tree)
+    eq(1, tonumber(lib.piece_tree_reclaim_retired_budget(w.tree, 1)))
+    eq(retired_count - 1, tonumber(lib.piece_tree_retired_node_count(w.tree)))
+    eq(1, tonumber(lib.piece_tree_free_node_count(w.tree)))
+
     ok(lib.piece_tree_reclaim_retired(w.tree))
     eq(0, tonumber(lib.piece_tree_retired_node_count(w.tree)))
     ok(w.tree[0].retired_nodes == null)
