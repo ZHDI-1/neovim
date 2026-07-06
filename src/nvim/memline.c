@@ -4160,6 +4160,7 @@ void ml_open_file(buf_T *buf)
   }
   if (ml_mmap_is_active(buf) && buf->b_ml.ml_piece_tree != NULL) {
     ml_mmap_disable_legacy_swap(buf);
+    ml_mmap_piece_journal_open(buf);
     return;
   }
   if (ml_mmap_materialize(buf) == FAIL) {

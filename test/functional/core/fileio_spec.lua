@@ -801,6 +801,53 @@ describe('fileio', function()
     eq(nil, uv.fs_stat(journal_path))
   end)
 
+  it('opens mmap piece journal when updatecount is enabled later', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for delayed mmap swap'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({
+      args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir// swapfile updatecount=0' },
+    })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(false, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq('', fn.swapname('%'))
+
+    command('set updatecount=100')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(false, stats.mmap_piece_journal_dirty)
+    eq(0, stats.mmap_piece_journal_record_count)
+    eq('', fn.swapname('%'))
+    local journal_path = stats.mmap_piece_journal_path
+    neq('', journal_path)
+    neq(nil, uv.fs_stat(journal_path))
+
+    command("call setline(2, 'delayed swap journal edit')")
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(true, stats.mmap_piece_journal_dirty)
+    eq(1, stats.mmap_piece_journal_record_count)
+    eq(journal_path, stats.mmap_piece_journal_path)
+    eq('delayed swap journal edit', fn.getline(2))
+
+    command('bwipe!')
+    eq(nil, uv.fs_stat(journal_path))
+  end)
+
   it('recovers mmap piece-tree edits from a piece journal', function()
     local lines = {}
     for i = 1, 40000 do
