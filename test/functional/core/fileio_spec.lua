@@ -859,6 +859,58 @@ describe('fileio', function()
     ok(stats.mmap_piece_revision >= 6)
   end)
 
+  it('keeps mmap piece tree active for line copy commands', function()
+    local lines = {}
+    for i = 1, 42000 do
+      lines[i] = ('copy mmap row %05d plain ascii'):format(i)
+    end
+
+    local function range_size(first, last)
+      local size = 0
+      for i = first, last do
+        size = size + #lines[i] + 1
+      end
+      return size
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    local text_size = #table.concat(lines, '\n') + 1
+    eq(text_size, stats.mmap_text_size)
+
+    command('10,20copy 30000')
+    text_size = text_size + range_size(10, 20)
+    eq(42011, fn.line('$'))
+    for i = 0, 10 do
+      eq(lines[10 + i], fn.getline(30001 + i))
+    end
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    ok(stats.mmap_piece_revision > 0)
+    ok(stats.mmap_piece_add_len > 0)
+    eq(text_size, stats.mmap_text_size)
+
+    command('10,20copy 15')
+    text_size = text_size + range_size(10, 20)
+    eq(42022, fn.line('$'))
+    for i = 0, 10 do
+      eq(lines[10 + i], fn.getline(16 + i))
+    end
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(0, stats.virt_blocks)
+    eq(text_size, stats.mmap_text_size)
+  end)
+
   it('keeps mmap piece tree active for same-file copy-backup writes', function()
     local lines = {}
     for i = 1, 40000 do

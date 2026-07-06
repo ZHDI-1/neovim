@@ -1063,6 +1063,21 @@ void ex_copy(linenr_T line1, linenr_T line2, linenr_T n)
     return;
   }
 
+  const int mmap_copy_ret = ml_buf_mmap_copy_lines(curbuf, line1, line2, n);
+  if (mmap_copy_ret == OK) {
+    curwin->w_cursor.lnum = n + count;
+    appended_lines_mark(n, count);
+    if (VIsual_active) {
+      check_pos(curbuf, &VIsual);
+    }
+
+    msgmore(count);
+    return;
+  }
+  if (mmap_copy_ret == FAIL) {
+    return;
+  }
+
   curwin->w_cursor.lnum = n;
   while (line1 <= line2) {
     // need to make a copy because the line will be unlocked within ml_append()

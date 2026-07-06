@@ -197,6 +197,7 @@ enum {
 enum {
   MLCS_MAXL = 800,  // max no of lines in chunk
   MLCS_MINL = 400,  // should be half of MLCS_MAXL
+  ML_MMAP_COPY_CHUNK_SIZE = 1024 * 1024,
 };
 
 static buf_T *ml_upd_lastbuf = NULL;
@@ -2226,6 +2227,126 @@ bool ml_buf_has_mmap_piece_tree(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
   return ml_mmap_is_active(buf) && buf->b_ml.ml_piece_tree != NULL;
+}
+
+int ml_buf_mmap_copy_lines(buf_T *buf, linenr_T line1, linenr_T line2, linenr_T dest)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (!ml_buf_flush_mmap_piece_tree(buf)) {
+    return NOTDONE;
+  }
+
+  PieceTree *tree = buf->b_ml.ml_piece_tree;
+  const linenr_T line_count = buf->b_ml.ml_line_count;
+  if (line1 < 1 || line2 < line1 || line2 > line_count || dest < 0 || dest > line_count) {
+    return NOTDONE;
+  }
+
+  const linenr_T count = line2 - line1 + 1;
+  if (count > MAXLNUM - line_count) {
+    return FAIL;
+  }
+
+  PieceTreeSnapshot snapshot = { 0 };
+  if (!piece_tree_snapshot(tree, &snapshot) || snapshot.line_count != (size_t)line_count) {
+    return NOTDONE;
+  }
+
+  size_t source_start = 0;
+  size_t source_end = 0;
+  size_t insert_offset = 0;
+  if (!piece_tree_line_start_at_revision(tree, (size_t)line1, snapshot.revision, &source_start)) {
+    return FAIL;
+  }
+  if (line2 < line_count) {
+    if (!piece_tree_line_start_at_revision(tree, (size_t)line2 + 1, snapshot.revision,
+                                           &source_end)) {
+      return FAIL;
+    }
+  } else {
+    source_end = snapshot.byte_len;
+  }
+  if (dest == 0) {
+    insert_offset = 0;
+  } else if (dest < line_count) {
+    if (!piece_tree_line_start_at_revision(tree, (size_t)dest + 1, snapshot.revision,
+                                           &insert_offset)) {
+      return FAIL;
+    }
+  } else {
+    insert_offset = snapshot.byte_len;
+    if (snapshot.byte_len > 0) {
+      char last = NUL;
+      if (!piece_tree_byte_at(tree, snapshot.byte_len - 1, &last)) {
+        return FAIL;
+      }
+      if (last != NL) {
+        return NOTDONE;
+      }
+    }
+  }
+
+  if (source_end <= source_start) {
+    return NOTDONE;
+  }
+  char source_last = NUL;
+  if (!piece_tree_byte_at(tree, source_end - 1, &source_last)) {
+    return FAIL;
+  }
+  if (source_last != NL) {
+    return NOTDONE;
+  }
+
+  PieceTreeSpanVec spans = { 0 };
+  if (!piece_tree_collect_span_vec_at_revision(tree, source_start, source_end - source_start,
+                                               snapshot.revision, &spans)) {
+    return FAIL;
+  }
+
+  char *chunk = xmalloc(ML_MMAP_COPY_CHUNK_SIZE);
+  bool ok = true;
+  size_t copied = 0;
+  while (copied < spans.byte_len) {
+    const size_t todo = MIN(ML_MMAP_COPY_CHUNK_SIZE, spans.byte_len - copied);
+    if (piece_tree_span_vec_read(&spans, source_start + copied, chunk, todo) != todo
+        || !piece_tree_insert(tree, insert_offset + copied, chunk, todo)) {
+      ok = false;
+      break;
+    }
+
+    if (buf->b_prev_line_count == 0) {
+      buf->b_prev_line_count = buf->b_ml.ml_line_count;
+    }
+    const size_t new_line_count = piece_tree_line_count(tree);
+    if (new_line_count > (size_t)MAXLNUM) {
+      ok = false;
+      break;
+    }
+    buf->b_ml.ml_line_count = (linenr_T)new_line_count;
+    ml_mmap_update_noeol(buf);
+    ml_mmap_piece_journal_append(buf, kPieceJournalOpInsert, insert_offset + copied, 0, chunk,
+                                 todo);
+    copied += todo;
+  }
+  xfree(chunk);
+  piece_tree_span_vec_clear(&spans);
+
+  if (!ok) {
+    ml_mmap_clear_cache(buf);
+    return FAIL;
+  }
+
+  if (ml_mmap_marked_has(buf)) {
+    for (linenr_T i = 0; i < count; i++) {
+      ml_mmap_marked_insert(buf, dest + i);
+    }
+  }
+  ml_mmap_update_noeol(buf);
+  ml_mmap_clear_cache(buf);
+  ml_mmap_maybe_schedule_piece_reclaim(buf);
+  buf->b_ml.ml_flags &= ~ML_EMPTY;
+  ml_upd_lastbuf = NULL;
+  return OK;
 }
 
 bool ml_buf_flush_mmap_piece_tree(buf_T *buf)
