@@ -1121,15 +1121,56 @@ static void ml_mmap_maybe_schedule_piece_reclaim(buf_T *buf)
 static void ml_mmap_update_noeol(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
-  const size_t len = ml_mmap_text_size(buf);
-  if (len == 0 || buf->b_ml.ml_piece_tree == NULL) {
+  PieceTreeSnapshot snapshot = { 0 };
+  if (buf->b_ml.ml_piece_tree == NULL
+      || !piece_tree_snapshot(buf->b_ml.ml_piece_tree, &snapshot)
+      || snapshot.byte_len == 0) {
     buf->b_ml.ml_mmap_noeol = false;
     return;
   }
 
   char last = NUL;
   buf->b_ml.ml_mmap_noeol =
-    piece_tree_byte_at(buf->b_ml.ml_piece_tree, len - 1, &last) && last != NL;
+    piece_tree_byte_at(buf->b_ml.ml_piece_tree, snapshot.byte_len - 1, &last)
+    && (last != NL
+        || (snapshot.line_count + 1 == (size_t)buf->b_ml.ml_line_count));
+}
+
+static bool ml_mmap_has_virtual_noeol_tail(const buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL
+      || !buf->b_ml.ml_mmap_noeol || buf->b_ml.ml_line_count < 2) {
+    return false;
+  }
+
+  PieceTreeSnapshot snapshot = { 0 };
+  return piece_tree_snapshot(buf->b_ml.ml_piece_tree, &snapshot)
+         && snapshot.byte_len > 0
+         && snapshot.line_count + 1 == (size_t)buf->b_ml.ml_line_count;
+}
+
+static bool ml_mmap_piece_logical_line_count(PieceTree *tree, bool noeol, size_t *line_countp)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  PieceTreeSnapshot snapshot = { 0 };
+  if (!piece_tree_snapshot(tree, &snapshot)) {
+    return false;
+  }
+
+  *line_countp = snapshot.line_count;
+  if (!noeol || snapshot.byte_len == 0) {
+    return true;
+  }
+
+  char last = NUL;
+  if (!piece_tree_byte_at(tree, snapshot.byte_len - 1, &last)) {
+    return false;
+  }
+  if (last == NL) {
+    (*line_countp)++;
+  }
+  return true;
 }
 
 static void ml_mmap_clear_cache(buf_T *buf)
@@ -1481,9 +1522,15 @@ static bool ml_mmap_piece_journal_apply_record(PieceTree *tree,
     return false;
   }
 
+  size_t line_count = 0;
   return tree->revision == record->revision
          && piece_tree_byte_len(tree) == (size_t)record->text_size_after
-         && piece_tree_line_count(tree) == (size_t)record->line_count_after;
+         && record->line_count_after <= SIZE_MAX
+         && ml_mmap_piece_logical_line_count(tree,
+                                             (record->flags_after
+                                              & PIECE_JOURNAL_FLAG_NOEOL) != 0,
+                                             &line_count)
+         && line_count == (size_t)record->line_count_after;
 }
 
 static bool ml_mmap_piece_journal_replay(buf_T *buf, const char *data, size_t len,
@@ -1813,9 +1860,15 @@ static size_t ml_mmap_line_start_offset(const buf_T *buf, linenr_T lnum)
 static void ml_mmap_line_bounds(const buf_T *buf, linenr_T lnum, size_t *startp, size_t *endp)
   FUNC_ATTR_NONNULL_ALL
 {
-  if (buf->b_ml.ml_piece_tree != NULL
-      && piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)lnum, startp, endp)) {
-    return;
+  if (buf->b_ml.ml_piece_tree != NULL) {
+    if (ml_mmap_has_virtual_noeol_tail(buf) && lnum == buf->b_ml.ml_line_count) {
+      *startp = ml_mmap_text_size(buf);
+      *endp = *startp;
+      return;
+    }
+    if (piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)lnum, startp, endp)) {
+      return;
+    }
   }
 
   const size_t start = ml_mmap_line_start_offset(buf, lnum);
@@ -1886,8 +1939,10 @@ static int ml_mmap_materialize(buf_T *buf)
   ml_mmap_storage_T *mmap_storage = buf->b_ml.ml_mmap_storage;
   char *base = buf->b_ml.ml_mmap_base;
   const size_t size = buf->b_ml.ml_mmap_size;
+  const size_t text_size = ml_mmap_text_size(buf);
   PieceTree *piece_tree = buf->b_ml.ml_piece_tree;
   const linenr_T line_count = buf->b_ml.ml_line_count;
+  const bool had_virtual_noeol_tail = ml_mmap_has_virtual_noeol_tail(buf);
 
   ml_mmap_marked_clear(buf);
   ml_mmap_clear_cache(buf);
@@ -1925,7 +1980,10 @@ static int ml_mmap_materialize(buf_T *buf)
     if (piece_tree != NULL) {
       size_t start = 0;
       size_t end = 0;
-      if (!piece_tree_line_bounds(piece_tree, (size_t)lnum, &start, &end)) {
+      if (had_virtual_noeol_tail && lnum == line_count) {
+        start = text_size;
+        end = text_size;
+      } else if (!piece_tree_line_bounds(piece_tree, (size_t)lnum, &start, &end)) {
         ret = FAIL;
         break;
       }
@@ -1978,7 +2036,14 @@ static int ml_mmap_replace_line(buf_T *buf, linenr_T lnum, char *line, size_t le
 
   size_t start = 0;
   size_t end = 0;
-  if (!piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)lnum, &start, &end)
+  const bool replace_virtual_tail = ml_mmap_has_virtual_noeol_tail(buf)
+                                    && lnum == buf->b_ml.ml_line_count;
+  if (replace_virtual_tail) {
+    start = ml_mmap_text_size(buf);
+    end = start;
+  }
+  if ((!replace_virtual_tail
+       && !piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)lnum, &start, &end))
       || !piece_tree_replace(buf->b_ml.ml_piece_tree, start, end - start, line, len)) {
     ml_mmap_clear_cache(buf);
     return FAIL;
@@ -2032,9 +2097,6 @@ static int ml_mmap_append_line(buf_T *buf, linenr_T lnum, char *line, colnr_T le
       char last = NUL;
       if (!piece_tree_byte_at(buf->b_ml.ml_piece_tree, total - 1, &last)) {
         return FAIL;
-      }
-      if (text_len == 0 && last != NL) {
-        return NOTDONE;
       }
       add_leading_nl = last != NL;
       add_trailing_nl = last == NL;
@@ -2124,15 +2186,28 @@ static int ml_mmap_delete_line(buf_T *buf, linenr_T lnum, bool message)
   size_t delete_len = 0;
   const linenr_T line_count = buf->b_ml.ml_line_count;
   const size_t total = ml_mmap_text_size(buf);
+  const bool delete_virtual_tail = ml_mmap_has_virtual_noeol_tail(buf) && lnum == line_count;
 
-  if (!piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)lnum, &start, &end)) {
+  if (delete_virtual_tail) {
+    start = total;
+    end = total;
+  } else if (!piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)lnum, &start, &end)) {
     ml_mmap_clear_cache(buf);
     return FAIL;
   }
 
-  if (lnum < line_count) {
+  if (delete_virtual_tail) {
+    if (total == 0) {
+      ml_mmap_clear_cache(buf);
+      return FAIL;
+    }
+    delete_start = total - 1;
+    delete_len = 1;
+  } else if (lnum < line_count) {
     size_t next_start = 0;
-    if (!piece_tree_line_start(buf->b_ml.ml_piece_tree, (size_t)lnum + 1, &next_start)) {
+    if (ml_mmap_has_virtual_noeol_tail(buf) && lnum + 1 == line_count) {
+      next_start = total;
+    } else if (!piece_tree_line_start(buf->b_ml.ml_piece_tree, (size_t)lnum + 1, &next_start)) {
       ml_mmap_clear_cache(buf);
       return FAIL;
     }
@@ -2195,8 +2270,15 @@ static bool ml_mmap_flush_dirty_line(buf_T *buf, bool noalloc)
 
   size_t start = 0;
   size_t end = 0;
-  if (!piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)buf->b_ml.ml_line_lnum, &start,
-                              &end)
+  const bool replace_virtual_tail = ml_mmap_has_virtual_noeol_tail(buf)
+                                    && buf->b_ml.ml_line_lnum == buf->b_ml.ml_line_count;
+  if (replace_virtual_tail) {
+    start = ml_mmap_text_size(buf);
+    end = start;
+  }
+  if ((!replace_virtual_tail
+       && !piece_tree_line_bounds(buf->b_ml.ml_piece_tree, (size_t)buf->b_ml.ml_line_lnum,
+                                  &start, &end))
       || !piece_tree_replace(buf->b_ml.ml_piece_tree, start, end - start, line, len)) {
     return false;
   }
@@ -2470,7 +2552,12 @@ int ml_buf_mmap_delete_lines(buf_T *buf, linenr_T lnum, linenr_T count, bool mes
   }
 
   PieceTreeSnapshot snapshot = { 0 };
-  if (!piece_tree_snapshot(tree, &snapshot) || snapshot.line_count != (size_t)line_count) {
+  if (!piece_tree_snapshot(tree, &snapshot)) {
+    return NOTDONE;
+  }
+  const bool virtual_tail = ml_mmap_has_virtual_noeol_tail(buf);
+  const size_t logical_line_count = snapshot.line_count + (virtual_tail ? 1 : 0);
+  if (logical_line_count != (size_t)line_count) {
     return NOTDONE;
   }
 
@@ -2491,12 +2578,23 @@ int ml_buf_mmap_delete_lines(buf_T *buf, linenr_T lnum, linenr_T count, bool mes
     delete_start = 0;
     delete_len = total;
     add_deleted_final_nl = total > 0 && !last_has_nl;
+  } else if (virtual_tail && lnum == line_count) {
+    if (total == 0) {
+      return FAIL;
+    }
+    delete_start = total - 1;
+    delete_len = 1;
   } else if (!delete_to_eof) {
     size_t start = 0;
     size_t end = 0;
-    if (!piece_tree_line_start_at_revision(tree, (size_t)lnum, snapshot.revision, &start)
-        || !piece_tree_line_start_at_revision(tree, (size_t)(lnum + delete_count),
-                                              snapshot.revision, &end)) {
+    const linenr_T end_lnum = lnum + delete_count;
+    if (!piece_tree_line_start_at_revision(tree, (size_t)lnum, snapshot.revision, &start)) {
+      return FAIL;
+    }
+    if (virtual_tail && end_lnum == line_count) {
+      end = total;
+    } else if (!piece_tree_line_start_at_revision(tree, (size_t)end_lnum, snapshot.revision,
+                                                  &end)) {
       return FAIL;
     }
     delete_start = start;

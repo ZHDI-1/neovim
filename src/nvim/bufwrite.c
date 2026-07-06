@@ -472,6 +472,20 @@ static void buf_write_mmap_piece_hash_span_vec(const PieceTreeSpanVec *span_vec,
   }
 }
 
+static size_t buf_write_mmap_piece_logical_line_count(buf_T *buf,
+                                                      const PieceTreeSnapshot *snapshot)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  size_t line_count = snapshot->line_count;
+  if (buf->b_ml.ml_mmap_noeol && snapshot->byte_len > 0) {
+    char last = NUL;
+    if (piece_tree_byte_at(buf->b_ml.ml_piece_tree, snapshot->byte_len - 1, &last) && last == NL) {
+      line_count++;
+    }
+  }
+  return line_count;
+}
+
 static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, const char *copy_source,
                                     linenr_T start, linenr_T end, bool write_final_eol,
                                     context_sha256_T *sha_ctx, bool *no_eolp, off_T *ncharsp)
@@ -487,19 +501,25 @@ static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, const char *
 
   PieceTree *tree = buf->b_ml.ml_piece_tree;
   PieceTreeSnapshot snapshot = { 0 };
-  if (!piece_tree_snapshot(tree, &snapshot)
-      || snapshot.line_count != (size_t)buf->b_ml.ml_line_count
-      || (size_t)end > snapshot.line_count) {
+  if (!piece_tree_snapshot(tree, &snapshot)) {
+    return NOTDONE;
+  }
+  const size_t logical_line_count = buf_write_mmap_piece_logical_line_count(buf, &snapshot);
+  if (logical_line_count != (size_t)buf->b_ml.ml_line_count
+      || (size_t)end > logical_line_count) {
     return NOTDONE;
   }
 
   size_t range_start = 0;
   size_t range_end = snapshot.byte_len;
-  if (!piece_tree_line_start_at_revision(tree, (size_t)start, snapshot.revision,
-                                         &range_start)) {
+  if ((size_t)start == snapshot.line_count + 1 && logical_line_count == snapshot.line_count + 1) {
+    range_start = snapshot.byte_len;
+  } else if (!piece_tree_line_start_at_revision(tree, (size_t)start, snapshot.revision,
+                                                &range_start)) {
     return NOTDONE;
   }
-  if ((size_t)end < snapshot.line_count
+  if ((size_t)end < logical_line_count
+      && (size_t)end < snapshot.line_count
       && !piece_tree_line_start_at_revision(tree, (size_t)end + 1, snapshot.revision,
                                             &range_end)) {
     return NOTDONE;

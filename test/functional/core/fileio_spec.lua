@@ -49,6 +49,7 @@ describe('fileio', function()
     os.remove('Xtest_mmap_saved_journal')
     os.remove('Xtest_mmap_noeol')
     os.remove('Xtest_mmap_empty_delete_written')
+    os.remove('Xtest_mmap_empty_noeol_written')
     os.remove('Xtest_mmap_noeol_written')
     os.remove('Xtest_mmap_range_noeol_written')
     os.remove('Xtest_mmap_range_written')
@@ -132,8 +133,9 @@ describe('fileio', function()
       return stats
     end
 
-    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
-    write_file('Xtest_mmap_noeol', table.concat(lines, '\n'), false)
+    local noeol_text = table.concat(lines, '\n')
+    write_file('Xtest_mmap_readfile', noeol_text .. '\n', false)
+    write_file('Xtest_mmap_noeol', noeol_text, false)
 
     clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
     command('edit Xtest_mmap_readfile')
@@ -393,6 +395,29 @@ describe('fileio', function()
     eq(write_stats.mmap_piece_write_fast_count + 1,
       written_stats.mmap_piece_write_fast_count)
     eq('tail without eol', read_file('Xtest_mmap_range_noeol_written'))
+    command('setlocal fixeol')
+
+    command('edit! Xtest_mmap_noeol')
+    retry(nil, 1000, function()
+      poke_eventloop()
+      expect_mmap_piece(0)
+    end)
+    eq(40000, fn.line('$'))
+    eq(0, fn.eval('&endofline'))
+
+    command("call append('$', '')")
+    expect_mmap_piece(1)
+    eq(40001, fn.line('$'))
+    eq('', fn.getline(40001))
+    eq(0, fn.eval('&endofline'))
+
+    command('setlocal nofixeol')
+    write_stats = expect_mmap_piece(1)
+    command('write Xtest_mmap_empty_noeol_written')
+    written_stats = expect_mmap_piece(1)
+    eq(write_stats.mmap_piece_write_fast_count + 1,
+      written_stats.mmap_piece_write_fast_count)
+    eq(noeol_text .. '\n', read_file('Xtest_mmap_empty_noeol_written'))
     command('setlocal fixeol')
 
     command('%delete _')
@@ -1812,6 +1837,56 @@ describe('fileio', function()
     eq('recovered change', fn.getline(2))
     eq('recovered inserted', fn.getline(3))
     eq(lines[5], fn.getline(5))
+    eq(1, fn.getbufvar('%', '&modified'))
+  end)
+
+  it('recovers mmap empty no-EOL tail edits from a piece journal', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for mmap empty no-EOL recovery'):format(i)
+    end
+    local text = table.concat(lines, '\n')
+    write_file('Xtest_mmap_readfile', text, false)
+
+    clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir// swapfile' } })
+    command('edit Xtest_mmap_readfile')
+    eq(0, fn.eval('&endofline'))
+    command("call append('$', '')")
+
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(1, stats.mmap_piece_journal_record_count)
+    eq(#lines + 1, fn.line('$'))
+    eq('', fn.getline('$'))
+    local journal_path = stats.mmap_piece_journal_path
+    neq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile(journal_path, 'Xtest_mmap_saved_journal'))
+
+    command('bwipe!')
+    eq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile('Xtest_mmap_saved_journal', journal_path))
+
+    command('edit Xtest_mmap_readfile')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(false, stats.mmap_piece_journal_active)
+    eq(true, stats.mmap_piece_journal_failed)
+
+    command('recover')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_piece_journal_active)
+    eq(false, stats.mmap_piece_journal_failed)
+    eq(1, stats.mmap_piece_journal_record_count)
+    eq(#lines + 1, fn.line('$'))
+    eq(lines[#lines], fn.getline(#lines))
+    eq('', fn.getline('$'))
+    eq(0, fn.eval('&endofline'))
     eq(1, fn.getbufvar('%', '&modified'))
   end)
 
