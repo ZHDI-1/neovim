@@ -16156,6 +16156,49 @@ void vim_regfree(regprog_T *prog)
   }
 }
 
+bool vim_regprog_get_required_literal(regprog_T *prog, bool ignore_case, const char **literalp,
+                                      size_t *lenp)
+  FUNC_ATTR_NONNULL_ARG(3, 4) FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  *literalp = NULL;
+  *lenp = 0;
+  if (prog == NULL) {
+    return false;
+  }
+
+  bool effective_ignore_case = ignore_case;
+  if (prog->regflags & RF_ICASE) {
+    effective_ignore_case = true;
+  } else if (prog->regflags & RF_NOICASE) {
+    effective_ignore_case = false;
+  }
+  if (effective_ignore_case) {
+    return false;
+  }
+
+  if (prog->engine == &bt_regengine) {
+    bt_regprog_T *bt_prog = (bt_regprog_T *)prog;
+    if (bt_prog->regmust == NULL || bt_prog->regmlen <= 0) {
+      return false;
+    }
+    *literalp = (const char *)bt_prog->regmust;
+    *lenp = (size_t)bt_prog->regmlen;
+    return true;
+  }
+
+  if (prog->engine == &nfa_regengine) {
+    nfa_regprog_T *nfa_prog = (nfa_regprog_T *)prog;
+    if (nfa_prog->match_text_full == NULL || nfa_prog->match_text_full_len == 0) {
+      return false;
+    }
+    *literalp = (const char *)nfa_prog->match_text_full;
+    *lenp = nfa_prog->match_text_full_len;
+    return true;
+  }
+
+  return false;
+}
+
 #ifdef EXITFREE
 void free_regexp_stuff(void)
 {

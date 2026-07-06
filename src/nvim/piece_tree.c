@@ -1861,22 +1861,101 @@ typedef struct {
   void *callback_ctx;
 } PieceTreeLiteralFindAllCtx;
 
+static const char *pt_find_literal_bytes(const char *data, size_t len, const char *pat,
+                                         size_t pat_len)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (len < pat_len) {
+    return NULL;
+  }
+  if (pat_len == 2) {
+    const uint8_t c0 = (uint8_t)pat[0];
+    const uint8_t c1 = (uint8_t)pat[1];
+    const char *p = data;
+    const char *const end = data + len;
+    while ((p = memchr(p, c0, (size_t)(end - p))) != NULL) {
+      if ((size_t)(end - p) < 2) {
+        return NULL;
+      }
+      if ((uint8_t)p[1] == c1) {
+        return p;
+      }
+      p++;
+    }
+    return NULL;
+  }
+
+#ifdef __GLIBC__
+  return memmem(data, len, pat, pat_len);
+#else
+  const char *p = data;
+  const char *const end = data + len;
+  while ((p = memchr(p, (uint8_t)pat[0], (size_t)(end - p))) != NULL) {
+    if ((size_t)(end - p) < pat_len) {
+      return NULL;
+    }
+    if (memcmp(p, pat, pat_len) == 0) {
+      return p;
+    }
+    p++;
+  }
+  return NULL;
+#endif
+}
+
+static bool pt_literal_kmp_advance(const char *pat, const size_t *prefix, size_t pat_len,
+                                   size_t *matchedp, char c)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  while (*matchedp > 0 && c != pat[*matchedp]) {
+    *matchedp = prefix[*matchedp - 1];
+  }
+  if (c == pat[*matchedp]) {
+    (*matchedp)++;
+  }
+  return *matchedp == pat_len;
+}
+
+static void pt_literal_update_suffix(const char *data, size_t len, const char *pat,
+                                     const size_t *prefix, size_t pat_len, size_t *matchedp)
+  FUNC_ATTR_NONNULL_ALL
+{
+  *matchedp = 0;
+  const size_t suffix_len = MIN(len, pat_len - 1);
+  const char *const suffix = data + len - suffix_len;
+  for (size_t i = 0; i < suffix_len; i++) {
+    if (pt_literal_kmp_advance(pat, prefix, pat_len, matchedp, suffix[i])) {
+      *matchedp = 0;
+    }
+  }
+}
+
 static bool pt_find_literal_span(const char *data, size_t len, void *ctx)
 {
   PieceTreeLiteralFindCtx *find_ctx = ctx;
-  for (size_t i = 0; i < len; i++) {
-    while (find_ctx->matched > 0 && data[i] != find_ctx->pat[find_ctx->matched]) {
-      find_ctx->matched = find_ctx->prefix[find_ctx->matched - 1];
-    }
-    if (data[i] == find_ctx->pat[find_ctx->matched]) {
-      find_ctx->matched++;
-    }
-    if (find_ctx->matched == find_ctx->pat_len) {
+  size_t i = 0;
+  while (i < len && find_ctx->matched > 0) {
+    if (pt_literal_kmp_advance(find_ctx->pat, find_ctx->prefix, find_ctx->pat_len,
+                               &find_ctx->matched, data[i])) {
       find_ctx->found_offset = find_ctx->logical_offset + i + 1 - find_ctx->pat_len;
       find_ctx->found = true;
       return false;
     }
+    i++;
   }
+
+  if (i < len) {
+    const char *match = pt_find_literal_bytes(data + i, len - i, find_ctx->pat,
+                                             find_ctx->pat_len);
+    if (match != NULL) {
+      find_ctx->found_offset = find_ctx->logical_offset + (size_t)(match - data);
+      find_ctx->found = true;
+      return false;
+    }
+    pt_literal_update_suffix(data, len, find_ctx->pat, find_ctx->prefix, find_ctx->pat_len,
+                             &find_ctx->matched);
+  }
+
   find_ctx->logical_offset += len;
   return true;
 }
@@ -1906,14 +1985,10 @@ static bool pt_find_byte_matches_span(const char *data, size_t len, void *ctx)
 static bool pt_find_literal_matches_span(const char *data, size_t len, void *ctx)
 {
   PieceTreeLiteralFindAllCtx *find_ctx = ctx;
-  for (size_t i = 0; i < len; i++) {
-    while (find_ctx->matched > 0 && data[i] != find_ctx->pat[find_ctx->matched]) {
-      find_ctx->matched = find_ctx->prefix[find_ctx->matched - 1];
-    }
-    if (data[i] == find_ctx->pat[find_ctx->matched]) {
-      find_ctx->matched++;
-    }
-    if (find_ctx->matched == find_ctx->pat_len) {
+  size_t i = 0;
+  while (i < len && find_ctx->matched > 0) {
+    if (pt_literal_kmp_advance(find_ctx->pat, find_ctx->prefix, find_ctx->pat_len,
+                               &find_ctx->matched, data[i])) {
       const size_t match_offset = find_ctx->logical_offset + i + 1 - find_ctx->pat_len;
       if (!find_ctx->callback(match_offset, find_ctx->callback_ctx)) {
         return false;
@@ -1922,7 +1997,30 @@ static bool pt_find_literal_matches_span(const char *data, size_t len, void *ctx
       // after the matched text rather than reporting overlapping matches.
       find_ctx->matched = 0;
     }
+    i++;
   }
+  if (i == len && find_ctx->matched > 0) {
+    find_ctx->logical_offset += len;
+    return true;
+  }
+
+  const char *p = data + i;
+  const char *const end = data + len;
+  while (p < end) {
+    const char *match = pt_find_literal_bytes(p, (size_t)(end - p), find_ctx->pat,
+                                             find_ctx->pat_len);
+    if (match == NULL) {
+      break;
+    }
+    if (!find_ctx->callback(find_ctx->logical_offset + (size_t)(match - data),
+                            find_ctx->callback_ctx)) {
+      return false;
+    }
+    p = match + find_ctx->pat_len;
+  }
+  pt_literal_update_suffix(p, (size_t)(end - p), find_ctx->pat, find_ctx->prefix,
+                           find_ctx->pat_len, &find_ctx->matched);
+
   find_ctx->logical_offset += len;
   return true;
 }

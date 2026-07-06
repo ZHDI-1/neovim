@@ -1292,6 +1292,8 @@ Dict nvim__buf_stats(Buffer buf, Arena *arena, Error *err)
         INTEGER_OBJ((Integer)ml_buf_mmap_piece_write_copy_range_count(b)));
   PUT_C(rv, "mmap_piece_compact_count",
         INTEGER_OBJ((Integer)ml_buf_mmap_piece_compact_count(b)));
+  PUT_C(rv, "mmap_search_prefilter_count",
+        INTEGER_OBJ((Integer)ml_buf_mmap_search_prefilter_count(b)));
   PUT_C(rv, "mmap_piece_journal_active",
         BOOLEAN_OBJ(ml_buf_mmap_piece_journal_active(b)));
   PUT_C(rv, "mmap_piece_journal_failed",

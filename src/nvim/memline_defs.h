@@ -96,6 +96,7 @@ typedef struct {
   uint64_t ml_mmap_piece_write_clone_range_count;  // original spans reflink-cloned by kernel
   uint64_t ml_mmap_piece_write_copy_range_count;  // original spans copied by kernel
   uint64_t ml_mmap_piece_compact_count;  // successful compact tree flips
+  uint64_t ml_mmap_search_prefilter_count;  // regex searches skipped via mmap literal
 
   bhdr_T *ml_locked;       // block used by last ml_get
   linenr_T ml_locked_low;       // first line in ml_locked
