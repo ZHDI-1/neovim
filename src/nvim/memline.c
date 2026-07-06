@@ -444,6 +444,7 @@ struct ml_mmap_retired_piece_storage {
 
 static bool ml_mmap_piece_reclaim_scheduled = false;
 static bool ml_mmap_piece_compact_worker_active = false;
+static bool ml_mmap_piece_dispose_worker_active = false;
 static ml_mmap_retired_piece_storage_T *ml_mmap_retired_piece_storage = NULL;
 
 static void ml_mmap_piece_reclaim_schedule(void);
@@ -577,11 +578,13 @@ static bool ml_mmap_retired_piece_storage_try_dispose(ml_mmap_retired_piece_stor
                                                       size_t *budgetp)
   FUNC_ATTR_NONNULL_ALL
 {
-  if (piece_tree_storage_ref_count(storage->tree) != 0) {
-    return false;
-  }
-  if (storage->tree != NULL && !piece_tree_dispose_budget(storage->tree, budgetp)) {
-    return false;
+  if (storage->tree != NULL) {
+    if (piece_tree_storage_ref_count(storage->tree) != 0) {
+      return false;
+    }
+    if (!piece_tree_dispose_budget(storage->tree, budgetp)) {
+      return false;
+    }
   }
   return true;
 }
@@ -595,16 +598,32 @@ static void ml_mmap_retired_piece_storage_dispose_all(ml_mmap_retired_piece_stor
   ml_mmap_retired_piece_storage_free(storage);
 }
 
+static void ml_mmap_retired_piece_storage_dispose_finish_event(void **argv)
+{
+  (void)argv;
+  ml_mmap_piece_dispose_worker_active = false;
+  ml_mmap_piece_reclaim_schedule();
+}
+
 static void ml_mmap_retired_piece_storage_dispose_worker(void *arg)
 {
   ml_mmap_retired_piece_storage_dispose_all(arg);
+  if (main_loop.events != NULL && !main_loop.closing) {
+    loop_schedule_deferred(&main_loop,
+                           event_create(ml_mmap_retired_piece_storage_dispose_finish_event,
+                                        NULL));
+  }
 }
 
 static bool ml_mmap_retired_piece_storage_start_dispose(ml_mmap_retired_piece_storage_T *storage)
   FUNC_ATTR_NONNULL_ALL
 {
+  assert(!ml_mmap_piece_dispose_worker_active);
+  ml_mmap_piece_dispose_worker_active = true;
+
   uv_thread_t thread;
   if (uv_thread_create(&thread, ml_mmap_retired_piece_storage_dispose_worker, storage) != 0) {
+    ml_mmap_piece_dispose_worker_active = false;
     return false;
   }
   uv_thread_detach(&thread);
@@ -648,10 +667,13 @@ static bool ml_mmap_retired_piece_storage_reclaim(size_t *budgetp)
       has_more = true;
       break;
     }
-    if (piece_tree_storage_ref_count(storage->tree) != 0) {
+    if (storage->tree != NULL && piece_tree_storage_ref_count(storage->tree) != 0) {
       has_more = true;
       storagep = &storage->next;
       continue;
+    }
+    if (ml_mmap_piece_dispose_worker_active) {
+      break;
     }
 
     *storagep = storage->next;
@@ -1593,6 +1615,12 @@ bool ml_buf_mmap_piece_reclaim_scheduled(void)
   FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
   return ml_mmap_piece_reclaim_scheduled;
+}
+
+bool ml_buf_mmap_piece_gc_worker_active(void)
+  FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_piece_dispose_worker_active;
 }
 
 size_t ml_buf_mmap_piece_add_len(buf_T *buf)
