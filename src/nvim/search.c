@@ -687,18 +687,24 @@ int searchit(win_T *win, buf_T *buf, pos_T *pos, pos_T *end_pos, Direction dir, 
           size_t line_start = 0;
           if (ml_get_buf_mmap_line_start(buf, lnum, &line_start)
               && (size_t)col <= SIZE_MAX - line_start) {
+            size_t end_offset = SIZE_MAX;
+            if (stop_lnum != 0 && stop_lnum < buf->b_ml.ml_line_count) {
+              (void)ml_get_buf_mmap_line_start(buf, stop_lnum + 1, &end_offset);
+            }
             linenr_T literal_lnum = lnum;
             size_t literal_offset = line_start + (size_t)col;
             size_t literal_line_start = line_start;
             size_t literal_line_len = 0;
             colnr_T literal_col = 0;
             const bool has_literal =
-              ml_get_buf_mmap_literal_match_at_pos(buf, &literal_offset, &literal_lnum,
-                                                   &literal_line_start, mmap_required_literal,
-                                                   mmap_required_literal_len, &literal_line_len,
-                                                   &literal_col);
+              ml_get_buf_mmap_literal_match_in_range_pos(buf, &literal_offset, end_offset,
+                                                         &literal_lnum, &literal_line_start,
+                                                         mmap_required_literal,
+                                                         mmap_required_literal_len,
+                                                         &literal_line_len, &literal_col);
             if (!has_literal
                 || (stop_lnum != 0 && literal_lnum > stop_lnum)) {
+              ml_buf_mmap_search_prefilter_miss_record(buf);
               lnum = buf->b_ml.ml_line_count + 1;
               break;
             }
