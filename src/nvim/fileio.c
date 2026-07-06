@@ -1049,6 +1049,96 @@ install_mmap_lines:
 #endif
 }
 
+#ifdef UNIX
+static bool readfile_can_defer_swap_for_mmap(int fd, bool newfile, bool filtering,
+                                             bool read_stdin, bool read_buffer,
+                                             bool read_fifo, linenr_T from,
+                                             linenr_T lines_to_skip,
+                                             linenr_T lines_to_read, exarg_T *eap,
+                                             int flags)
+  FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (!newfile
+      || filtering
+      || read_stdin
+      || read_buffer
+      || read_fifo
+      || from != 0
+      || lines_to_skip != 0
+      || lines_to_read != MAXLNUM
+      || curbuf->b_p_bin
+      || recoverymode
+      || (flags & READ_DUMMY)
+      || curbuf->b_ml.ml_mfp == NULL
+      || !(curbuf->b_ml.ml_flags & ML_EMPTY)) {
+    return false;
+  }
+
+  if (eap != NULL && eap->force_ff != 0
+      && get_fileformat_force(curbuf, eap) != EOL_UNIX) {
+    return false;
+  }
+
+  if (eap != NULL && eap->force_enc != 0) {
+    char *fenc = enc_canonize(eap->cmd + eap->force_enc);
+    const bool supported = fenc != NULL && (*fenc == NUL || strcmp(fenc, "utf-8") == 0);
+    xfree(fenc);
+    if (!supported) {
+      return false;
+    }
+  }
+
+  const bool read_undo_file_for_open = (newfile && (flags & READ_KEEP_UNDO) == 0
+                                        && curbuf->b_ffname != NULL
+                                        && curbuf->b_p_udf
+                                        && !filtering
+                                        && !read_fifo
+                                        && !read_stdin
+                                        && !read_buffer);
+  if (read_undo_file_for_open) {
+    return false;
+  }
+
+  FileInfo info;
+  return os_fileinfo_fd(fd, &info)
+         && S_ISREG(info.stat.st_mode)
+         && info.stat.st_size >= READFILE_MMAP_MIN_SIZE
+         && (uintmax_t)info.stat.st_size <= (uintmax_t)PTRDIFF_MAX
+         && (uintmax_t)info.stat.st_size <= (uintmax_t)SIZE_MAX;
+}
+
+static void readfile_set_swapfile_protection(int swap_mode, const FileInfo *file_info)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (swap_mode <= 0
+      || curbuf->b_ml.ml_mfp == NULL
+      || curbuf->b_ml.ml_mfp->mf_fname == NULL) {
+    return;
+  }
+
+  const char *swap_fname = curbuf->b_ml.ml_mfp->mf_fname;
+
+  // If the group-read bit is set but not the world-read bit, then the
+  // group must be equal to the group of the original file.  If we can't
+  // make that happen then reset the group-read bit.  This avoids making
+  // the swap file readable to more users when the primary group of the
+  // user is too permissive.
+  if ((swap_mode & 044) == 040) {
+    FileInfo swap_info;
+
+    if (os_fileinfo(swap_fname, &swap_info)
+        && file_info->stat.st_gid != swap_info.stat.st_gid
+        && os_fchown(curbuf->b_ml.ml_mfp->mf_fd, (uv_uid_t)(-1),
+                     (uv_gid_t)file_info->stat.st_gid)
+        == -1) {
+      swap_mode &= 0600;
+    }
+  }
+
+  os_setperm(swap_fname, swap_mode);
+}
+#endif
+
 static inline int readfile_put_line(linenr_T lnum, char *line, colnr_T len, int append_flags,
                                     bool *replaced_empty_line)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_ALWAYS_INLINE
@@ -1366,6 +1456,7 @@ int readfile(char *fname, char *sfname, linenr_T from, linenr_T lines_to_skip,
   int perm = 0;
 #ifdef UNIX
   int swap_mode = -1;                   // protection bits for swap file
+  bool deferred_swap_for_mmap = false;  // try mmap before legacy swap handling
 #endif
   int fileformat = 0;                   // end-of-line format
   bool keep_fileformat = false;
@@ -1702,7 +1793,21 @@ int readfile(char *fname, char *sfname, linenr_T from, linenr_T lines_to_skip,
   // editing this file.
   // Don't do this for a "nofile" or "nowrite" buffer type.
   if (!bt_dontwrite(curbuf)) {
-    check_need_swap(newfile);
+#ifdef UNIX
+    deferred_swap_for_mmap =
+      readfile_can_defer_swap_for_mmap(fd, newfile, filtering, read_stdin, read_buffer,
+                                       read_fifo, from, lines_to_skip, lines_to_read,
+                                       eap, flags);
+    if (deferred_swap_for_mmap) {
+      // mmap piece-tree buffers do not use the legacy memline swap path.
+      // If the mmap install later rejects the file, readfile() runs the
+      // normal swap check before falling back to legacy loading.
+    } else {
+#endif
+      check_need_swap(newfile);
+#ifdef UNIX
+    }
+#endif
     if (!read_stdin
         && (curbuf != old_curbuf
             || (using_b_ffname && (old_b_ffname != curbuf->b_ffname))
@@ -1715,29 +1820,7 @@ int readfile(char *fname, char *sfname, linenr_T from, linenr_T lines_to_skip,
     }
 #ifdef UNIX
     // Set swap file protection bits after creating it.
-    if (swap_mode > 0 && curbuf->b_ml.ml_mfp != NULL
-        && curbuf->b_ml.ml_mfp->mf_fname != NULL) {
-      const char *swap_fname = curbuf->b_ml.ml_mfp->mf_fname;
-
-      // If the group-read bit is set but not the world-read bit, then
-      // the group must be equal to the group of the original file.  If
-      // we can't make that happen then reset the group-read bit.  This
-      // avoids making the swap file readable to more users when the
-      // primary group of the user is too permissive.
-      if ((swap_mode & 044) == 040) {
-        FileInfo swap_info;
-
-        if (os_fileinfo(swap_fname, &swap_info)
-            && file_info.stat.st_gid != swap_info.stat.st_gid
-            && os_fchown(curbuf->b_ml.ml_mfp->mf_fd, (uv_uid_t)(-1),
-                         (uv_gid_t)file_info.stat.st_gid)
-            == -1) {
-          swap_mode &= 0600;
-        }
-      }
-
-      os_setperm(swap_fname, swap_mode);
-    }
+    readfile_set_swapfile_protection(swap_mode, &file_info);
 #endif
   }
 
@@ -2104,6 +2187,54 @@ retry:
       read_replaced_empty_line = true;
       lnum = from + mmap_line_count;
       goto failed;
+    }
+  }
+
+  if (deferred_swap_for_mmap) {
+    check_need_swap(newfile);
+    deferred_swap_for_mmap = false;
+    if (!read_stdin
+        && (curbuf != old_curbuf
+            || (using_b_ffname && (old_b_ffname != curbuf->b_ffname))
+            || (using_b_fname && (old_b_fname != curbuf->b_fname)))) {
+      emsg(_(e_auchangedbuf));
+      if (!read_buffer) {
+        close(fd);
+      }
+      if (fenc_alloced) {
+        xfree(fenc);
+      }
+      if (iconv_fd != (iconv_t)-1) {
+        iconv_close(iconv_fd);
+      }
+      if (tmpname != NULL) {
+        os_remove(tmpname);
+        xfree(tmpname);
+      }
+      xfree(buffer);
+      no_wait_return--;
+      goto theend;
+    }
+
+    readfile_set_swapfile_protection(swap_mode, &file_info);
+
+    if (swap_exists_action == SEA_QUIT) {
+      if (!read_buffer && !read_stdin) {
+        close(fd);
+      }
+      if (fenc_alloced) {
+        xfree(fenc);
+      }
+      if (iconv_fd != (iconv_t)-1) {
+        iconv_close(iconv_fd);
+      }
+      if (tmpname != NULL) {
+        os_remove(tmpname);
+        xfree(tmpname);
+      }
+      xfree(buffer);
+      no_wait_return--;
+      goto theend;
     }
   }
 #endif

@@ -11,6 +11,7 @@ local eq = t.eq
 local neq = t.neq
 local ok = t.ok
 local feed = n.feed
+local exec_capture = n.exec_capture
 local fn = n.fn
 local nvim_prog = n.nvim_prog
 local poke_eventloop = n.poke_eventloop
@@ -565,6 +566,63 @@ describe('fileio', function()
     eq('changed with swap', fn.getline(2))
     eq(lines[40000], fn.getline(40000))
     eq(40000, fn.line('$'))
+  end)
+
+  it('defers stale legacy swap checks for mmap piece tree reads', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for mmap stale swap smoke'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', 'small file before mmap reopen\n', false)
+    mkdir('Xtest_startup_swapdir')
+
+    clear({ args = { '--cmd', 'set nofsync' } })
+    local j = fn.jobstart({
+      nvim_prog,
+      '--clean',
+      '--embed',
+      '--cmd',
+      'set nofsync directory=Xtest_startup_swapdir// swapfile fileformat=unix undolevels=-1',
+    }, { rpc = true })
+    fn.rpcrequest(
+      j,
+      'nvim_exec2',
+      [[
+      edit Xtest_mmap_readfile
+      call setline(1, 'stale swap change')
+      preserve
+    ]],
+      {}
+    )
+    local swapname = fn.rpcrequest(j, 'nvim_eval', "swapname('%')")
+    neq('', swapname)
+    neq(nil, uv.fs_stat(swapname))
+    fn.jobstop(j)
+    retry(10, nil, function()
+      neq(nil, uv.fs_stat(swapname))
+    end)
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+    clear({
+      args = {
+        '--cmd',
+        'set nofsync directory=Xtest_startup_swapdir// swapfile fileformat=unix undolevels=-1',
+      },
+    })
+    command('messages clear')
+    command('edit Xtest_mmap_readfile')
+
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq('', fn.swapname('%'))
+    eq(lines[2], fn.getline(2))
+    eq(40000, fn.line('$'))
+
+    local messages = exec_capture('messages')
+    eq(nil, messages:find('E325', 1, true))
+    eq(nil, messages:find('W325', 1, true))
   end)
 
   it("fsync() with 'nofsync' #8304", function()
