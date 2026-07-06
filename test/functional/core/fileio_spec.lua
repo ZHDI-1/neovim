@@ -1966,6 +1966,49 @@ describe('fileio', function()
     os.remove(journal_path)
   end)
 
+  it('refuses mmap piece-journal recovery over local piece-tree edits', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('line%d ascii text for mmap dirty recovery refusal'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '--cmd', 'set nofsync directory=Xtest_startup_swapdir// swapfile' } })
+    command('edit Xtest_mmap_readfile')
+    command("call setline(2, 'journal recovered dirty refusal')")
+
+    local stats = api.nvim__buf_stats(0)
+    local journal_path = stats.mmap_piece_journal_path
+    eq(true, uv.fs_copyfile(journal_path, 'Xtest_mmap_saved_journal'))
+    command('bwipe!')
+    eq(nil, uv.fs_stat(journal_path))
+    eq(true, uv.fs_copyfile('Xtest_mmap_saved_journal', journal_path))
+
+    command('edit Xtest_mmap_readfile')
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(false, stats.mmap_piece_journal_active)
+    eq(true, stats.mmap_piece_journal_failed)
+
+    local dirty_line = lines[3]:gsub('line', 'same', 1)
+    eq(#lines[3], #dirty_line)
+    command("call setline(3, '" .. dirty_line .. "')")
+    stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    ok(stats.mmap_piece_revision > 0)
+    eq(#table.concat(lines, '\n') + 1, stats.mmap_text_size)
+
+    matches('E308: Cannot recover .* over a modified mmap piece%-tree buffer',
+      pcall_err(command, 'recover!'))
+    eq(lines[2], fn.getline(2))
+    eq(dirty_line, fn.getline(3))
+    eq(1, fn.getbufvar('%', '&modified'))
+    os.remove(journal_path)
+  end)
+
   it('refuses mmap piece-journal recovery when the original file is missing', function()
     local lines = {}
     for i = 1, 40000 do

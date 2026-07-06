@@ -412,6 +412,16 @@ static bool ml_mmap_is_pristine(const buf_T *buf)
          && (buf->b_ml.ml_piece_tree == NULL || buf->b_ml.ml_piece_tree->revision == 0);
 }
 
+static bool ml_mmap_piece_journal_has_replay_base(const buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf)
+         && buf->b_ml.ml_piece_tree != NULL
+         && buf->b_ml.ml_piece_tree->revision == 0
+         && buf->b_ml.ml_mmap_source_is_buffer_file
+         && ml_mmap_text_size(buf) == buf->b_ml.ml_mmap_size;
+}
+
 static bool ml_mmap_can_edit_tree(const buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
@@ -1481,6 +1491,7 @@ static bool ml_mmap_piece_journal_replay(buf_T *buf, const char *data, size_t le
   PieceJournalHeader header = { 0 };
   size_t consumed = 0;
   if (piece_journal_header_decode(data, len, &header, &consumed) != kPieceJournalDecodeOK
+      || !ml_mmap_piece_journal_has_replay_base(buf)
       || !ml_mmap_piece_journal_header_matches(buf, &header)) {
     return false;
   }
@@ -1615,6 +1626,10 @@ static bool ml_recover_mmap_piece_journal(const char *fname, bool called_from_ma
   }
   if (curbuf->b_ml.ml_mmap_piece_journal_fd >= 0) {
     semsg(_("E308: Cannot recover from active mmap piece journal %s"), fname);
+    return false;
+  }
+  if (!ml_mmap_piece_journal_has_replay_base(curbuf)) {
+    semsg(_("E308: Cannot recover %s over a modified mmap piece-tree buffer"), fname);
     return false;
   }
 
@@ -3115,7 +3130,8 @@ bool ml_buf_mmap_piece_journal_recover(buf_T *buf)
   }
 
   ml_flush_line(buf, false);
-  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL) {
+  if (!ml_mmap_piece_journal_has_replay_base(buf)) {
+    buf->b_ml.ml_mmap_piece_journal_failed = true;
     return false;
   }
 
