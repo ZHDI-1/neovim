@@ -1314,6 +1314,10 @@ static void ml_mmap_piece_journal_open(buf_T *buf)
       || buf->b_ml.ml_mmap_piece_journal_failed || buf->b_ffname == NULL) {
     return;
   }
+  if (!ml_mmap_piece_journal_has_replay_base(buf)) {
+    buf->b_ml.ml_mmap_piece_journal_failed = true;
+    return;
+  }
 
   FileInfo file_info;
   if (!os_fileinfo(buf->b_ffname, &file_info)) {
