@@ -88,6 +88,7 @@ typedef struct {
   bool ml_mmap_source_is_buffer_file;  // mmap source still aliases buffer file
   PieceTree *ml_piece_tree;     // tree index/composition for mmap-backed text
   uint64_t ml_mmap_piece_write_fast_count;  // successful direct piece-span writes
+  uint64_t ml_mmap_piece_write_copy_range_count;  // original spans copied by kernel
   uint64_t ml_mmap_piece_compact_count;  // successful compact tree flips
 
   bhdr_T *ml_locked;       // block used by last ml_get

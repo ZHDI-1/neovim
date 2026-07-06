@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <iconv.h>
 #include <inttypes.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -330,6 +331,49 @@ static int buf_write_raw_bytes(int fd, const char *data, size_t len, off_T *ncha
   return OK;
 }
 
+static int buf_write_copy_file_range_bytes(int source_fd, int dest_fd, size_t source_start,
+                                           size_t len, off_T *ncharsp)
+  FUNC_ATTR_NONNULL_ALL
+{
+#ifdef __linux__
+  enum { kCopyFileRangeChunk = 1024 * 1024 * 1024 };
+
+  off_t source_offset = (off_t)source_start;
+  bool copied_any = false;
+  while (len > 0) {
+    const size_t todo = MIN(len, (size_t)kCopyFileRangeChunk);
+    ssize_t copied;
+    do {
+      copied = copy_file_range(source_fd, &source_offset, dest_fd, NULL, todo, 0);
+    } while (copied < 0 && errno == EINTR);
+
+    if (copied < 0) {
+      return copied_any ? FAIL : NOTDONE;
+    }
+    if (copied == 0) {
+      return FAIL;
+    }
+
+    copied_any = true;
+    *ncharsp += (off_T)copied;
+    len -= (size_t)copied;
+
+    os_breakcheck();
+    if (got_int) {
+      return FAIL;
+    }
+  }
+  return OK;
+#else
+  (void)source_fd;
+  (void)dest_fd;
+  (void)source_start;
+  (void)len;
+  (void)ncharsp;
+  return NOTDONE;
+#endif
+}
+
 static bool buf_write_span_vec_ends_in_nl(const PieceTreeSpanVec *span_vec)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
@@ -347,10 +391,10 @@ static bool buf_write_span_vec_ends_in_nl(const PieceTreeSpanVec *span_vec)
   return false;
 }
 
-static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, linenr_T start,
-                                    linenr_T end, bool write_final_eol, bool *no_eolp,
-                                    off_T *ncharsp)
-  FUNC_ATTR_NONNULL_ALL
+static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, const char *copy_source,
+                                    linenr_T start, linenr_T end, bool write_final_eol,
+                                    bool *no_eolp, off_T *ncharsp)
+  FUNC_ATTR_NONNULL_ARG(1, 2, 7, 8)
 {
   if (ip->bw_fd < 0 || ip->bw_len != 0 || buf->b_ml.ml_piece_tree == NULL
       || start < 1 || end < start) {
@@ -390,10 +434,24 @@ static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, linenr_T sta
   }
 
   int ret = OK;
+  int source_fd = copy_source == NULL ? -1 : os_open(copy_source, O_RDONLY, 0);
   for (size_t i = 0; i < span_vec.count; i++) {
     const PieceTreeSpan *span = &span_vec.items[i];
     if (span->len == 0) {
       continue;
+    }
+    if (source_fd >= 0 && span->source == kPieceTreeSourceOriginal) {
+      const int copy_ret = buf_write_copy_file_range_bytes(source_fd, ip->bw_fd,
+                                                           span->source_start, span->len,
+                                                           ncharsp);
+      if (copy_ret == OK) {
+        ml_buf_mmap_piece_write_copy_range_record(buf);
+        continue;
+      }
+      if (copy_ret == FAIL) {
+        ret = FAIL;
+        break;
+      }
     }
     if (buf_write_raw_bytes(ip->bw_fd, span->data, span->len, ncharsp) == FAIL) {
       ret = FAIL;
@@ -401,6 +459,9 @@ static int buf_write_mmap_piece_raw(buf_T *buf, struct bw_info *ip, linenr_T sta
     }
   }
 
+  if (source_fd >= 0) {
+    close(source_fd);
+  }
   if (ret == OK && !buf_write_span_vec_ends_in_nl(&span_vec)) {
     if (write_final_eol) {
       ret = buf_write_raw_bytes(ip->bw_fd, "\n", 1, ncharsp);
@@ -1305,6 +1366,9 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
                    &file_readonly, &err) == FAIL) {
     goto fail;
   }
+  const bool mmap_source_was_output = ml_buf_has_mmap_storage(buf)
+                                      && buf_write_mmap_source_is_output(buf, newfile, device,
+                                                                        &file_info_old);
 
   // For systems that support ACL: get the ACL from the original file.
   if (!newfile) {
@@ -1340,8 +1404,7 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
       retval = FAIL;
       goto fail;
     }
-    if (backup != NULL && !backup_copy
-        && buf_write_mmap_source_is_output(buf, newfile, device, &file_info_old)) {
+    if (backup != NULL && !backup_copy && mmap_source_was_output) {
       ml_buf_mmap_source_detach_buffer_file(buf);
     }
   }
@@ -1373,6 +1436,14 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
   }
   const bool mmap_source_can_stream =
     buf_write_mmap_source_can_stream(buf, newfile, device, backup_copy, backup, &file_info_old);
+  const char *mmap_piece_copy_source = NULL;
+  if (mmap_source_can_stream) {
+    if (mmap_source_was_output && backup != NULL && !backup_copy) {
+      mmap_piece_copy_source = backup;
+    } else if (ml_buf_mmap_source_is_buffer_file(buf) && buf->b_ffname != NULL) {
+      mmap_piece_copy_source = buf->b_ffname;
+    }
+  }
 
 #ifdef UNIX
   bool made_writable = false;  // 'w' bit has been set
@@ -1666,7 +1737,8 @@ restore_backup:
         && ml_buf_has_mmap_piece_tree(buf)) {
       const bool write_final_eol = buf->b_p_fixeol || buf->b_p_eol;
       const int mmap_write_ret =
-        buf_write_mmap_piece_raw(buf, &write_info, start, end, write_final_eol, &no_eol, &nchars);
+        buf_write_mmap_piece_raw(buf, &write_info, mmap_piece_copy_source, start, end,
+                                 write_final_eol, &no_eol, &nchars);
       if (mmap_write_ret == OK) {
         lnum = end + 1;
         goto write_loop_done;
