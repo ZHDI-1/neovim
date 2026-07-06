@@ -83,6 +83,7 @@ typedef struct {
   size_t *ml_mmap_line_starts;  // byte offsets for sparse line-index blocks
   size_t ml_mmap_index_count;   // number of sparse line-index blocks
   bool ml_mmap_noeol;           // last line has no final EOL
+  bool ml_mmap_source_is_buffer_file;  // mmap source still aliases buffer file
   PieceTree *ml_piece_tree;     // tree index/composition for mmap-backed text
   uint64_t ml_mmap_piece_write_fast_count;  // successful direct piece-span writes
 

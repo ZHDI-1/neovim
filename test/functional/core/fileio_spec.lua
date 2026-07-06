@@ -435,6 +435,48 @@ describe('fileio', function()
     eq(table.concat(lines, '\n') .. '\n', read_file('Xtest_mmap_written'))
   end)
 
+  it('keeps mmap piece tree active for same-file copy-backup writes', function()
+    local lines = {}
+    for i = 1, 40000 do
+      lines[i] = ('copy-backup mmap line %05d'):format(i)
+    end
+
+    write_file('Xtest_mmap_readfile', table.concat(lines, '\n') .. '\n', false)
+
+    clear({ args = { '-n', '-u', 'NONE', '-i', 'NONE' } })
+    command('edit Xtest_mmap_readfile')
+    local stats = api.nvim__buf_stats(0)
+    eq(true, stats.mmap_active)
+    eq(true, stats.mmap_piece_tree)
+    eq(true, stats.mmap_source_is_buffer_file)
+
+    lines[2] = 'copy-backup mmap write'
+    command("call setline(2, 'copy-backup mmap write')")
+    command('set writebackup nobackup backupcopy=yes backupskip=')
+    stats = api.nvim__buf_stats(0)
+    command('write')
+    local written_stats = api.nvim__buf_stats(0)
+    eq(true, written_stats.mmap_active)
+    eq(true, written_stats.mmap_piece_tree)
+    eq(false, written_stats.mmap_source_is_buffer_file)
+    eq(stats.mmap_piece_write_fast_count + 1, written_stats.mmap_piece_write_fast_count)
+    local prefix = 'copy-backup mmap line 00001\ncopy-backup mmap write\n'
+    eq(prefix, read_file('Xtest_mmap_readfile'):sub(1, #prefix))
+
+    lines[3] = 'detached-source mmap write'
+    command("call setline(3, 'detached-source mmap write')")
+    stats = api.nvim__buf_stats(0)
+    command('write')
+    written_stats = api.nvim__buf_stats(0)
+    eq(true, written_stats.mmap_active)
+    eq(true, written_stats.mmap_piece_tree)
+    eq(false, written_stats.mmap_source_is_buffer_file)
+    eq(stats.mmap_piece_write_fast_count + 1, written_stats.mmap_piece_write_fast_count)
+    prefix = 'copy-backup mmap line 00001\ncopy-backup mmap write\n'
+      .. 'detached-source mmap write\n'
+    eq(prefix, read_file('Xtest_mmap_readfile'):sub(1, #prefix))
+  end)
+
   it('opens large UTF-8 files with mmap while swapfile is enabled', function()
     local lines = {}
     for i = 1, 40000 do

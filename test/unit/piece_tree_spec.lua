@@ -291,6 +291,28 @@ describe('piece tree', function()
     eq(1, tonumber(lib.piece_tree_node_count(w.tree)))
   end)
 
+  itp('rebases borrowed original storage without changing add storage', function()
+    local w = new_tree('abc\ndef')
+    ok(lib.piece_tree_insert(w.tree, 3, 'X', 1))
+    check_tree(w.tree, 'abcX\ndef')
+    local revision = tonumber(w.tree[0].revision)
+
+    local wrong_len = cbuf('ABC\nDE')
+    eq(false, lib.piece_tree_rebase_original(w.tree, wrong_len, 6))
+    check_tree(w.tree, 'abcX\ndef')
+
+    local active_reader = cbuf('ABC\nDEF')
+    lib.piece_tree_reader_enter(w.tree)
+    eq(false, lib.piece_tree_rebase_original(w.tree, active_reader, 7))
+    lib.piece_tree_reader_leave(w.tree)
+    check_tree(w.tree, 'abcX\ndef')
+
+    local new_original = cbuf('ABC\nDEF')
+    ok(lib.piece_tree_rebase_original(w.tree, new_original, 7))
+    eq(revision, tonumber(w.tree[0].revision))
+    check_tree(w.tree, 'ABCX\nDEF')
+  end)
+
   itp('inserts at beginning, middle, and end', function()
     local w = new_tree('alpha\ngamma')
     local shadow = 'alpha\ngamma'

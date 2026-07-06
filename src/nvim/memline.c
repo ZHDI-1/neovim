@@ -43,6 +43,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <uv.h>
 
@@ -451,6 +452,7 @@ static void ml_mmap_close(buf_T *buf)
   XFREE_CLEAR(buf->b_ml.ml_mmap_line_starts);
   buf->b_ml.ml_mmap_index_count = 0;
   buf->b_ml.ml_mmap_noeol = false;
+  buf->b_ml.ml_mmap_source_is_buffer_file = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   ml_mmap_clear_cache(buf);
 }
@@ -573,6 +575,7 @@ static int ml_mmap_materialize(buf_T *buf)
   buf->b_ml.ml_mmap_line_starts = NULL;
   buf->b_ml.ml_mmap_index_count = 0;
   buf->b_ml.ml_mmap_noeol = false;
+  buf->b_ml.ml_mmap_source_is_buffer_file = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_piece_tree = NULL;
 
@@ -907,6 +910,7 @@ int ml_set_mmap_lines(buf_T *buf, char *base, size_t size, size_t *line_starts,
   buf->b_ml.ml_mmap_line_starts = line_starts;
   buf->b_ml.ml_mmap_index_count = index_count;
   buf->b_ml.ml_mmap_noeol = noeol;
+  buf->b_ml.ml_mmap_source_is_buffer_file = true;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_line_count = line_count;
   buf->b_ml.ml_flags &= ~ML_EMPTY;
@@ -925,6 +929,20 @@ bool ml_buf_has_mmap_storage(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
   return ml_mmap_is_active(buf);
+}
+
+bool ml_buf_mmap_source_is_buffer_file(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return ml_mmap_is_active(buf) && buf->b_ml.ml_mmap_source_is_buffer_file;
+}
+
+void ml_buf_mmap_source_detach_buffer_file(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  if (ml_mmap_is_active(buf)) {
+    buf->b_ml.ml_mmap_source_is_buffer_file = false;
+  }
 }
 
 bool ml_buf_has_mmap_piece_tree(buf_T *buf)
@@ -948,6 +966,64 @@ int ml_buf_mmap_materialize(buf_T *buf)
   FUNC_ATTR_NONNULL_ALL
 {
   return ml_mmap_is_active(buf) ? ml_mmap_materialize(buf) : OK;
+}
+
+int ml_buf_mmap_rebase_file(buf_T *buf, const char *fname)
+  FUNC_ATTR_NONNULL_ALL
+{
+#ifdef UNIX
+  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL
+      || !ml_buf_mmap_source_is_buffer_file(buf)) {
+    return OK;
+  }
+
+  ml_flush_line(buf, false);
+  if (!ml_mmap_is_active(buf) || buf->b_ml.ml_piece_tree == NULL) {
+    return FAIL;
+  }
+
+  const size_t size = buf->b_ml.ml_mmap_size;
+  if (size == 0) {
+    return FAIL;
+  }
+
+  int fd = os_open(fname, O_RDONLY, 0);
+  if (fd < 0) {
+    return FAIL;
+  }
+
+  FileInfo file_info;
+  if (!os_fileinfo_fd(fd, &file_info) || !S_ISREG(file_info.stat.st_mode)
+      || (uintmax_t)file_info.stat.st_size != (uintmax_t)size) {
+    close(fd);
+    return FAIL;
+  }
+
+  char *base = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+  if (base == MAP_FAILED) {
+    return FAIL;
+  }
+
+  char *old_base = buf->b_ml.ml_mmap_base;
+  const size_t old_size = buf->b_ml.ml_mmap_size;
+  if (!piece_tree_rebase_original(buf->b_ml.ml_piece_tree, base, size)) {
+    munmap(base, size);
+    return FAIL;
+  }
+
+  buf->b_ml.ml_mmap_base = base;
+  buf->b_ml.ml_mmap_source_is_buffer_file = false;
+  if (old_base != NULL) {
+    munmap(old_base, old_size);
+  }
+  ml_mmap_clear_cache(buf);
+  return OK;
+#else
+  (void)buf;
+  (void)fname;
+  return FAIL;
+#endif
 }
 
 void ml_buf_mmap_piece_write_fast_record(buf_T *buf)
@@ -2328,6 +2404,7 @@ int ml_open(buf_T *buf)
   buf->b_ml.ml_mmap_line_starts = NULL;
   buf->b_ml.ml_mmap_index_count = 0;
   buf->b_ml.ml_mmap_noeol = false;
+  buf->b_ml.ml_mmap_source_is_buffer_file = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_piece_tree = NULL;
   buf->b_ml.ml_chunksize = NULL;
@@ -2875,6 +2952,7 @@ void ml_recover(bool checkext)
   buf->b_ml.ml_mmap_line_starts = NULL;
   buf->b_ml.ml_mmap_index_count = 0;
   buf->b_ml.ml_mmap_noeol = false;
+  buf->b_ml.ml_mmap_source_is_buffer_file = false;
   buf->b_ml.ml_mmap_piece_write_fast_count = 0;
   buf->b_ml.ml_piece_tree = NULL;
   buf->b_ml.ml_locked = NULL;           // no locked block

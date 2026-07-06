@@ -424,6 +424,9 @@ static bool buf_write_mmap_source_can_stream(buf_T *buf, bool newfile, bool devi
   if (newfile || device) {
     return true;
   }
+  if (!ml_buf_mmap_source_is_buffer_file(buf)) {
+    return true;
+  }
   if (!buf->file_id_valid) {
     return false;
   }
@@ -441,7 +444,8 @@ static bool buf_write_mmap_source_is_output(buf_T *buf, bool newfile, bool devic
                                             const FileInfo *file_info_old)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
 {
-  if (newfile || device || !buf->file_id_valid) {
+  if (newfile || device || !buf->file_id_valid
+      || !ml_buf_mmap_source_is_buffer_file(buf)) {
     return false;
   }
 
@@ -457,6 +461,32 @@ static bool buf_write_mmap_source_can_rename(char *fname, const FileInfo *file_i
   return os_fileinfo_hardlinks(file_info_old) <= 1
          && os_fileinfo_link(fname, &file_info)
          && os_fileinfo_id_equal(&file_info, file_info_old);
+}
+
+static bool buf_write_mmap_source_rebase_copy(buf_T *buf, char *fname, const char *backup)
+  FUNC_ATTR_NONNULL_ARG(1, 2) FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  if (!ml_buf_mmap_source_is_buffer_file(buf)) {
+    return true;
+  }
+
+  if (backup != NULL && ml_buf_mmap_rebase_file(buf, backup) == OK) {
+    return true;
+  }
+
+  char *tmp = vim_tempname();
+  if (tmp == NULL) {
+    return false;
+  }
+
+  bool ok = false;
+  if (os_copy(fname, tmp, UV_FS_COPYFILE_FICLONE) == 0
+      && ml_buf_mmap_rebase_file(buf, tmp) == OK) {
+    ok = true;
+  }
+  os_remove(tmp);
+  xfree(tmp);
+  return ok;
 }
 
 /// Check modification time of file, before writing to it.
@@ -1310,6 +1340,10 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
       retval = FAIL;
       goto fail;
     }
+    if (backup != NULL && !backup_copy
+        && buf_write_mmap_source_is_output(buf, newfile, device, &file_info_old)) {
+      ml_buf_mmap_source_detach_buffer_file(buf);
+    }
   }
   if (!append
       && !filtering
@@ -1325,9 +1359,13 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
         retval = FAIL;
         goto fail;
       }
+      if (backup != NULL && !backup_copy) {
+        ml_buf_mmap_source_detach_buffer_file(buf);
+      }
     }
     if (!buf_write_mmap_source_can_stream(buf, newfile, device, backup_copy, backup,
                                           &file_info_old)
+        && !buf_write_mmap_source_rebase_copy(buf, fname, backup)
         && ml_buf_mmap_materialize(buf) == FAIL) {
       retval = FAIL;
       goto fail;

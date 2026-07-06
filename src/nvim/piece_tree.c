@@ -971,6 +971,18 @@ void piece_tree_clear(PieceTree *tree)
   memset(tree, 0, sizeof *tree);
 }
 
+bool piece_tree_rebase_original(PieceTree *tree, const char *original, size_t original_len)
+{
+  if (tree == NULL || original_len != tree->original_len
+      || (original == NULL && original_len != 0)
+      || pt_reader_count_load(tree) != 0) {
+    return false;
+  }
+
+  tree->original = original;
+  return true;
+}
+
 size_t piece_tree_byte_len(const PieceTree *tree)
 {
   return pt_bytes(tree->root);
