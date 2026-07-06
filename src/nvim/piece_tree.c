@@ -55,6 +55,7 @@ enum {
 #include "piece_tree.c.generated.h"
 
 static size_t pt_reader_count_load(const PieceTree *tree);
+static size_t pt_span_ref_count_load(const PieceTree *tree);
 static size_t pt_reclaim_retired_nodes(PieceTree *tree, size_t budget);
 
 static size_t pt_count_lfs(const char *data, size_t len)
@@ -337,6 +338,41 @@ static size_t pt_reader_count_decrement(PieceTree *tree)
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
   }
   return remaining;
+}
+
+static size_t pt_span_ref_count_load(const PieceTree *tree)
+{
+  return __atomic_load_n(&tree->span_ref_count, __ATOMIC_ACQUIRE);
+}
+
+static void pt_span_ref_count_increment(PieceTree *tree)
+{
+  size_t old = pt_span_ref_count_load(tree);
+  for (;;) {
+    assert(old < SIZE_MAX);
+    if (old == SIZE_MAX) {
+      return;
+    }
+    const size_t new_count = old + 1;
+    if (__atomic_compare_exchange_n(&tree->span_ref_count, &old, new_count, false,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+      return;
+    }
+  }
+}
+
+static void pt_span_ref_count_decrement(PieceTree *tree)
+{
+  const size_t old = __atomic_load_n(&tree->span_ref_count, __ATOMIC_ACQUIRE);
+  assert(old > 0);
+  if (old == 0) {
+    return;
+  }
+
+  const size_t remaining = __atomic_sub_fetch(&tree->span_ref_count, 1, __ATOMIC_RELEASE);
+  if (remaining == 0) {
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  }
 }
 
 static void pt_recycle_node(PieceTree *tree, PieceTreeNode *node)
@@ -971,6 +1007,8 @@ void piece_tree_init_with_line_index(PieceTree *tree, const char *original, size
 
 void piece_tree_clear(PieceTree *tree)
 {
+  assert(pt_reader_count_load(tree) == 0);
+  assert(pt_span_ref_count_load(tree) == 0);
   pt_free_node_blocks(tree->node_blocks);
   pt_free_add_chunks(tree->add_chunks);
   memset(tree, 0, sizeof *tree);
@@ -1352,7 +1390,7 @@ static bool pt_collect_span(const char *data, size_t len, void *ctx)
 
 static bool pt_collect_span_vec(PieceTree *tree, size_t offset, size_t len,
                                 uint64_t revision, bool check_revision,
-                                PieceTreeSpanVec *vec)
+                                bool lease_storage, PieceTreeSpanVec *vec)
 {
   if (vec == NULL) {
     return false;
@@ -1365,6 +1403,9 @@ static bool pt_collect_span_vec(PieceTree *tree, size_t offset, size_t len,
   const bool ok = (!check_revision || actual_revision == revision)
                   && pt_for_each_span(tree, offset, len, pt_collect_span, &ctx)
                   && (!check_revision || tree->revision == revision);
+  if (ok && lease_storage) {
+    pt_span_ref_count_increment(tree);
+  }
   piece_tree_reader_leave(tree);
   if (!ok) {
     xfree(ctx.spans);
@@ -1372,6 +1413,7 @@ static bool pt_collect_span_vec(PieceTree *tree, size_t offset, size_t len,
   }
 
   *vec = (PieceTreeSpanVec){
+    .owner = lease_storage ? tree : NULL,
     .items = ctx.spans,
     .count = ctx.count,
     .logical_start = offset,
@@ -1384,13 +1426,13 @@ static bool pt_collect_span_vec(PieceTree *tree, size_t offset, size_t len,
 bool piece_tree_collect_span_vec(PieceTree *tree, size_t offset, size_t len,
                                  PieceTreeSpanVec *vec)
 {
-  return pt_collect_span_vec(tree, offset, len, 0, false, vec);
+  return pt_collect_span_vec(tree, offset, len, 0, false, true, vec);
 }
 
 bool piece_tree_collect_span_vec_at_revision(PieceTree *tree, size_t offset, size_t len,
                                              uint64_t revision, PieceTreeSpanVec *vec)
 {
-  return pt_collect_span_vec(tree, offset, len, revision, true, vec);
+  return pt_collect_span_vec(tree, offset, len, revision, true, true, vec);
 }
 
 void piece_tree_span_vec_clear(PieceTreeSpanVec *vec)
@@ -1399,6 +1441,9 @@ void piece_tree_span_vec_clear(PieceTreeSpanVec *vec)
     return;
   }
 
+  if (vec->owner != NULL) {
+    pt_span_ref_count_decrement(vec->owner);
+  }
   xfree(vec->items);
   *vec = (PieceTreeSpanVec){ 0 };
 }
@@ -1413,7 +1458,7 @@ bool piece_tree_collect_spans(PieceTree *tree, size_t offset, size_t len,
   *countp = 0;
 
   PieceTreeSpanVec vec = { 0 };
-  if (!piece_tree_collect_span_vec(tree, offset, len, &vec)) {
+  if (!pt_collect_span_vec(tree, offset, len, 0, false, false, &vec)) {
     return false;
   }
 

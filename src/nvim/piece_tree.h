@@ -12,12 +12,17 @@ typedef enum {
 typedef struct piece_tree_node PieceTreeNode;
 typedef struct piece_tree_node_block PieceTreeNodeBlock;
 typedef struct piece_tree_add_chunk PieceTreeAddChunk;
+#ifndef NVIM_PIECE_TREE_TYPEDEF
+# define NVIM_PIECE_TREE_TYPEDEF
+typedef struct piece_tree PieceTree;
+#endif
 typedef struct {
   const char *data;
   size_t len;
   size_t offset;
 } PieceTreeSpan;
 typedef struct {
+  PieceTree *owner;
   PieceTreeSpan *items;
   size_t count;
   size_t logical_start;
@@ -32,11 +37,6 @@ typedef struct {
 } PieceTreeSnapshot;
 typedef bool (*PieceTreeSpanCallback)(const char *data, size_t len, void *ctx);
 typedef bool (*PieceTreeMatchCallback)(size_t offset, void *ctx);
-
-#ifndef NVIM_PIECE_TREE_TYPEDEF
-# define NVIM_PIECE_TREE_TYPEDEF
-typedef struct piece_tree PieceTree;
-#endif
 
 struct piece_tree {
   const char *original;
@@ -58,6 +58,7 @@ struct piece_tree {
   size_t node_capacity;
   size_t retired_node_count;
   size_t reader_count;
+  size_t span_ref_count;
   uint64_t revision;
 };
 

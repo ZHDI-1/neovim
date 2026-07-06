@@ -27,6 +27,7 @@ typedef struct {
   size_t node_capacity;
   size_t retired_node_count;
   size_t reader_count;
+  size_t span_ref_count;
   uint64_t revision;
 } PieceTree;
 typedef struct {
@@ -35,6 +36,7 @@ typedef struct {
   size_t offset;
 } PieceTreeSpan;
 typedef struct {
+  PieceTree *owner;
   PieceTreeSpan *items;
   size_t count;
   size_t logical_start;
@@ -559,6 +561,9 @@ describe('piece tree', function()
     eq(newline_count(shadow), tonumber(snapshot[0].newline_count))
     eq(line_count(shadow), tonumber(snapshot[0].line_count))
     eq(1, tonumber(snapshot[0].revision))
+
+    lib.piece_tree_span_vec_clear(vec)
+    eq(0, tonumber(w.tree[0].span_ref_count))
   end)
 
   itp('reads partial ranges across pieces', function()
@@ -631,9 +636,13 @@ describe('piece tree', function()
 
     local start = 1
     local len = #shadow - 2
+    eq(0, tonumber(w.tree[0].span_ref_count))
     local spans, count = collect_spans(w.tree, start, len)
+    eq(0, tonumber(w.tree[0].span_ref_count))
     local snapshot_revision = tonumber(w.tree[0].revision)
     local span_vec = collect_span_vec(w.tree, start, len)
+    eq(1, tonumber(w.tree[0].span_ref_count))
+    ok(span_vec[0].owner == w.tree)
     ok(count > 1)
     eq(shadow:sub(start + 1, start + len), read_spans(spans, count))
     eq(count, tonumber(span_vec[0].count))
@@ -659,6 +668,8 @@ describe('piece tree', function()
 
     local empty_spans, empty_count = collect_spans(w.tree, 0, 0)
     local empty_vec = collect_span_vec(w.tree, 0, 0)
+    eq(2, tonumber(w.tree[0].span_ref_count))
+    ok(empty_vec[0].owner == w.tree)
     eq(0, empty_count)
     eq('', read_spans(empty_spans, empty_count))
     eq(0, tonumber(empty_vec[0].count))
@@ -668,8 +679,10 @@ describe('piece tree', function()
     eq('', read_span_vec(empty_vec))
 
     local clear_vec = collect_span_vec(w.tree, 0, #('replacement'))
+    eq(3, tonumber(w.tree[0].span_ref_count))
     ok(tonumber(clear_vec[0].count) > 0)
     lib.piece_tree_span_vec_clear(clear_vec)
+    eq(2, tonumber(w.tree[0].span_ref_count))
     eq(0, tonumber(clear_vec[0].count))
     eq(0, tonumber(clear_vec[0].logical_start))
     eq(0, tonumber(clear_vec[0].byte_len))
@@ -682,10 +695,17 @@ describe('piece tree', function()
 
     local bad_vec = ffi.new('PieceTreeSpanVec[1]')
     eq(false, lib.piece_tree_collect_span_vec(w.tree, 100, 0, bad_vec))
+    eq(2, tonumber(w.tree[0].span_ref_count))
+    ok(bad_vec[0].owner == ffi.cast('PieceTree *', 0))
     eq(0, tonumber(bad_vec[0].count))
     eq(0, tonumber(bad_vec[0].logical_start))
     eq(0, tonumber(bad_vec[0].byte_len))
     ok(bad_vec[0].items == ffi.cast('PieceTreeSpan *', 0))
+
+    lib.piece_tree_span_vec_clear(empty_vec)
+    eq(1, tonumber(w.tree[0].span_ref_count))
+    lib.piece_tree_span_vec_clear(span_vec)
+    eq(0, tonumber(w.tree[0].span_ref_count))
   end)
 
   itp('stores appended text in multiple add chunks', function()
